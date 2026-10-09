@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "demoqc"
+version = "0.1.0"
+description = "Quality scoring for robot-learning datasets: score, trim, flag and dedupe teleoperation episodes (LeRobot format)."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Alejandro Torrico" }]
+keywords = ["robotics", "lerobot", "imitation-learning", "dataset", "data-quality", "teleoperation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "huggingface_hub>=0.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+demoqc = "demoqc.cli:main"
+
+[project.urls]
+Repository = "https://github.com/alej96/quality-scoring-robot-learning"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demoqc"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "NPY", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-m 'not network'"
+markers = ["network: downloads public datasets from the Hugging Face Hub (run with: pytest -m network)"]
