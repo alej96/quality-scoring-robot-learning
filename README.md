@@ -25,6 +25,10 @@ demoqc score lerobot/svla_so101_pickplace
 demoqc score ./my_dataset --json report.json --csv report.csv --min-score 80
 demoqc score user/dataset --fail-under 85   # non-zero exit for CI gates
 demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episodes
+
+# write a cleaned copy (LeRobot v3.0) without the episodes below --min-score
+demoqc score user/dataset --json report.json --min-score 80
+demoqc export user/dataset --keep-from report.json -o ./clean_dataset
 ```
 
 Example (real output, abridged):
@@ -45,6 +49,22 @@ lowest-scoring episodes (top 3):
 The JSON report (`schema_version: 1`) contains, per episode, a 0-100 `score`, every
 `flag` with its severity and penalty, raw `metrics`, and a suggested `trim` frame range.
 `summary.keep` lists the episodes at or above `--min-score`.
+
+## Exporting a cleaned dataset
+
+`demoqc export <source> --keep-from report.json -o <dir>` writes a LeRobot **v3.0** dataset
+that contains only the episodes in the report's `summary.keep`. It does what filtering rows
+by hand gets wrong: episodes are renumbered `0..k-1`, the global `index` stays contiguous,
+`meta/episodes` gets the new indices and `dataset_from_index`/`dataset_to_index` ranges,
+`meta/info.json` totals and `splits` are updated, and `meta/stats.json` (and the per-episode
+`stats/index` and `stats/episode_index` columns) are recomputed for the kept episodes, so the
+normalisation statistics no longer include the episodes you dropped. Tabular features are
+recomputed exactly; video features are combined from the per-episode stats.
+
+Only tabular data and metadata are written; videos are never read or copied. Their time spans
+and file indices are unchanged, so copy the source `videos/` directory into the output to
+train on it. The report must come from the same dataset (episode and frame counts are
+checked). v2.x export is not implemented yet. Trimming idle frames is not part of this step.
 
 ## What it checks
 
@@ -75,8 +95,8 @@ ruff check . && ruff format --check . && pytest -q
 pytest -m network   # end-to-end against public Hub datasets
 ```
 
-See [ROADMAP.md](ROADMAP.md) for what's next (near-duplicate detection, action/state sync,
-exporting cleaned datasets, pushing reports to the Hub).
+See [ROADMAP.md](ROADMAP.md) for what's next (applying trims on export, pushing reports to
+the Hub, gripper chatter, configurable thresholds).
 
 ## License
 

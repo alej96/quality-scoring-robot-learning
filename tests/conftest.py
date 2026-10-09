@@ -67,11 +67,39 @@ def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     return timestamps[keep], action[keep], state[keep]
 
 
-def write_dataset(root: Path, specs: list[EpisodeSpec], version: str = "v3.0") -> Path:
+def _stats(x: np.ndarray) -> dict[str, list]:
+    """LeRobot-style stats of an (n, d) matrix: per-dim min/max/mean/std and the row count."""
+    x = np.asarray(x, dtype=np.float64).reshape(len(x), -1)
+    return {
+        "min": x.min(0).tolist(),
+        "max": x.max(0).tolist(),
+        "mean": x.mean(0).tolist(),
+        "std": x.std(0).tolist(),
+        "count": [len(x)],
+    }
+
+
+def _image_stats(rng: np.random.Generator, count: int) -> dict[str, list]:
+    """Per-episode video stats are (channels, 1, 1) nested lists; the values are arbitrary."""
+    mean = rng.uniform(0.3, 0.7, 3)
+    return {
+        "min": [[[0.0]]] * 3,
+        "max": [[[float(m + 0.2)]] for m in mean],
+        "mean": [[[float(m)]] for m in mean],
+        "std": [[[float(rng.uniform(0.05, 0.2))]] for _ in mean],
+        "count": [count],
+    }
+
+
+def write_dataset(
+    root: Path, specs: list[EpisodeSpec], version: str = "v3.0", data_files: int = 1
+) -> Path:
+    """``data_files`` > 1 spreads the episodes over that many v3.0 data files."""
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
     frames, episodes = [], []
     index = 0
+    rng = np.random.default_rng(123)
     for ep, spec in enumerate(specs):
         ts, action, state = make_episode(spec)
         n = len(ts)
@@ -89,9 +117,21 @@ def write_dataset(root: Path, specs: list[EpisodeSpec], version: str = "v3.0") -
             )
         )
         span = spec.video_span_s if spec.video_span_s is not None else n / FPS
+        stats = {
+            "action": _stats(action),
+            "observation.state": _stats(state),
+            "index": _stats(np.arange(index, index + n)),
+            "episode_index": _stats(np.full(n, ep)),
+            "observation.images.top": _image_stats(rng, n),
+        }
         episodes.append(
             {
                 "episode_index": ep,
+                "data/chunk_index": 0,
+                "data/file_index": ep * data_files // len(specs),
+                "videos/observation.images.top/chunk_index": 0,
+                "videos/observation.images.top/file_index": 0,
+                **{f"stats/{f}/{k}": v for f, st in stats.items() for k, v in st.items()},
                 "tasks": ["pick the cube"],
                 "length": n + spec.meta_length_delta,
                 "dataset_from_index": index,
@@ -109,10 +149,39 @@ def write_dataset(root: Path, specs: list[EpisodeSpec], version: str = "v3.0") -
         "total_episodes": len(specs),
         "total_frames": index,
     }
+    info["splits"] = {"train": f"0:{len(specs)}"}
+    scalar = {"shape": [1], "names": None}
+    info["features"] = {
+        "action": {"dtype": "float32", "shape": [DIMS], "names": None},
+        "observation.state": {"dtype": "float32", "shape": [DIMS], "names": None},
+        "observation.images.top": {"dtype": "video", "shape": [480, 640, 3], "names": None},
+        "timestamp": {"dtype": "float32", **scalar},
+        "frame_index": {"dtype": "int64", **scalar},
+        "episode_index": {"dtype": "int64", **scalar},
+        "index": {"dtype": "int64", **scalar},
+        "task_index": {"dtype": "int64", **scalar},
+    }
+    info["total_tasks"] = 1
+    info["chunks_size"] = 1000
+    info["data_path"] = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+    info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
     (root / "meta" / "info.json").write_text(json.dumps(info))
+    all_frames = pd.concat(frames)
+    dataset_stats = {
+        "action": _stats(np.stack(all_frames["action"])),
+        "observation.state": _stats(np.stack(all_frames["observation.state"])),
+        "index": _stats(all_frames["index"].to_numpy()),
+        "episode_index": _stats(all_frames["episode_index"].to_numpy()),
+        "observation.images.top": _image_stats(rng, index),
+    }
+    (root / "meta" / "stats.json").write_text(json.dumps(dataset_stats))
 
     if version.startswith("v3"):
-        pd.concat(frames).to_parquet(root / "data" / "chunk-000" / "file-000.parquet")
+        for k in range(data_files):
+            part = [f for ep, f in enumerate(frames) if ep * data_files // len(specs) == k]
+            pd.concat(part, ignore_index=True).to_parquet(
+                root / "data" / "chunk-000" / f"file-{k:03d}.parquet", index=False
+            )
         (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
         pd.DataFrame(episodes).to_parquet(
             root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
@@ -138,7 +207,7 @@ def clean_specs(n: int = 12) -> list[EpisodeSpec]:
 
 @pytest.fixture
 def make_dataset(tmp_path):
-    def _make(specs: list[EpisodeSpec], version: str = "v3.0") -> Path:
-        return write_dataset(tmp_path / f"ds-{version}", specs, version)
+    def _make(specs: list[EpisodeSpec], version: str = "v3.0", data_files: int = 1) -> Path:
+        return write_dataset(tmp_path / f"ds-{version}", specs, version, data_files)
 
     return _make
