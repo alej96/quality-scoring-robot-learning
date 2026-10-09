@@ -1,0 +1,57 @@
+# The daily maintainer agent pushes a `claude/*` branch. This workflow runs CI on it,
+# opens a PR (or reuses an open one) and rebase-merges it when CI is green. Rebase keeps
+# the original commit authors. Changes under .github/workflows/ are never auto-merged.
+name: auto-merge
+
+on:
+  push:
+    branches: ["claude/**"]
+
+concurrency:
+  group: auto-merge-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  merge:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Open or find the pull request
+        id: pr
+        run: |
+          git fetch origin main
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            title=$(git log origin/main..HEAD --reverse --format=%s | head -n1)
+            git log origin/main..HEAD --reverse --format='### %s%n%n%b' > body.md
+            printf '\n---\nOpened by the auto-merge workflow; merges when CI passes.\n' >> body.md
+            gh pr create --base main --head "$BRANCH" --title "$title" --body-file body.md
+            pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to auto-merge workflow changes
+        id: guard
+        run: |
+          if git diff --name-only origin/main...HEAD | grep -q '^\.github/workflows/'; then
+            gh pr comment "${{ steps.pr.outputs.number }}" \
+              --body "This PR changes .github/workflows/, so it was not auto-merged. A human needs to review it."
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge
+        if: steps.guard.outputs.blocked != 'true'
+        run: gh pr merge "${{ steps.pr.outputs.number }}" --rebase --delete-branch
