@@ -13,13 +13,20 @@ import numpy as np
 from demoqc import __version__
 from demoqc.checks import EpisodeResult
 from demoqc.dataset import Dataset
+from demoqc.dedupe import DuplicateGroup
 
 SCHEMA_VERSION = 1
 
 
-def build_report(ds: Dataset, results: list[EpisodeResult], min_score: float) -> dict:
+def build_report(
+    ds: Dataset,
+    results: list[EpisodeResult],
+    min_score: float,
+    duplicate_groups: list[DuplicateGroup] | None = None,
+) -> dict:
     scores = np.array([r.score for r in results]) if results else np.array([0.0])
     flag_counts = Counter(f.check for r in results for f in r.flags if f.penalty > 0)
+    duplicate_groups = duplicate_groups or []
     return {
         "schema_version": SCHEMA_VERSION,
         "demoqc_version": __version__,
@@ -46,6 +53,10 @@ def build_report(ds: Dataset, results: list[EpisodeResult], min_score: float) ->
                 2,
             ),
             "flags_by_check": dict(flag_counts.most_common()),
+            "duplicate_groups": [
+                {"episodes": g.episodes, "kind": g.kind, "max_distance": g.max_distance}
+                for g in duplicate_groups
+            ],
         },
         "episodes": [_episode_dict(r) for r in results],
     }
@@ -125,6 +136,15 @@ def format_summary(report: dict, top: int) -> str:
     ]
     if s["flags_by_check"]:
         lines.append("flags: " + ", ".join(f"{k} x{v}" for k, v in s["flags_by_check"].items()))
+    groups = s.get("duplicate_groups") or []
+    if groups:
+        exact = sum(1 for g in groups if g["kind"] == "exact")
+        near = len(groups) - exact
+        dup_episodes = sum(len(g["episodes"]) - 1 for g in groups)
+        lines.append(
+            f"duplicates: {exact} exact group(s), {near} near group(s), "
+            f"{dup_episodes} episode(s) to drop"
+        )
     worst = sorted(report["episodes"], key=lambda e: e["score"])[:top]
     worst = [e for e in worst if e["flags"]]
     if worst:
