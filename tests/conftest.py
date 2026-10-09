@@ -24,6 +24,8 @@ class EpisodeSpec:
     stale_state_from: tuple[int, int] | None = None  # [start, end) frames state is frozen
     video_span_s: float | None = None  # override video duration in episode metadata
     meta_length_delta: int = 0
+    state_lag_frames: int = 1  # observation.state tracks action with this many frames' delay
+    state_decorrelated: bool = False  # state is unrelated motion, not a delayed copy of action
     seed: int = 0
 
 
@@ -44,7 +46,14 @@ def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]
         [np.repeat(start[None], lead, 0), moving, np.repeat(end[None], trail, 0)]
     )
     action += rng.normal(0, 0.02, action.shape)  # encoder noise
-    state = np.vstack([action[:1], action[:-1]])  # follower lags leader by one frame
+    if spec.state_decorrelated:
+        # a scrambled stream: same per-frame distribution, no temporal correspondence
+        state = rng.permutation(action, axis=0)
+    elif spec.state_lag_frames > 0:
+        lag = spec.state_lag_frames
+        state = np.vstack([np.repeat(action[:1], lag, 0), action[:-lag]])
+    else:
+        state = action.copy()
 
     for i in spec.spikes_at:
         action[i] += 40.0
