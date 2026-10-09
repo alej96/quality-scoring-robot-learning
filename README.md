@@ -56,6 +56,7 @@ The JSON report (`schema_version: 1`) contains, per episode, a 0-100 `score`, ev
 | `smoothness` | single-frame glitches, abrupt jumps, demos far jerkier than their peers | per-dimension step size vs dataset p99; log dimensionless jerk (LDLJ) robust z-score |
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
 | `length` | demos with far less (aborted?) or far more activity than peers | robust z-score of active (trimmed) duration |
+| `sync` | bad action/state sync (USB latency spikes, recorder bugs) | cross-correlate per-dim velocities over ±0.5s; flag low peak correlation or a lag far from the dataset median |
 
 The score starts at 100 and subtracts each flag's penalty. Info-level flags (such as
 trimmable idle) cost little because they can be fixed automatically.
