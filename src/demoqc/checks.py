@@ -34,6 +34,8 @@ class Config:
     sync_max_lag_s: float = 0.5  # search window for action/state cross-correlation
     sync_min_peak_corr: float = 0.4  # below this, the lag estimate is unreliable
     sync_lag_outlier_frames: float = 2.0  # flag if an episode's lag differs from the median by more
+    dedupe_resample_len: int = 50  # points each trimmed action trajectory is resampled to
+    dedupe_z: float = 3.0  # near-duplicate if nn distance < median nn distance - this * MAD
 
 
 @dataclass

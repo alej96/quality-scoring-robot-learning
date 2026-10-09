@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from demoqc import __version__
-from demoqc.checks import Config, evaluate
+from demoqc.checks import Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
+from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
 from demoqc.report import build_report, format_summary, write_csv, write_json
 
 
@@ -40,6 +42,16 @@ def _parser() -> argparse.ArgumentParser:
         help="exit with status 1 if the mean score is below this (for CI)",
     )
     score.add_argument("--quiet", action="store_true", help="don't print the summary")
+
+    dedupe = sub.add_parser(
+        "dedupe",
+        help="find exact and near-duplicate episodes",
+        description="Find exact (byte-identical) and near-duplicate (same trajectory, "
+        "resampled) episodes in a LeRobot dataset.",
+    )
+    dedupe.add_argument("source", help="local dataset directory or Hub repo id")
+    dedupe.add_argument("--revision", help="Hub branch, tag or commit")
+    dedupe.add_argument("--json", type=Path, help="write the duplicate groups as JSON")
     return p
 
 
@@ -47,17 +59,29 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "score":
         return _score(args)
+    if args.command == "dedupe":
+        return _dedupe(args)
     return 2
 
 
-def _score(args: argparse.Namespace) -> int:
+def _load(args: argparse.Namespace):
     try:
-        ds = load_dataset(args.source, revision=args.revision)
+        return load_dataset(args.source, revision=args.revision)
     except (FileNotFoundError, ValueError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
+        return None
+
+
+def _score(args: argparse.Namespace) -> int:
+    ds = _load(args)
+    if ds is None:
         return 2
-    results = evaluate(ds, Config())
-    report = build_report(ds, results, min_score=args.min_score)
+    cfg = Config()
+    results = evaluate(ds, cfg)
+    ctx = DatasetContext.build(ds, cfg)
+    duplicate_groups = find_duplicates(ds, results, ctx, cfg)
+    flag_duplicates(results, duplicate_groups)
+    report = build_report(ds, results, min_score=args.min_score, duplicate_groups=duplicate_groups)
     if args.json:
         write_json(report, args.json)
     if args.csv:
@@ -66,6 +90,29 @@ def _score(args: argparse.Namespace) -> int:
         print(format_summary(report, top=args.top))
     if args.fail_under is not None and report["summary"]["mean_score"] < args.fail_under:
         return 1
+    return 0
+
+
+def _dedupe(args: argparse.Namespace) -> int:
+    ds = _load(args)
+    if ds is None:
+        return 2
+    cfg = Config()
+    results = evaluate(ds, cfg)
+    ctx = DatasetContext.build(ds, cfg)
+    groups = find_duplicates(ds, results, ctx, cfg)
+    print(format_duplicates(groups))
+    if args.json:
+        args.json.write_text(
+            json.dumps(
+                [
+                    {"episodes": g.episodes, "kind": g.kind, "max_distance": g.max_distance}
+                    for g in groups
+                ],
+                indent=2,
+            )
+            + "\n"
+        )
     return 0
 
 
