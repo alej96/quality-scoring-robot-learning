@@ -24,6 +24,7 @@ pip install git+https://github.com/alej96/quality-scoring-robot-learning
 demoqc score lerobot/svla_so101_pickplace
 demoqc score ./my_dataset --json report.json --csv report.csv --min-score 80
 demoqc score user/dataset --fail-under 85   # non-zero exit for CI gates
+demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episodes
 ```
 
 Example (real output, abridged):
@@ -57,9 +58,14 @@ The JSON report (`schema_version: 1`) contains, per episode, a 0-100 `score`, ev
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
 | `length` | demos with far less (aborted?) or far more activity than peers | robust z-score of active (trimmed) duration |
 | `sync` | bad action/state sync (USB latency spikes, recorder bugs) | cross-correlate per-dim velocities over ±0.5s; flag low peak correlation or a lag far from the dataset median |
+| `duplicate` | exact (re-run upload) and near-duplicate (repeated demo) episodes | hash of raw action/state for exact matches; L2 distance of resampled, trimmed, scaled action trajectories vs. the dataset's own nearest-neighbour distance distribution for near matches |
 
 The score starts at 100 and subtracts each flag's penalty. Info-level flags (such as
 trimmable idle) cost little because they can be fixed automatically.
+
+`demoqc score` includes a `duplicate_groups` summary and flags every episode in a group
+except the lowest-indexed (kept) one. `demoqc dedupe <source>` runs duplicate detection on
+its own and prints the groups (`--json` writes them out).
 
 ## Development
 

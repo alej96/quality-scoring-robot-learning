@@ -18,13 +18,17 @@ Work top-down through **Next up**. Each item should ship in one focused session
       Follow-up: dims are currently matched by shape only (`action.shape[1] == state.shape[1]`)
       because the loader doesn't read per-feature names from `meta/info.json` yet; once it
       does, match by name instead so a reordered or extra dim doesn't disable the check.
-- [ ] **Near-duplicate episodes (`demoqc dedupe`, plus a `duplicates` section in `score`).**
-      Resample each episode's scaled action trajectory (trimmed) to a fixed length, compute
-      pairwise distances (start with L2 on the resampled trajectories, then DTW if needed),
-      and group near-duplicates with a threshold relative to the dataset's
-      nearest-neighbour distance distribution. Also catch exact duplicates (identical data
-      hashes), which happen when uploads are re-run. Validate on community datasets and
-      report what you find.
+- [x] **Near-duplicate episodes (`demoqc dedupe`, plus a `duplicates` section in `score`).**
+      Resamples each episode's scaled action trajectory (trimmed) to a fixed length and
+      groups near-duplicates with a threshold relative to the dataset's nearest-neighbour
+      distance distribution (robust z vs. the dataset's own nn-distance spread). Exact
+      duplicates (identical action/state bytes) are caught separately by content hash.
+      Shipped as `src/demoqc/dedupe.py`, the `demoqc dedupe` subcommand, and a
+      `duplicate_groups` summary plus per-episode `duplicate` flags in `demoqc score`.
+      Follow-up: pairwise L2 is O(n²) in episode count and holds the whole distance matrix
+      in memory; fine up to a few thousand episodes, but DTW (for duplicates recorded at
+      different speeds beyond what resampling absorbs) and a chunked/approximate
+      nearest-neighbour search (for huge datasets) are still open.
 - [ ] **Export a cleaned dataset (slice 1): `demoqc export --keep-from report.json`.**
       Write a filtered LeRobot v3.0 dataset (tabular data and meta only): drop rejected
       episodes, re-index episodes and frames, recompute `meta/info.json` totals and
@@ -76,3 +80,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
   from the dataset's median by more than 2 frames. Validated with synthetic-defect tests
   only; the Hugging Face Hub was unreachable from this environment (network policy blocks
   huggingface.co) so real-dataset validation is a follow-up.
+- 2026-10-09: Added exact and near-duplicate episode detection (`src/demoqc/dedupe.py`,
+  `demoqc dedupe`, `duplicate_groups` in `score`). Validated on
+  lerobot/svla_so101_pickplace (50 ep), masato-ka/so100_cutlery_handling_simple (50 ep),
+  aaronsu11/so100_lego (100 ep) and shylee/so100_cube (200 ep): no duplicates and no false
+  positives on any of them. Synthetic tests cover exact (byte-identical) and near
+  (same seed, different duration) duplicates, plus a 40-episode independent-seed check for
+  false positives.
