@@ -31,6 +31,9 @@ class Config:
     outlier_z: float = 3.5
     min_relative_length_diff: float = 0.25
     jerk_z: float = -3.0
+    sync_max_lag_s: float = 0.5  # search window for action/state cross-correlation
+    sync_min_peak_corr: float = 0.4  # below this, the lag estimate is unreliable
+    sync_lag_outlier_frames: float = 2.0  # flag if an episode's lag differs from the median by more
 
 
 @dataclass
@@ -295,6 +298,59 @@ def check_staleness(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeR
         )
 
 
+def _best_lag(a: np.ndarray, s: np.ndarray, max_lag: int) -> tuple[int, float]:
+    """Lag (in frames) and peak Pearson correlation that best aligns ``s[t + lag]`` with
+    ``a[t]``, averaged over dims with enough variance in both signals. ``a`` and ``s`` are
+    per-dim velocity series of equal length; a positive lag means ``s`` trails ``a``.
+    """
+    n = len(a)
+    valid_a = a.std(axis=0) > 1e-9
+    if not valid_a.any():
+        return 0, 0.0
+    best_lag, best_corr = 0, -2.0
+    for lag in range(-max_lag, max_lag + 1):
+        at, st = (a[: n - lag], s[lag:]) if lag >= 0 else (a[-lag:], s[: n + lag])
+        if len(at) < 10:
+            continue
+        at, st = at[:, valid_a], st[:, valid_a]
+        ok = st.std(axis=0) > 1e-9
+        if not ok.any():
+            continue
+        at, st = at[:, ok] - at[:, ok].mean(axis=0), st[:, ok] - st[:, ok].mean(axis=0)
+        num = (at * st).sum(axis=0)
+        den = np.sqrt((at**2).sum(axis=0) * (st**2).sum(axis=0))
+        avg_corr = float(np.mean(np.where(den > 1e-9, num / den, 0.0)))
+        if avg_corr > best_corr:
+            best_lag, best_corr = lag, avg_corr
+    return best_lag, best_corr
+
+
+def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
+    """Estimate the lag between commanded ``action`` and observed ``observation.state``.
+
+    A USB latency spike or a recorder bug desyncs the two streams for part of a recording
+    session; that episode's best-fit lag will differ from its peers' even though each
+    stream looks fine on its own.
+    """
+    if ep.action is None or ep.state is None or ep.length < 10:
+        return
+    if ep.action.shape[1] != ep.state.shape[1]:
+        return  # no feature names to match dims by; only compare same-width streams
+    max_lag = max(1, int(round(cfg.sync_max_lag_s * ctx.fps)))
+    lag, corr = _best_lag(np.diff(ep.action, axis=0), np.diff(ep.state, axis=0), max_lag)
+    out.metrics.update(sync_lag_frames=float(lag), sync_lag_s=lag / ctx.fps, sync_peak_corr=corr)
+    if corr < cfg.sync_min_peak_corr:
+        out.flags.append(
+            Flag(
+                "sync",
+                WARN,
+                f"action/observation.state correlation is weak (r={corr:.2f}); "
+                "lag estimate unreliable",
+                10,
+            )
+        )
+
+
 def check_relative(results: list[EpisodeResult], ctx: DatasetContext, cfg: Config) -> None:
     """Checks that compare an episode to its peers in the same dataset."""
     if len(results) < 5:
@@ -330,21 +386,42 @@ def check_relative(results: list[EpisodeResult], ctx: DatasetContext, cfg: Confi
 
     ldlj = np.array([r.metrics.get("ldlj", np.nan) for r in results])
     valid = ldlj[np.isfinite(ldlj)]
-    if len(valid) < 5:
+    if len(valid) >= 5:
+        for r in results:
+            value = r.metrics.get("ldlj")
+            if value is None or not np.isfinite(value):
+                continue
+            z = _robust_z(value, valid)
+            r.metrics["ldlj_z"] = z
+            if z < cfg.jerk_z:
+                r.flags.append(
+                    Flag(
+                        "smoothness",
+                        WARN,
+                        f"much jerkier than peers (smoothness z={z:.1f})",
+                        min(20.0, 4 * -z),
+                    )
+                )
+
+    # only episodes whose own action/state correlation is trustworthy inform (and are
+    # eligible for) the lag-outlier check; a low-corr episode is already flagged on its own
+    confident = [
+        r for r in results if r.metrics.get("sync_peak_corr", 0.0) >= cfg.sync_min_peak_corr
+    ]
+    if len(confident) < 5:
         return
-    for r in results:
-        value = r.metrics.get("ldlj")
-        if value is None or not np.isfinite(value):
-            continue
-        z = _robust_z(value, valid)
-        r.metrics["ldlj_z"] = z
-        if z < cfg.jerk_z:
+    lags = np.array([r.metrics["sync_lag_frames"] for r in confident])
+    median_lag = float(np.median(lags))
+    for r in confident:
+        lag = r.metrics["sync_lag_frames"]
+        if abs(lag - median_lag) > cfg.sync_lag_outlier_frames:
             r.flags.append(
                 Flag(
-                    "smoothness",
+                    "sync",
                     WARN,
-                    f"much jerkier than peers (smoothness z={z:.1f})",
-                    min(20.0, 4 * -z),
+                    f"action/observation.state lag is {lag:.0f} frames vs dataset median "
+                    f"{median_lag:.0f} (r={r.metrics['sync_peak_corr']:.2f}); possible bad sync",
+                    min(25.0, 5 * abs(lag - median_lag)),
                 )
             )
 
@@ -355,7 +432,14 @@ def _active_s(r: EpisodeResult) -> float:
     return max(0.0, r.duration_s - r.metrics["lead_idle_s"] - r.metrics["trail_idle_s"])
 
 
-EPISODE_CHECKS = [check_timing, check_metadata, check_idle, check_smoothness, check_staleness]
+EPISODE_CHECKS = [
+    check_timing,
+    check_metadata,
+    check_idle,
+    check_smoothness,
+    check_staleness,
+    check_sync,
+]
 
 
 def evaluate(ds: Dataset, cfg: Config | None = None) -> list[EpisodeResult]:

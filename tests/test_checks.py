@@ -85,3 +85,33 @@ def test_short_active_episode_is_flagged(make_dataset):
     specs[9] = EpisodeSpec(seconds=3.0, seed=9)
     results = _results(make_dataset, specs)
     assert "length" in _checks(results[9])
+
+
+def test_sync_lag_outlier(make_dataset):
+    # every episode's follower tracks the leader with a 1-frame delay, except one that
+    # was recorded with a USB latency spike and lags by 6 frames (0.2s at 30fps)
+    specs = clean_specs()
+    specs[6] = EpisodeSpec(state_lag_frames=6, seed=6)
+    results = _results(make_dataset, specs)
+
+    assert results[6].metrics["sync_lag_frames"] == pytest.approx(6, abs=1)
+    assert "sync" in _checks(results[6])
+    assert all("sync" not in _checks(r) for i, r in enumerate(results) if i != 6)
+
+
+def test_sync_low_correlation(make_dataset):
+    # a recorder bug scrambles observation.state relative to action for one episode
+    specs = clean_specs()
+    specs[8] = EpisodeSpec(state_decorrelated=True, seed=8)
+    results = _results(make_dataset, specs)
+
+    assert results[8].metrics["sync_peak_corr"] < 0.4
+    assert "sync" in _checks(results[8])
+    assert all("sync" not in _checks(r) for i, r in enumerate(results) if i != 8)
+
+
+def test_clean_dataset_has_consistent_sync_lag(make_dataset):
+    results = _results(make_dataset, clean_specs())
+    for r in results:
+        assert r.metrics["sync_lag_frames"] == pytest.approx(1, abs=1)
+        assert r.metrics["sync_peak_corr"] > 0.8
