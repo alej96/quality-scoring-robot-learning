@@ -11,6 +11,7 @@ from demoqc import __version__
 from demoqc.checks import Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
+from demoqc.export import export_dataset, keep_from_report
 from demoqc.report import build_report, format_summary, write_csv, write_json
 
 
@@ -52,6 +53,27 @@ def _parser() -> argparse.ArgumentParser:
     dedupe.add_argument("source", help="local dataset directory or Hub repo id")
     dedupe.add_argument("--revision", help="Hub branch, tag or commit")
     dedupe.add_argument("--json", type=Path, help="write the duplicate groups as JSON")
+
+    export = sub.add_parser(
+        "export",
+        help="write a cleaned copy of a dataset without the rejected episodes",
+        description="Write a LeRobot v3.0 dataset containing only the episodes a `demoqc score "
+        "--json` report keeps. Episodes are renumbered and meta/info.json, meta/episodes and "
+        "meta/stats.json are rewritten. Only tabular data and metadata are written; videos are "
+        "neither read nor copied.",
+    )
+    export.add_argument("source", help="local dataset directory or Hub repo id")
+    export.add_argument("--revision", help="Hub branch, tag or commit")
+    export.add_argument(
+        "--keep-from",
+        type=Path,
+        required=True,
+        metavar="REPORT.json",
+        help="report from `demoqc score --json` for this dataset; its summary.keep list is kept",
+    )
+    export.add_argument(
+        "-o", "--output", type=Path, required=True, help="directory to write (must be empty)"
+    )
     return p
 
 
@@ -61,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         return _score(args)
     if args.command == "dedupe":
         return _dedupe(args)
+    if args.command == "export":
+        return _export(args)
     return 2
 
 
@@ -112,6 +136,32 @@ def _dedupe(args: argparse.Namespace) -> int:
                 indent=2,
             )
             + "\n"
+        )
+    return 0
+
+
+def _export(args: argparse.Namespace) -> int:
+    ds = _load(args)
+    if ds is None:
+        return 2
+    try:
+        keep = keep_from_report(args.keep_from, ds)
+        result = export_dataset(ds.root, args.output, keep)
+    except (ValueError, FileExistsError) as exc:
+        print(f"demoqc: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"kept {len(result.kept)} of {len(result.kept) + len(result.dropped)} episodes "
+        f"({result.frames} frames) -> {result.out}"
+    )
+    if result.dropped:
+        print("dropped episodes: " + ", ".join(map(str, result.dropped)))
+    for w in result.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    if result.has_videos:
+        print(
+            "videos were not copied. Their episode time spans are unchanged, so copy the "
+            "source videos/ directory into the output to use it for training."
         )
     return 0
 

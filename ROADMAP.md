@@ -29,11 +29,22 @@ Work top-down through **Next up**. Each item should ship in one focused session
       in memory; fine up to a few thousand episodes, but DTW (for duplicates recorded at
       different speeds beyond what resampling absorbs) and a chunked/approximate
       nearest-neighbour search (for huge datasets) are still open.
-- [ ] **Export a cleaned dataset (slice 1): `demoqc export --keep-from report.json`.**
+- [x] **Export a cleaned dataset (slice 1): `demoqc export --keep-from report.json`.**
       Write a filtered LeRobot v3.0 dataset (tabular data and meta only): drop rejected
       episodes, re-index episodes and frames, recompute `meta/info.json` totals and
       `meta/episodes`. Must load with LeRobot's own loader (add a test that does so if
       `lerobot` is installed, skipped otherwise).
+      Shipped as `src/demoqc/export.py` and the `demoqc export` subcommand. Also rewrites
+      `meta/stats.json` (exact for tabular features, count-weighted combination of the
+      per-episode stats for video features) and the per-episode `stats/index` and
+      `stats/episode_index` columns, which would otherwise go stale.
+      Follow-ups: (1) **v2.x export.** v3.0 only for now, but most community datasets
+      (e.g. the so100 ones used for validation) are v2.1, so this is the most useful next
+      slice of export (per-episode parquet and videos, `episodes.jsonl`, `episodes_stats.jsonl`).
+      (2) An option to copy or symlink the source `videos/` directory for local sources (they
+      are never read today; the export only notes that they must be copied). (3) `--min-score`
+      on `export` itself, so a separate `score --json` run isn't required. (4) Single `train`
+      split only: other `splits` entries in `info.json` are collapsed into `train`.
 - [ ] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
@@ -87,3 +98,15 @@ Work top-down through **Next up**. Each item should ship in one focused session
   positives on any of them. Synthetic tests cover exact (byte-identical) and near
   (same seed, different duration) duplicates, plus a 40-episode independent-seed check for
   false positives.
+- 2026-10-09: Added `demoqc export SOURCE --keep-from report.json -o DIR` (LeRobot v3.0 only,
+  `src/demoqc/export.py`). Validated on lerobot/svla_so101_pickplace (50 ep) and
+  lerobot/pusht (206 ep), the only v3.0 datasets in the validation set (the so100 community
+  ones are v2.1, which export rejects with a clear error). Keeping every episode reproduces
+  the data and `meta/episodes` tables exactly and `stats.json` to within 3e-5 (including the
+  combined video stats); dropping ~2/7 of the episodes gives contiguous indices, correct
+  `dataset_from/to_index` ranges and stats that match a recomputation from the kept frames.
+  All four exports load with `LeRobotDataset` from lerobot 0.6.1 (with placeholder files
+  for the videos, which LeRobot checks for) and `episodes=[...]` subsets resolve correctly.
+  `tests/test_export.py` covers this on synthetic data, including a 3-file layout where one
+  file contains only dropped episodes; the lerobot loader test is skipped when lerobot isn't
+  installed (CI doesn't install it).
