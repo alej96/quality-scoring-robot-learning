@@ -9,11 +9,15 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
-- [ ] **Action/state sync check.** Estimate per-episode lag between `action` and
+- [x] **Action/state sync check.** Estimate per-episode lag between `action` and
       `observation.state` (cross-correlate per-dim velocities over ±0.5 s; only dims present
       in both with matching names or shapes). Flag episodes whose lag deviates from the
       dataset median by more than 2 frames, or whose peak correlation is low. Catches "bad
       syncs" from USB latency spikes and recorder bugs. Add to the report and README table.
+      Shipped as the `sync` check (`sync_lag_frames`, `sync_lag_s`, `sync_peak_corr` metrics).
+      Follow-up: dims are currently matched by shape only (`action.shape[1] == state.shape[1]`)
+      because the loader doesn't read per-feature names from `meta/info.json` yet; once it
+      does, match by name instead so a reordered or extra dim doesn't disable the check.
 - [ ] **Near-duplicate episodes (`demoqc dedupe`, plus a `duplicates` section in `score`).**
       Resample each episode's scaled action trajectory (trimmed) to a fixed length, compute
       pairwise distances (start with L2 on the resampled trajectories, then DTW if needed),
@@ -67,3 +71,8 @@ Work top-down through **Next up**. Each item should ship in one focused session
   timing, metadata, video_sync, idle/trim, smoothness, stale_state and length, plus
   JSON/CSV reports, the `demoqc score` CLI, CI and auto-merge. Validated on
   lerobot/svla_so101_pickplace, lerobot/pusht and 5 community SO-100 datasets.
+- 2026-10-09: Added the `sync` check (action/observation.state lag via per-dim
+  cross-correlation, ±0.5s window); flags a weak peak correlation or a lag that deviates
+  from the dataset's median by more than 2 frames. Validated with synthetic-defect tests
+  only; the Hugging Face Hub was unreachable from this environment (network policy blocks
+  huggingface.co) so real-dataset validation is a follow-up.
