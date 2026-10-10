@@ -29,6 +29,9 @@ demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episode
 # write a cleaned copy (LeRobot v3.0) without the episodes below --min-score
 demoqc score user/dataset --json report.json --min-score 80
 demoqc export user/dataset --keep-from report.json -o ./clean_dataset
+
+# also cut each kept episode's idle start/end frames
+demoqc export user/dataset --keep-from report.json --apply-trim -o ./clean_dataset
 ```
 
 Example (real output, abridged):
@@ -64,7 +67,14 @@ recomputed exactly; video features are combined from the per-episode stats.
 Only tabular data and metadata are written; videos are never read or copied. Their time spans
 and file indices are unchanged, so copy the source `videos/` directory into the output to
 train on it. The report must come from the same dataset (episode and frame counts are
-checked). v2.x export is not implemented yet. Trimming idle frames is not part of this step.
+checked). v2.x export is not implemented yet.
+
+`--apply-trim` additionally cuts each kept episode's idle start/end frames, using the same
+`trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered, `timestamp` is
+shifted so the episode still starts near 0, and `meta/episodes`' `length` and each camera's
+`videos/*/from_timestamp`/`to_timestamp` are narrowed by the same number of frames, so the
+(uncopied, unmodified) video file's window for that episode still lines up with the trimmed
+data. Episodes with no suggested trim are kept in full.
 
 ## What it checks
 

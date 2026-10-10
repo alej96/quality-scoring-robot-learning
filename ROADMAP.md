@@ -45,9 +45,17 @@ Work top-down through **Next up**. Each item should ship in one focused session
       are never read today; the export only notes that they must be copied). (3) `--min-score`
       on `export` itself, so a separate `score --json` run isn't required. (4) Single `train`
       split only: other `splits` entries in `info.json` are collapsed into `train`.
-- [ ] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
+- [x] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
+      Shipped as `demoqc export --apply-trim`: `frame_index`/`index` are renumbered,
+      `timestamp` is shifted by the number of leading frames cut, and each camera's video
+      span is narrowed by the same frame counts (video bytes are never touched). `length` in
+      `meta/episodes` is now always rewritten to match the written frame count (previously it
+      only warned on a pre-existing mismatch and left the stale value, which would have made
+      a trimmed export self-inconsistent).
+      Follow-up: v2.x export (including trims) is still not implemented; this only covers
+      v3.0, same as slice 1.
 - [ ] **Hub integration: `demoqc push-report <repo_id>`.** Upload the JSON report plus a
       Markdown summary to the dataset repo as a Hub pull request (`create_pr=True`), so
       dataset owners get actionable feedback. Generate a dataset-card snippet with a badge.
@@ -110,3 +118,19 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `tests/test_export.py` covers this on synthetic data, including a 3-file layout where one
   file contains only dropped episodes; the lerobot loader test is skipped when lerobot isn't
   installed (CI doesn't install it).
+- 2026-10-10: Added `demoqc export --apply-trim`, which cuts each kept episode's idle
+  start/end frames per the report's `trim` suggestion, renumbers `frame_index`/`index`, shifts
+  `timestamp`, and narrows the per-camera `videos/*/from_timestamp`/`to_timestamp` window by the
+  same frame counts (videos are still never read, copied or re-encoded). Also fixed `length` in
+  `meta/episodes` to always match the written frame count instead of only warning when it
+  disagreed. Validated on lerobot/svla_so101_pickplace (50 ep, v3.0): the Hugging Face Hub was
+  reachable this run. 46/50 episodes had a suggested trim; after `--apply-trim`, total frames
+  dropped from 11939 to 10528 (1411 trimmed), re-scoring the export dropped `trimmable idle`
+  from 71.6s/47 flags to 3.6s/3 flags (the small remainder is the check's own padding, by
+  design) and mean score rose from 97.1 to 99.8 with no new flags. Verified per-episode that
+  the trimmed frame count and both video-span edges exactly match `start`/`end` from the
+  report. Also validated on lerobot/pusht (206 ep, v3.0, no idle episodes): `--apply-trim`
+  trimmed 0 frames and the re-scored export is byte-for-byte the same report (mean 100.0, no
+  flags), confirming no false positives when there is nothing to trim. The so100 community
+  datasets used for earlier validation (masato-ka/so100_cutlery_handling_simple etc.) are
+  v2.1, so `export` still rejects them with the existing "v2.x not implemented" error.
