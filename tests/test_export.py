@@ -7,10 +7,12 @@ import pytest
 
 from demoqc.cli import main
 from demoqc.dataset import load_dataset
-from demoqc.export import export_dataset, keep_from_report
-from tests.conftest import EpisodeSpec, clean_specs, write_dataset
+from demoqc.export import export_dataset, keep_from_report, trim_from_report
+from tests.conftest import FPS, EpisodeSpec, clean_specs, write_dataset
 
 KEEP = [0, 2, 3, 5]
+VIDEO_FROM = "videos/observation.images.top/from_timestamp"
+VIDEO_TO = "videos/observation.images.top/to_timestamp"
 
 
 def _frames(root):
@@ -247,3 +249,112 @@ def test_exported_dataset_loads_with_lerobot(exported):
         assert rows.sum() == e["length"]
         assert (episode[rows] == e["episode_index"]).all()
     assert ds.meta.stats["action"]["count"].tolist() == [result.frames]
+
+
+def test_apply_trim_cuts_frames_shifts_timestamps_and_narrows_video_span(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4))
+    before = _frames(src)
+    ep1_before = before[before["episode_index"] == 1]
+    ep1_len = len(ep1_before)
+    lead, trail = 10, 5
+    trim = {1: (lead, ep1_len - trail)}
+
+    result = export_dataset(src, tmp_path / "out", keep=[0, 1, 2, 3], trim=trim)
+
+    assert result.trimmed_frames == lead + trail
+    after = _frames(tmp_path / "out")
+    assert after["index"].tolist() == list(range(len(after)))
+    ep1_after = after[after["episode_index"] == 1]
+    assert len(ep1_after) == ep1_len - lead - trail
+    assert ep1_after["frame_index"].tolist() == list(range(len(ep1_after)))
+    np.testing.assert_array_equal(
+        np.stack(ep1_after["action"]), np.stack(ep1_before["action"])[lead : ep1_len - trail]
+    )
+    np.testing.assert_allclose(
+        ep1_after["timestamp"].to_numpy(),
+        ep1_before["timestamp"].to_numpy()[lead : ep1_len - trail] - lead / FPS,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    eps, old_eps = _episodes(tmp_path / "out"), _episodes(src)
+    row1 = eps[eps["episode_index"] == 1].iloc[0]
+    old_row1 = old_eps[old_eps["episode_index"] == 1].iloc[0]
+    assert row1["length"] == len(ep1_after)
+    assert row1[VIDEO_FROM] == pytest.approx(old_row1[VIDEO_FROM] + lead / FPS)
+    assert row1[VIDEO_TO] == pytest.approx(old_row1[VIDEO_TO] - trail / FPS)
+
+    # untrimmed episodes are carried over exactly, including their video spans
+    row0 = eps[eps["episode_index"] == 0].iloc[0]
+    old_row0 = old_eps[old_eps["episode_index"] == 0].iloc[0]
+    assert row0[VIDEO_FROM] == old_row0[VIDEO_FROM] and row0[VIDEO_TO] == old_row0[VIDEO_TO]
+    np.testing.assert_array_equal(
+        np.stack(after[after["episode_index"] == 0]["action"]),
+        np.stack(before[before["episode_index"] == 0]["action"]),
+    )
+
+
+def test_apply_trim_rejects_out_of_range_trims(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(3))
+    length = len(_frames(src).loc[lambda d: d["episode_index"] == 0])
+    with pytest.raises(ValueError, match="invalid trim"):
+        export_dataset(src, tmp_path / "a", keep=[0, 1, 2], trim={0: (5, 2)})
+    with pytest.raises(ValueError, match="invalid trim"):
+        export_dataset(src, tmp_path / "b", keep=[0, 1, 2], trim={0: (0, length + 10)})
+
+
+def test_apply_trim_for_a_dropped_episode_is_ignored(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4))
+    result = export_dataset(src, tmp_path / "out", keep=[0, 2, 3], trim={1: (0, 999999)})
+    assert result.kept == [0, 2, 3] and result.trimmed_frames == 0
+
+
+def test_apply_trim_without_any_trim_is_a_no_op(exported):
+    """trim=None (the default) must reproduce the untrimmed export exactly."""
+    src, out, result = exported
+    assert result.trimmed_frames == 0
+
+
+def test_export_command_apply_trim(make_dataset, tmp_path, capsys):
+    specs = clean_specs(4)
+    specs[1] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=1)
+    src = make_dataset(specs)
+    report, out = tmp_path / "r.json", tmp_path / "clean"
+    assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0
+    episodes = json.loads(report.read_text())["episodes"]
+    assert 1 in json.loads(report.read_text())["summary"]["keep"]
+    start, end = episodes[1]["trim"]
+    capsys.readouterr()
+
+    assert (
+        main(["export", str(src), "--keep-from", str(report), "--apply-trim", "-o", str(out)]) == 0
+    )
+
+    said = capsys.readouterr().out
+    assert "trimmed" in said
+    after = _frames(out)
+    ep1 = after[after["episode_index"] == 1]
+    assert len(ep1) == end - start
+    assert ep1["frame_index"].tolist() == list(range(end - start))
+
+
+def test_export_command_without_apply_trim_keeps_episodes_whole(make_dataset, tmp_path):
+    specs = clean_specs(4)
+    specs[1] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=1)
+    src = make_dataset(specs)
+    report, out = tmp_path / "r.json", tmp_path / "clean"
+    main(["score", str(src), "--json", str(report), "--quiet"])
+    main(["export", str(src), "--keep-from", str(report), "-o", str(out)])
+
+    before_len = len(load_dataset(src).episodes[1].timestamps)
+    after_len = len(_frames(out)[_frames(out)["episode_index"] == 1])
+    assert after_len == before_len
+
+
+def test_trim_from_report_rejects_a_report_for_another_dataset(make_dataset, tmp_path):
+    a = make_dataset(clean_specs(6))
+    report = tmp_path / "r.json"
+    assert main(["score", str(a), "--json", str(report), "--quiet"]) == 0
+    other = load_dataset(write_dataset(tmp_path / "other", clean_specs(4)))
+    with pytest.raises(ValueError, match="different dataset"):
+        trim_from_report(report, other)
