@@ -11,7 +11,7 @@ from demoqc import __version__
 from demoqc.checks import Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
-from demoqc.export import export_dataset, keep_from_report
+from demoqc.export import export_dataset, keep_from_report, trim_from_report
 from demoqc.report import build_report, format_summary, write_csv, write_json
 
 
@@ -59,8 +59,9 @@ def _parser() -> argparse.ArgumentParser:
         help="write a cleaned copy of a dataset without the rejected episodes",
         description="Write a LeRobot v3.0 dataset containing only the episodes a `demoqc score "
         "--json` report keeps. Episodes are renumbered and meta/info.json, meta/episodes and "
-        "meta/stats.json are rewritten. Only tabular data and metadata are written; videos are "
-        "neither read nor copied.",
+        "meta/stats.json are rewritten. With --apply-trim, each kept episode's idle start/end "
+        "frames are also cut. Only tabular data and metadata are written; videos are neither "
+        "read nor copied.",
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
@@ -73,6 +74,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     export.add_argument(
         "-o", "--output", type=Path, required=True, help="directory to write (must be empty)"
+    )
+    export.add_argument(
+        "--apply-trim",
+        action="store_true",
+        help="cut each kept episode's idle start/end frames (per the report's trim "
+        "suggestion), shifting timestamps and narrowing video spans to match",
     )
     return p
 
@@ -146,7 +153,8 @@ def _export(args: argparse.Namespace) -> int:
         return 2
     try:
         keep = keep_from_report(args.keep_from, ds)
-        result = export_dataset(ds.root, args.output, keep)
+        trim = trim_from_report(args.keep_from, ds) if args.apply_trim else None
+        result = export_dataset(ds.root, args.output, keep, trim=trim)
     except (ValueError, FileExistsError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
         return 2
@@ -156,6 +164,10 @@ def _export(args: argparse.Namespace) -> int:
     )
     if result.dropped:
         print("dropped episodes: " + ", ".join(map(str, result.dropped)))
+    if result.trimmed_frames:
+        print(
+            f"trimmed {result.trimmed_frames} idle frames ({result.trimmed_frames / ds.fps:.1f}s)"
+        )
     for w in result.warnings:
         print(f"warning: {w}", file=sys.stderr)
     if result.has_videos:

@@ -9,6 +9,12 @@ normalisation statistics in ``meta/stats.json`` (plus the per-episode ``stats/in
 Data and episode-metadata files keep their relative paths, so the ``data/*`` and ``videos/*``
 chunk/file indices stored in ``meta/episodes`` stay valid, and the original ``videos/``
 directory can be copied next to the export unchanged (videos are never read or copied here).
+
+Optionally, ``export_dataset`` can also apply the ``trim`` suggested by ``demoqc score`` for an
+episode: drop the idle frames at its start/end, renumber ``frame_index`` and shift ``timestamp``
+so it still starts near 0, and shrink its ``videos/*/from_timestamp``/``to_timestamp`` window by
+the same number of frames. The video itself is never read or re-encoded; trimming only narrows
+which part of it a kept episode's metadata points at.
 """
 
 from __future__ import annotations
@@ -39,18 +45,18 @@ class ExportResult:
     dropped: list[int]
     frames: int
     has_videos: bool
+    trimmed_frames: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
-def keep_from_report(report_path: Path, ds: Dataset) -> list[int]:
-    """Episode indices to keep according to a ``demoqc score --json`` report.
+def _load_report(report_path: Path, ds: Dataset) -> dict:
+    """Parse a ``demoqc score --json`` report and check it was made for this dataset.
 
     Refuses a report that was clearly made for another dataset (different episode or frame
-    count), because applying its indices would silently drop the wrong episodes.
+    count), because applying its indices would silently drop or trim the wrong episodes.
     """
     try:
         report = json.loads(Path(report_path).read_text())
-        keep = [int(i) for i in report["summary"]["keep"]]
         episodes, frames = report["dataset"]["episodes"], report["dataset"]["frames"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ValueError(f"{report_path} is not a demoqc score report ({exc!r})") from exc
@@ -59,17 +65,47 @@ def keep_from_report(report_path: Path, ds: Dataset) -> list[int]:
             f"{report_path} was made for a different dataset: it has {episodes} episodes / "
             f"{frames} frames, this one has {len(ds.episodes)} / {ds.total_frames}"
         )
-    return keep
+    return report
 
 
-def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
+def keep_from_report(report_path: Path, ds: Dataset) -> list[int]:
+    """Episode indices to keep according to a ``demoqc score --json`` report."""
+    report = _load_report(report_path, ds)
+    try:
+        return [int(i) for i in report["summary"]["keep"]]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"{report_path} is not a demoqc score report ({exc!r})") from exc
+
+
+def trim_from_report(report_path: Path, ds: Dataset) -> dict[int, tuple[int, int]]:
+    """Per-episode ``[start, end)`` frame ranges to keep, from a ``demoqc score --json`` report.
+
+    Only episodes with a suggested trim (idle time at the start/end) are included.
+    """
+    report = _load_report(report_path, ds)
+    try:
+        return {
+            int(e["episode_index"]): (int(e["trim"][0]), int(e["trim"][1]))
+            for e in report["episodes"]
+            if e.get("trim")
+        }
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError(f"{report_path} is not a demoqc score report ({exc!r})") from exc
+
+
+def export_dataset(
+    src: Path, out: Path, keep: Iterable[int], trim: dict[int, tuple[int, int]] | None = None
+) -> ExportResult:
     """Write the episodes in ``keep`` from the v3.0 dataset at ``src`` to ``out``.
 
-    Kept episodes are renumbered 0..k-1 in their original order.
+    Kept episodes are renumbered 0..k-1 in their original order. ``trim`` optionally maps an
+    original episode index to the ``[start, end)`` frame range to keep for it (see
+    :func:`trim_from_report`); episodes not in ``trim`` are kept in full.
     """
     src, out = Path(src), Path(out)
     info = json.loads((src / "meta" / "info.json").read_text())
     version = str(info.get("codebase_version", "unknown"))
+    fps = float(info["fps"])
     if not version.startswith("v3"):
         raise ValueError(
             f"export supports LeRobot v3.0 datasets; this one is {version} "
@@ -91,14 +127,32 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
     keep_ids = np.unique(np.asarray(list(keep), dtype=np.int64))
     if keep_ids.size == 0:
         raise ValueError("no episodes to keep")
-    present = np.unique(
-        np.concatenate(
-            [pq.read_table(f, columns=["episode_index"])[0].to_numpy() for f in data_files]
-        )
+    all_ep = np.concatenate(
+        [pq.read_table(f, columns=["episode_index"])[0].to_numpy() for f in data_files]
     )
+    present, present_lengths = np.unique(all_ep, return_counts=True)
     unknown = np.setdiff1d(keep_ids, present)
     if unknown.size:
         raise ValueError(f"episodes not in the dataset: {unknown.tolist()}")
+    raw_lengths = present_lengths[np.searchsorted(present, keep_ids)]
+
+    trim = dict(trim) if trim else {}
+    trim_starts = np.zeros(len(keep_ids), dtype=np.int64)
+    trim_ends = raw_lengths.copy()  # default: keep the whole episode
+    if trim:
+        keep_set = set(keep_ids.tolist())
+        bad = []
+        for ep, (s, e) in trim.items():
+            if ep not in keep_set:
+                continue  # trimmed episode is being dropped, not kept
+            pos = int(np.searchsorted(keep_ids, ep))
+            length = int(raw_lengths[pos])
+            if not (0 <= s < e <= length):
+                bad.append((ep, s, e, length))
+                continue
+            trim_starts[pos], trim_ends[pos] = s, e
+        if bad:
+            raise ValueError(f"invalid trim (start, end, episode length): {bad}")
 
     warnings: list[str] = []
     stat_arrays: dict[str, list[np.ndarray]] = {k: [] for k in old_stats}
@@ -110,10 +164,24 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
         if not mask.any():
             continue
         table = table.filter(pa.array(mask))
-        n = table.num_rows
         new_ep = np.searchsorted(keep_ids, table["episode_index"].to_numpy())
+        if trim:
+            local_frame = table["frame_index"].to_numpy()
+            keep_frame = (local_frame >= trim_starts[new_ep]) & (local_frame < trim_ends[new_ep])
+            if not keep_frame.all():
+                table = table.filter(pa.array(keep_frame))
+                new_ep = new_ep[keep_frame]
+                local_frame = local_frame[keep_frame]
+        n = table.num_rows
+        if n == 0:
+            continue
         table = _set(table, "episode_index", new_ep)
         table = _set(table, "index", offset + np.arange(n))
+        if trim:
+            shift = trim_starts[new_ep]
+            table = _set(table, "frame_index", local_frame - shift)
+            if "timestamp" in table.column_names:
+                table = _set(table, "timestamp", table["timestamp"].to_numpy() - shift / fps)
         for name in stat_arrays:
             if name in table.column_names:
                 stat_arrays[name].append(_as_matrix(table[name]))
@@ -121,12 +189,15 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
         _write(table, out / f.relative_to(src))
         offset += n
 
+    if not new_episode_rows:
+        raise ValueError("no frames left after trimming")
     new_ep_all = np.concatenate(new_episode_rows)
     if np.any(np.diff(new_ep_all) < 0):
         raise ValueError("episodes are not stored in ascending order across the data files")
     counts = np.bincount(new_ep_all, minlength=len(keep_ids))
     ends = np.cumsum(counts)
     starts = ends - counts
+    trimmed_frames = int(raw_lengths.sum() - counts.sum())
 
     episode_tables = []
     for f in episode_files:
@@ -140,11 +211,14 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
         table = _set(table, "dataset_to_index", ends[new_ep])
         if "length" in table.column_names:
             declared = table["length"].to_numpy()
-            if np.any(declared != counts[new_ep]):
+            if np.any(declared != raw_lengths[new_ep]):
                 warnings.append(
                     "meta/episodes 'length' disagrees with the data for some episodes "
                     "(run `demoqc score` to see the metadata flags)"
                 )
+            table = _set(table, "length", counts[new_ep])
+        if trim:
+            table = _shift_video_spans(table, new_ep, trim_starts, raw_lengths - trim_ends, fps)
         episode_tables.append((f, table))
     if sum(t.num_rows for _, t in episode_tables) != len(keep_ids):
         raise ValueError("meta/episodes is missing rows for some of the episodes to keep")
@@ -180,6 +254,7 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
         dropped=dropped.tolist(),
         frames=int(ends[-1]),
         has_videos=any(f.get("dtype") == "video" for f in info.get("features", {}).values()),
+        trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
     )
 
@@ -187,6 +262,25 @@ def export_dataset(src: Path, out: Path, keep: Iterable[int]) -> ExportResult:
 def _write(table: pa.Table, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
+
+
+def _shift_video_spans(
+    table: pa.Table, new_ep: np.ndarray, lead: np.ndarray, trail: np.ndarray, fps: float
+) -> pa.Table:
+    """Narrow each camera's ``from_timestamp``/``to_timestamp`` window by ``lead``/``trail``
+    frames (indexed by ``new_ep``), so it still points at exactly the kept part of the video."""
+    prefixes = {
+        c[: -len("/from_timestamp")]
+        for c in table.column_names
+        if c.startswith("videos/") and c.endswith("/from_timestamp")
+    }
+    for prefix in prefixes:
+        from_col, to_col = f"{prefix}/from_timestamp", f"{prefix}/to_timestamp"
+        if to_col not in table.column_names:
+            continue
+        table = _set(table, from_col, table[from_col].to_numpy() + lead[new_ep] / fps)
+        table = _set(table, to_col, table[to_col].to_numpy() - trail[new_ep] / fps)
+    return table
 
 
 def _set(table: pa.Table, name: str, values: np.ndarray) -> pa.Table:
