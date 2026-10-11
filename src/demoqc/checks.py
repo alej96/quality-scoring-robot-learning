@@ -36,6 +36,12 @@ class Config:
     sync_lag_outlier_frames: float = 2.0  # flag if an episode's lag differs from the median by more
     dedupe_resample_len: int = 50  # points each trimmed action trajectory is resampled to
     dedupe_z: float = 3.0  # near-duplicate if nn distance < median nn distance - this * MAD
+    gripper_active_frac: float = 0.5  # episode's gripper range must exceed this * dataset scale
+    gripper_hysteresis_frac: float = 0.15  # fraction of the episode's own range, debounces noise
+    gripper_chatter_window_s: float = 1.0  # sliding window toggles are counted over
+    gripper_chatter_min_toggles: int = (
+        4  # that many open/close transitions in the window is chatter
+    )
 
 
 @dataclass
@@ -67,12 +73,16 @@ class DatasetContext:
     action_scale: np.ndarray | None  # robust std per action dim
     step_p99: np.ndarray | None  # 99th pct |delta action| per dim, in scaled units
     idle_speed: float  # speed threshold, scaled units / s
+    gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
 
     @classmethod
     def build(cls, ds: Dataset, cfg: Config) -> DatasetContext:
+        gripper_dims = [
+            i for i, name in enumerate(ds.action_names or []) if name and "gripper" in name.lower()
+        ]
         actions = [e.action for e in ds.episodes if e.action is not None and len(e.action) > 1]
         if not actions:
-            return cls(ds.fps, None, None, 0.0)
+            return cls(ds.fps, None, None, 0.0, gripper_dims)
         allA = np.concatenate(actions)
         q75, q25 = np.percentile(allA, [75, 25], axis=0)
         scale = (q75 - q25) / 1.349
@@ -91,6 +101,7 @@ class DatasetContext:
             action_scale=scale,
             step_p99=step_p99,
             idle_speed=cfg.idle_fraction_of_p75 * p75,
+            gripper_dims=gripper_dims,
         )
 
 
@@ -353,6 +364,68 @@ def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
         )
 
 
+def _hysteresis_state(pos: np.ndarray, mid: float, band: float) -> np.ndarray:
+    """Binary open/closed state with hysteresis: only crosses when past ``mid +/- band``,
+    so noise sitting near the midpoint doesn't register as a toggle."""
+    state = np.empty(len(pos), dtype=bool)
+    cur = bool(pos[0] > mid)
+    for i, v in enumerate(pos):
+        if v > mid + band:
+            cur = True
+        elif v < mid - band:
+            cur = False
+        state[i] = cur
+    return state
+
+
+def _max_in_window(times: np.ndarray, window_s: float) -> int:
+    """Largest count of ``times`` falling within any ``window_s``-second span."""
+    j, best = 0, 0
+    for i in range(len(times)):
+        while times[i] - times[j] > window_s:
+            j += 1
+        best = max(best, i - j + 1)
+    return best
+
+
+def check_gripper_chatter(
+    ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
+) -> None:
+    """Rapid open/close toggling on a gripper dim: an anxious-squeeze teleop artifact, not
+    a deliberate grasp. Gripper dims are found by feature name (``names`` in
+    ``meta/info.json``); datasets without feature names skip this check."""
+    if not ctx.gripper_dims or ep.action is None or ctx.action_scale is None or ep.length < 5:
+        return
+    worst_count, worst_dim = 0, None
+    for dim in ctx.gripper_dims:
+        pos = ep.action[:, dim]
+        scale = ctx.action_scale[dim]
+        span = float(pos.max() - pos.min())
+        if not np.isfinite(scale) or span < cfg.gripper_active_frac * scale:
+            continue  # gripper barely moved this episode; nothing to debounce or flag
+        mid = (float(pos.max()) + float(pos.min())) / 2
+        state = _hysteresis_state(pos, mid, cfg.gripper_hysteresis_frac * span)
+        edges = np.flatnonzero(np.diff(state.astype(np.int8)) != 0) + 1
+        if len(edges) < cfg.gripper_chatter_min_toggles:
+            continue
+        count = _max_in_window(ep.timestamps[edges], cfg.gripper_chatter_window_s)
+        if count > worst_count:
+            worst_count, worst_dim = count, dim
+    if worst_dim is None:
+        return
+    out.metrics["gripper_toggles_per_window"] = worst_count
+    if worst_count >= cfg.gripper_chatter_min_toggles:
+        out.flags.append(
+            Flag(
+                "gripper_chatter",
+                WARN,
+                f"gripper toggled {worst_count}x within {cfg.gripper_chatter_window_s:.1f}s "
+                f"(dim {worst_dim}); chatter rather than a deliberate grasp?",
+                min(20.0, 3.0 * worst_count),
+            )
+        )
+
+
 def check_relative(results: list[EpisodeResult], ctx: DatasetContext, cfg: Config) -> None:
     """Checks that compare an episode to its peers in the same dataset."""
     if len(results) < 5:
@@ -441,6 +514,7 @@ EPISODE_CHECKS = [
     check_smoothness,
     check_staleness,
     check_sync,
+    check_gripper_chatter,
 ]
 
 

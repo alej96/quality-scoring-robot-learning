@@ -59,8 +59,17 @@ Work top-down through **Next up**. Each item should ship in one focused session
 - [ ] **Hub integration: `demoqc push-report <repo_id>`.** Upload the JSON report plus a
       Markdown summary to the dataset repo as a Hub pull request (`create_pr=True`), so
       dataset owners get actionable feedback. Generate a dataset-card snippet with a badge.
-- [ ] **Gripper chatter check.** Detect gripper dims by feature name (`gripper` in
+- [x] **Gripper chatter check.** Detect gripper dims by feature name (`gripper` in
       `names`) and flag rapid open/close toggling, a common teleop artifact.
+      Shipped as the `gripper_chatter` check. `dataset.py` now reads `info["features"]["action"]["names"]`
+      onto `Dataset.action_names` (previously unused); `DatasetContext.gripper_dims` finds dims whose
+      name contains "gripper" (case-insensitive). A dim counts as active only if its per-episode range
+      exceeds half the dataset's own robust scale for that dim (debounces noise on an unused or barely-
+      moved gripper); state changes use hysteresis (15% of the episode's own range) before counting
+      toggles, then flags 4+ toggles within any 1-second sliding window.
+      Follow-up: now that per-dim feature names are loaded, `check_sync` (`src/demoqc/checks.py`) could
+      match action/state dims by name instead of requiring `action.shape[1] == state.shape[1]`, so a
+      reordered or extra dim (e.g. an added gripper force sensor) no longer disables the sync check.
 - [ ] **Configurable thresholds.** `--config demoqc.toml` with per-check thresholds and
       penalty weights, plus `--disable-check NAME`. Document the defaults.
 - [ ] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
@@ -134,3 +143,14 @@ Work top-down through **Next up**. Each item should ship in one focused session
   flags), confirming no false positives when there is nothing to trim. The so100 community
   datasets used for earlier validation (masato-ka/so100_cutlery_handling_simple etc.) are
   v2.1, so `export` still rejects them with the existing "v2.x not implemented" error.
+- 2026-10-11: Added the `gripper_chatter` check (rapid open/close toggling via feature-name
+  lookup + hysteresis-debounced sliding-window toggle counting). Validated on
+  lerobot/svla_so101_pickplace (50 ep, max 2 toggles/window, well under the 4-toggle
+  threshold; every normal grasp is 1-2 toggles), masato-ka/so100_cutlery_handling_simple
+  (50 ep) and aaronsu11/so100_lego (100 ep), both also maxing out at 2 toggles/window, and
+  shylee/so100_cube (200 ep), where the gripper barely moves (0 episodes pass the active-range
+  filter) — no false positives on any of them. Also ran on lerobot/pusht (206 ep, no gripper
+  feature at all) to confirm the check degrades to a no-op rather than erroring when a dataset
+  has no feature names or no gripper dim. Synthetic test injects a 15-frame toggle burst on one
+  episode's gripper dim and checks it fires there only; confirmed the test fails with
+  `KeyError` before the implementation.

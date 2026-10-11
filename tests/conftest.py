@@ -12,6 +12,8 @@ import pytest
 
 FPS = 30
 DIMS = 6
+GRIPPER_DIM = DIMS - 1
+FEATURE_NAMES = [f"joint_{i}" for i in range(DIMS - 1)] + ["gripper"]
 
 
 @dataclass
@@ -26,6 +28,7 @@ class EpisodeSpec:
     meta_length_delta: int = 0
     state_lag_frames: int = 1  # observation.state tracks action with this many frames' delay
     state_decorrelated: bool = False  # state is unrelated motion, not a delayed copy of action
+    gripper_chatter_at: tuple[int, int] | None = None  # [start, end) frames of rapid toggling
     seed: int = 0
 
 
@@ -57,6 +60,10 @@ def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]
 
     for i in spec.spikes_at:
         action[i] += 40.0
+    if spec.gripper_chatter_at:
+        s, e = spec.gripper_chatter_at
+        toggle = np.where(np.arange(e - s) % 2 == 0, -40.0, 40.0)
+        action[s:e, GRIPPER_DIM] = action[s, GRIPPER_DIM] + toggle
     if spec.stale_state_from:
         s, e = spec.stale_state_from
         state[s:e] = state[s - 1]
@@ -152,8 +159,8 @@ def write_dataset(
     info["splits"] = {"train": f"0:{len(specs)}"}
     scalar = {"shape": [1], "names": None}
     info["features"] = {
-        "action": {"dtype": "float32", "shape": [DIMS], "names": None},
-        "observation.state": {"dtype": "float32", "shape": [DIMS], "names": None},
+        "action": {"dtype": "float32", "shape": [DIMS], "names": FEATURE_NAMES},
+        "observation.state": {"dtype": "float32", "shape": [DIMS], "names": FEATURE_NAMES},
         "observation.images.top": {"dtype": "video", "shape": [480, 640, 3], "names": None},
         "timestamp": {"dtype": "float32", **scalar},
         "frame_index": {"dtype": "int64", **scalar},
