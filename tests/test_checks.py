@@ -115,3 +115,15 @@ def test_clean_dataset_has_consistent_sync_lag(make_dataset):
     for r in results:
         assert r.metrics["sync_lag_frames"] == pytest.approx(1, abs=1)
         assert r.metrics["sync_peak_corr"] > 0.8
+
+
+def test_gripper_chatter(make_dataset):
+    # the operator rapidly double-taps the gripper for half a second: an anxious squeeze,
+    # not a deliberate open/close
+    specs = clean_specs()
+    specs[3] = EpisodeSpec(gripper_chatter_at=(100, 115), seed=3)
+    results = _results(make_dataset, specs)
+
+    assert results[3].metrics["gripper_toggles_per_window"] >= 4
+    assert "gripper_chatter" in _checks(results[3])
+    assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
