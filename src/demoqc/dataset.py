@@ -47,6 +47,7 @@ class Dataset:
     episodes: list[Episode]
     repo_id: str | None = None
     action_names: list[str] | None = None  # per-dim feature names, e.g. "gripper.pos"
+    state_names: list[str] | None = None  # observation.state per-dim feature names
 
     @property
     def total_frames(self) -> int:
@@ -100,6 +101,7 @@ def load_dataset(
         episodes=episodes,
         repo_id=repo_id,
         action_names=info.get("features", {}).get("action", {}).get("names"),
+        state_names=info.get("features", {}).get("observation.state", {}).get("names"),
     )
 
 

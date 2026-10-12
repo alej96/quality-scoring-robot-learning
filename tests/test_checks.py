@@ -117,6 +117,33 @@ def test_clean_dataset_has_consistent_sync_lag(make_dataset):
         assert r.metrics["sync_peak_corr"] > 0.8
 
 
+def test_sync_matches_dims_by_name_when_reordered(make_dataset):
+    # observation.state's columns are in a different order than action's (e.g. the
+    # recorder enumerates sensors differently per stream); matching dims positionally
+    # would compare unrelated joints and see no correlation anywhere
+    specs = clean_specs()
+    path = make_dataset(specs, state_perm=[5, 1, 2, 3, 4, 0])
+    results = evaluate(load_dataset(path))
+
+    for r in results:
+        assert r.metrics["sync_lag_frames"] == pytest.approx(1, abs=1)
+        assert r.metrics["sync_peak_corr"] > 0.8
+        assert "sync" not in _checks(r)
+
+
+def test_sync_survives_extra_unmatched_action_dim(make_dataset):
+    # an action-only "force_sensor" column (no observation.state counterpart) used to make
+    # action.shape[1] != state.shape[1] and disable the sync check for the whole dataset
+    specs = clean_specs()
+    specs[6] = EpisodeSpec(state_lag_frames=6, seed=6)
+    path = make_dataset(specs, extra_action_dim=True)
+    results = evaluate(load_dataset(path))
+
+    assert results[6].metrics["sync_lag_frames"] == pytest.approx(6, abs=1)
+    assert "sync" in _checks(results[6])
+    assert all("sync" not in _checks(r) for i, r in enumerate(results) if i != 6)
+
+
 def test_gripper_chatter(make_dataset):
     # the operator rapidly double-taps the gripper for half a second: an anxious squeeze,
     # not a deliberate open/close

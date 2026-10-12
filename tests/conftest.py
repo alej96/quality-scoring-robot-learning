@@ -99,9 +99,20 @@ def _image_stats(rng: np.random.Generator, count: int) -> dict[str, list]:
 
 
 def write_dataset(
-    root: Path, specs: list[EpisodeSpec], version: str = "v3.0", data_files: int = 1
+    root: Path,
+    specs: list[EpisodeSpec],
+    version: str = "v3.0",
+    data_files: int = 1,
+    state_perm: list[int] | None = None,
+    extra_action_dim: bool = False,
 ) -> Path:
-    """``data_files`` > 1 spreads the episodes over that many v3.0 data files."""
+    """``data_files`` > 1 spreads the episodes over that many v3.0 data files.
+
+    ``state_perm`` reorders observation.state's columns (and feature names) relative to
+    action's, e.g. ``[1, 0, 2, 3, 4, 5]`` swaps the first two. ``extra_action_dim`` appends
+    a constant action-only column (an unmatched extra sensor with no observation.state
+    counterpart) named ``force_sensor``.
+    """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
     frames, episodes = [], []
@@ -109,6 +120,11 @@ def write_dataset(
     rng = np.random.default_rng(123)
     for ep, spec in enumerate(specs):
         ts, action, state = make_episode(spec)
+        if state_perm is not None:
+            state = state[:, state_perm]
+        if extra_action_dim:
+            extra = np.full((len(action), 1), 1.0) + rng.normal(0, 1e-4, (len(action), 1))
+            action = np.hstack([action, extra])
         n = len(ts)
         frames.append(
             pd.DataFrame(
@@ -158,9 +174,18 @@ def write_dataset(
     }
     info["splits"] = {"train": f"0:{len(specs)}"}
     scalar = {"shape": [1], "names": None}
+    action_names = FEATURE_NAMES + ["force_sensor"] if extra_action_dim else FEATURE_NAMES
+    if state_perm is not None:
+        state_names = [FEATURE_NAMES[i] for i in state_perm]
+    else:
+        state_names = FEATURE_NAMES
     info["features"] = {
-        "action": {"dtype": "float32", "shape": [DIMS], "names": FEATURE_NAMES},
-        "observation.state": {"dtype": "float32", "shape": [DIMS], "names": FEATURE_NAMES},
+        "action": {"dtype": "float32", "shape": [len(action_names)], "names": action_names},
+        "observation.state": {
+            "dtype": "float32",
+            "shape": [len(state_names)],
+            "names": state_names,
+        },
         "observation.images.top": {"dtype": "video", "shape": [480, 640, 3], "names": None},
         "timestamp": {"dtype": "float32", **scalar},
         "frame_index": {"dtype": "int64", **scalar},
@@ -214,7 +239,15 @@ def clean_specs(n: int = 12) -> list[EpisodeSpec]:
 
 @pytest.fixture
 def make_dataset(tmp_path):
-    def _make(specs: list[EpisodeSpec], version: str = "v3.0", data_files: int = 1) -> Path:
-        return write_dataset(tmp_path / f"ds-{version}", specs, version, data_files)
+    def _make(
+        specs: list[EpisodeSpec],
+        version: str = "v3.0",
+        data_files: int = 1,
+        state_perm: list[int] | None = None,
+        extra_action_dim: bool = False,
+    ) -> Path:
+        return write_dataset(
+            tmp_path / f"ds-{version}", specs, version, data_files, state_perm, extra_action_dim
+        )
 
     return _make
