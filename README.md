@@ -87,7 +87,7 @@ data. Episodes with no suggested trim are kept in full.
 | `smoothness` | single-frame glitches, abrupt jumps, demos far jerkier than their peers | per-dimension step size vs dataset p99; log dimensionless jerk (LDLJ) robust z-score |
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
 | `length` | demos with far less (aborted?) or far more activity than peers | robust z-score of active (trimmed) duration |
-| `sync` | bad action/state sync (USB latency spikes, recorder bugs) | cross-correlate per-dim velocities over ±0.5s; flag low peak correlation or a lag far from the dataset median |
+| `sync` | bad action/state sync (USB latency spikes, recorder bugs) | match action/`observation.state` dims by feature name (falls back to position if either stream lacks names), cross-correlate per-dim velocities over ±0.5s; flag low peak correlation or a lag far from the dataset median |
 | `duplicate` | exact (re-run upload) and near-duplicate (repeated demo) episodes | hash of raw action/state for exact matches; L2 distance of resampled, trimmed, scaled action trajectories vs. the dataset's own nearest-neighbour distance distribution for near matches |
 | `gripper_chatter` | rapid open/close toggling (anxious squeeze, not a deliberate grasp) | find gripper dim(s) by feature name (`gripper` in `meta/info.json`'s `names`); hysteresis-debounced open/closed state, flag 4+ toggles within any 1s window |
 

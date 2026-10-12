@@ -67,9 +67,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
       exceeds half the dataset's own robust scale for that dim (debounces noise on an unused or barely-
       moved gripper); state changes use hysteresis (15% of the episode's own range) before counting
       toggles, then flags 4+ toggles within any 1-second sliding window.
-      Follow-up: now that per-dim feature names are loaded, `check_sync` (`src/demoqc/checks.py`) could
-      match action/state dims by name instead of requiring `action.shape[1] == state.shape[1]`, so a
-      reordered or extra dim (e.g. an added gripper force sensor) no longer disables the sync check.
+      Follow-up (resolved 2026-10-12): `check_sync` now matches action/state dims by name
+      instead of requiring `action.shape[1] == state.shape[1]`, so a reordered or extra dim
+      (e.g. an added force sensor) no longer disables the sync check. See the Log entry.
 - [ ] **Configurable thresholds.** `--config demoqc.toml` with per-check thresholds and
       penalty weights, plus `--disable-check NAME`. Document the defaults.
 - [ ] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
@@ -154,3 +154,21 @@ Work top-down through **Next up**. Each item should ship in one focused session
   has no feature names or no gripper dim. Synthetic test injects a 15-frame toggle burst on one
   episode's gripper dim and checks it fires there only; confirmed the test fails with
   `KeyError` before the implementation.
+- 2026-10-12: `check_sync` now matches action/observation.state dims by feature name
+  (`Dataset.state_names`, newly loaded from `info["features"]["observation.state"]["names"]`)
+  instead of requiring the two streams to have equal width. Previously, any dataset where
+  the two streams had different widths (e.g. an extra, unmatched sensor dim on one side)
+  silently disabled the sync check for every episode; a dataset where both streams had the
+  same width but a different dim order would get wrong lag/correlation estimates from
+  comparing unrelated dims position-by-position. Falls back to positional matching when
+  either stream lacks feature names, so nothing changes for datasets without them. Two new
+  synthetic tests confirm both bugs: one reorders `observation.state`'s columns relative to
+  `action`'s (previously computed near-zero peak correlation for a dataset that is in fact
+  tightly synced, risking a false `sync` flag; now correctly reports r>0.8), the other adds
+  an action-only `force_sensor` dim with no state counterpart (previously the sync check
+  produced no metrics at all; now it still detects an injected 6-frame lag). Both tests fail
+  with the pre-fix code (`KeyError` / an assertion on `sync_peak_corr`). Validated on
+  lerobot/svla_so101_pickplace (50 ep), masato-ka/so100_cutlery_handling_simple (50 ep) and
+  aaronsu11/so100_lego (100 ep): all three have identically-ordered, identically-named
+  action/state features, so matched dims are unchanged (`[0..5]`/`[0..5]`) and scores, sync
+  metrics and flags are byte-for-byte the same as before this change — no regression.
