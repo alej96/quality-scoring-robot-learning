@@ -67,6 +67,30 @@ class EpisodeResult:
         return float(max(0.0, 100.0 - sum(f.penalty for f in self.flags)))
 
 
+def _match_sync_dims(
+    action_names: list[str] | None,
+    state_names: list[str] | None,
+    action_width: int | None,
+    state_width: int | None,
+) -> tuple[list[int], list[int]] | None:
+    """Pair up action and observation.state dims to cross-correlate for the sync check.
+
+    Matches by feature name when both streams have names, so a reordered or extra dim
+    (e.g. an added sensor) doesn't disable the check; falls back to comparing same-width
+    streams positionally when names aren't available.
+    """
+    if action_names and state_names:
+        state_pos = {name: i for i, name in enumerate(state_names) if name}
+        pairs = [(i, state_pos[name]) for i, name in enumerate(action_names) if name in state_pos]
+        if not pairs:
+            return None  # names present but nothing in common; don't guess positionally
+        a_idx, s_idx = zip(*pairs, strict=True)
+        return list(a_idx), list(s_idx)
+    if action_width is None or state_width is None or action_width != state_width:
+        return None
+    return list(range(action_width)), list(range(state_width))
+
+
 @dataclass
 class DatasetContext:
     fps: float
@@ -74,15 +98,19 @@ class DatasetContext:
     step_p99: np.ndarray | None  # 99th pct |delta action| per dim, in scaled units
     idle_speed: float  # speed threshold, scaled units / s
     gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
+    sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
 
     @classmethod
     def build(cls, ds: Dataset, cfg: Config) -> DatasetContext:
         gripper_dims = [
             i for i, name in enumerate(ds.action_names or []) if name and "gripper" in name.lower()
         ]
+        a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
+        s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
+        sync_dims = _match_sync_dims(ds.action_names, ds.state_names, a_width, s_width)
         actions = [e.action for e in ds.episodes if e.action is not None and len(e.action) > 1]
         if not actions:
-            return cls(ds.fps, None, None, 0.0, gripper_dims)
+            return cls(ds.fps, None, None, 0.0, gripper_dims, sync_dims)
         allA = np.concatenate(actions)
         q75, q25 = np.percentile(allA, [75, 25], axis=0)
         scale = (q75 - q25) / 1.349
@@ -102,6 +130,7 @@ class DatasetContext:
             step_p99=step_p99,
             idle_speed=cfg.idle_fraction_of_p75 * p75,
             gripper_dims=gripper_dims,
+            sync_dims=sync_dims,
         )
 
 
@@ -345,12 +374,14 @@ def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
     session; that episode's best-fit lag will differ from its peers' even though each
     stream looks fine on its own.
     """
-    if ep.action is None or ep.state is None or ep.length < 10:
+    if ep.action is None or ep.state is None or ep.length < 10 or ctx.sync_dims is None:
         return
-    if ep.action.shape[1] != ep.state.shape[1]:
-        return  # no feature names to match dims by; only compare same-width streams
+    a_idx, s_idx = ctx.sync_dims
+    if max(a_idx) >= ep.action.shape[1] or max(s_idx) >= ep.state.shape[1]:
+        return  # this episode's streams are narrower than the dataset's matched dims
+    action, state = ep.action[:, a_idx], ep.state[:, s_idx]
     max_lag = max(1, int(round(cfg.sync_max_lag_s * ctx.fps)))
-    lag, corr = _best_lag(np.diff(ep.action, axis=0), np.diff(ep.state, axis=0), max_lag)
+    lag, corr = _best_lag(np.diff(action, axis=0), np.diff(state, axis=0), max_lag)
     out.metrics.update(sync_lag_frames=float(lag), sync_lag_s=lag / ctx.fps, sync_peak_corr=corr)
     if corr < cfg.sync_min_peak_corr:
         out.flags.append(
