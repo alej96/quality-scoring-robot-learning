@@ -26,6 +26,20 @@ def test_score_writes_reports(make_dataset, tmp_path, capsys):
     assert "ep     0" in capsys.readouterr().out
 
 
+def test_score_writes_markdown(make_dataset, tmp_path):
+    specs = clean_specs()
+    specs[0] = EpisodeSpec(lead_idle_s=2.0, spikes_at=[150], seed=0)
+    root = make_dataset(specs)
+    out_md = tmp_path / "r.md"
+
+    assert main(["score", str(root), "--md", str(out_md), "--quiet"]) == 0
+
+    md = out_md.read_text()
+    assert md.startswith("### demoqc report:")
+    assert "| mean score |" in md
+    assert "idle" in md
+
+
 def test_fail_under(make_dataset):
     root = make_dataset(clean_specs())
     assert main(["score", str(root), "--quiet", "--fail-under", "50"]) == 0
