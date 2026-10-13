@@ -59,6 +59,11 @@ Work top-down through **Next up**. Each item should ship in one focused session
 - [ ] **Hub integration: `demoqc push-report <repo_id>`.** Upload the JSON report plus a
       Markdown summary to the dataset repo as a Hub pull request (`create_pr=True`), so
       dataset owners get actionable feedback. Generate a dataset-card snippet with a badge.
+      Skipped this run in favour of the `--md` item below: there is no `HF_TOKEN` in this
+      environment, so a Hub PR can't be created or validated end to end, and opening PRs on
+      real community dataset repos isn't something to ship untested. The Markdown body this
+      needs (`format_markdown`) is now done; `push-report` is mostly `HfApi.create_commit` /
+      `create_pull_request` plumbing once a token is available.
 - [x] **Gripper chatter check.** Detect gripper dims by feature name (`gripper` in
       `names`) and flag rapid open/close toggling, a common teleop artifact.
       Shipped as the `gripper_chatter` check. `dataset.py` now reads `info["features"]["action"]["names"]`
@@ -72,7 +77,15 @@ Work top-down through **Next up**. Each item should ship in one focused session
       (e.g. an added force sensor) no longer disables the sync check. See the Log entry.
 - [ ] **Configurable thresholds.** `--config demoqc.toml` with per-check thresholds and
       penalty weights, plus `--disable-check NAME`. Document the defaults.
-- [ ] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
+- [x] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
+      Shipped as `demoqc score --md report.md` and `src/demoqc/report.py::format_markdown`:
+      a score/flags table, duplicate-group counts, and a table of the lowest-scoring
+      episodes with their flags, matching `format_summary`'s content but as GitHub/Hub-
+      flavoured Markdown tables. Table cells escape `|` in flag messages so an unusual
+      message can't break a row.
+      Follow-up: this is the Markdown half of the `push-report` item above; once that ships,
+      it should reuse `format_markdown` as the PR/dataset-card body instead of generating its
+      own text.
 - [ ] **Scale to large datasets.** Stream per data file instead of loading everything at
       once; add `--episodes 0-99` and `--max-episodes`. Target: DROID-scale metadata without
       running out of memory.
@@ -172,3 +185,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
   aaronsu11/so100_lego (100 ep): all three have identically-ordered, identically-named
   action/state features, so matched dims are unchanged (`[0..5]`/`[0..5]`) and scores, sync
   metrics and flags are byte-for-byte the same as before this change — no regression.
+- 2026-10-13: Added `demoqc score --md report.md` (`format_markdown` in `report.py`), a
+  Markdown rendering of the same summary `format_summary` prints to the terminal, for
+  pasting into a dataset card or a Hub/GitHub PR. Flag messages are escaped (`|` -> `\|`)
+  so a stray pipe can't break a table row. Validated on lerobot/svla_so101_pickplace
+  (50 ep, v3.0) and masato-ka/so100_cutlery_handling_simple (50 ep, v2.1): both render as
+  clean GitHub-flavoured Markdown tables with no escaping artifacts. Skipped the
+  higher-priority `push-report` item this run — no `HF_TOKEN` in this environment to create
+  or validate a real Hub PR — and left a note on it pointing back to `format_markdown` as
+  the body it should reuse.

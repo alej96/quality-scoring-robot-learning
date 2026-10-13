@@ -24,6 +24,7 @@ pip install git+https://github.com/alej96/quality-scoring-robot-learning
 demoqc score lerobot/svla_so101_pickplace
 demoqc score ./my_dataset --json report.json --csv report.csv --min-score 80
 demoqc score user/dataset --fail-under 85   # non-zero exit for CI gates
+demoqc score user/dataset --md report.md    # Markdown summary for a dataset card or PR
 demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episodes
 
 # write a cleaned copy (LeRobot v3.0) without the episodes below --min-score
@@ -52,6 +53,10 @@ lowest-scoring episodes (top 3):
 The JSON report (`schema_version: 1`) contains, per episode, a 0-100 `score`, every
 `flag` with its severity and penalty, raw `metrics`, and a suggested `trim` frame range.
 `summary.keep` lists the episodes at or above `--min-score`.
+
+`--md report.md` writes the same summary as a Markdown file: score and flag tables, the
+duplicate-group counts, and a table of the lowest-scoring episodes, ready to paste into a
+Hugging Face dataset card or a GitHub/Hub pull request.
 
 ## Exporting a cleaned dataset
 
