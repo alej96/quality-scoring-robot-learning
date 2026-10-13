@@ -12,7 +12,7 @@ from demoqc.checks import Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
 from demoqc.export import export_dataset, keep_from_report, trim_from_report
-from demoqc.report import build_report, format_summary, write_csv, write_json
+from demoqc.report import build_report, format_markdown, format_summary, write_csv, write_json
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,6 +30,9 @@ def _parser() -> argparse.ArgumentParser:
     score.add_argument("--revision", help="Hub branch, tag or commit")
     score.add_argument("--json", type=Path, help="write the full report as JSON")
     score.add_argument("--csv", type=Path, help="write one row per episode as CSV")
+    score.add_argument(
+        "--md", type=Path, help="write a Markdown summary, for a dataset card or a Hub/GitHub PR"
+    )
     score.add_argument(
         "--min-score",
         type=float,
@@ -117,6 +120,8 @@ def _score(args: argparse.Namespace) -> int:
         write_json(report, args.json)
     if args.csv:
         write_csv(report, args.csv)
+    if args.md:
+        args.md.write_text(format_markdown(report, top=args.top) + "\n")
     if not args.quiet:
         print(format_summary(report, top=args.top))
     if args.fail_under is not None and report["summary"]["mean_score"] < args.fail_under:
