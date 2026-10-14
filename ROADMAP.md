@@ -75,8 +75,18 @@ Work top-down through **Next up**. Each item should ship in one focused session
       Follow-up (resolved 2026-10-12): `check_sync` now matches action/state dims by name
       instead of requiring `action.shape[1] == state.shape[1]`, so a reordered or extra dim
       (e.g. an added force sensor) no longer disables the sync check. See the Log entry.
-- [ ] **Configurable thresholds.** `--config demoqc.toml` with per-check thresholds and
-      penalty weights, plus `--disable-check NAME`. Document the defaults.
+- [x] **Configurable thresholds (slice 1): `--config demoqc.toml`.** Override any subset of
+      `Config`'s threshold/penalty fields from a TOML file, for `score` and `dedupe`.
+      Shipped as `Config.from_file`/`Config.with_overrides` (`src/demoqc/checks.py`) and
+      `--config FILE.toml` on both subcommands. Unknown keys or wrong-typed values raise a
+      clear error (naming the key) instead of being silently ignored or miscalibrating the
+      run; `tomli` is pulled in as a dependency only on Python < 3.11 (stdlib `tomllib`
+      covers 3.11+).
+      Follow-up: **`--disable-check NAME`** to skip individual checks entirely (e.g. a
+      dataset with no gripper but a noisy `sync` check from an unsynced third camera clock).
+      Needs a per-check name registry shared between `EPISODE_CHECKS` and the names
+      `check_relative` emits (`length`, plus the peer-comparison halves of `smoothness` and
+      `sync`), which this slice didn't touch.
 - [x] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
       Shipped as `demoqc score --md report.md` and `src/demoqc/report.py::format_markdown`:
       a score/flags table, duplicate-group counts, and a table of the lowest-scoring
@@ -194,3 +204,18 @@ Work top-down through **Next up**. Each item should ship in one focused session
   higher-priority `push-report` item this run — no `HF_TOKEN` in this environment to create
   or validate a real Hub PR — and left a note on it pointing back to `format_markdown` as
   the body it should reuse.
+- 2026-10-14: Added `--config demoqc.toml` to `demoqc score`/`demoqc dedupe`
+  (`Config.from_file`/`Config.with_overrides`), overriding any subset of the threshold and
+  penalty fields in `Config` so a different embodiment, fps or operator style doesn't need a
+  code change. Unknown keys and wrong-typed values are rejected with an error naming the
+  key. `huggingface.co` was reachable this run but there is still no `HF_TOKEN`, so
+  `push-report` (which needs to open a Hub PR on someone else's dataset repo) stays blocked;
+  picked this item instead. Validated on lerobot/svla_so101_pickplace (50 ep, v3.0: mean
+  score 97.13 at defaults, 97.14 with a config loosening `max_idle_fraction`,
+  `gripper_chatter_min_toggles` and `sync_min_peak_corr`) and
+  masato-ka/so100_cutlery_handling_simple (50 ep, v2.1: 92.92 at defaults, 93.47 tuned),
+  confirming thresholds actually move scores end to end and a bad config file exits 2 with a
+  clear message on both. New `tests/test_config.py` (8 cases: override/validation on
+  `Config` directly, TOML parsing, a synthetic gripper-chatter episode that only flags once
+  `gripper_chatter_min_toggles` is lowered via config, and both CLI paths) fails on 7/8
+  cases without this change.
