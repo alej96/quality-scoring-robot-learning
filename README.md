@@ -103,6 +103,27 @@ trimmable idle) cost little because they can be fixed automatically.
 except the lowest-indexed (kept) one. `demoqc dedupe <source>` runs duplicate detection on
 its own and prints the groups (`--json` writes them out).
 
+## Configurable thresholds
+
+Every threshold and penalty is a field of `demoqc.checks.Config`
+(`src/demoqc/checks.py`), calibrated on public SO-100/SO-101 datasets. A different
+embodiment, fps or operator style can warrant different values, so `score` and `dedupe`
+take `--config FILE.toml` to override any subset of them:
+
+```toml
+# demoqc.toml
+max_idle_fraction = 0.6          # this robot's task legitimately has long idle holds
+gripper_chatter_min_toggles = 6  # this gripper is driven by a noisy analog stick
+```
+
+```bash
+demoqc score user/dataset --config demoqc.toml
+```
+
+Unknown keys or values of the wrong type are rejected with an error naming the key, so a
+typo fails loudly instead of being silently ignored. Keys not listed in the file keep their
+default.
+
 ## Development
 
 ```bash
@@ -111,8 +132,8 @@ ruff check . && ruff format --check . && pytest -q
 pytest -m network   # end-to-end against public Hub datasets
 ```
 
-See [ROADMAP.md](ROADMAP.md) for what's next (applying trims on export, pushing reports to
-the Hub, gripper chatter, configurable thresholds).
+See [ROADMAP.md](ROADMAP.md) for what's next (pushing reports to the Hub, disabling
+individual checks, scaling to large datasets).
 
 ## License
 
