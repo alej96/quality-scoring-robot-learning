@@ -8,13 +8,33 @@ LeRobot datasets (``lerobot/svla_so101_pickplace``, ``lerobot/pusht``).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import get_type_hints
 
 import numpy as np
 
 from demoqc.dataset import Dataset, Episode
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
+
 ERROR, WARN, INFO = "error", "warn", "info"
+
+
+def _coerce(expected: type, value: object, where: str) -> float | int:
+    if expected is float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"{where}: expected a number, got {value!r}")
+        return float(value)
+    if expected is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{where}: expected an integer, got {value!r}")
+        return value
+    raise ValueError(f"{where}: unsupported config field type {expected!r}")  # pragma: no cover
 
 
 @dataclass
@@ -42,6 +62,33 @@ class Config:
     gripper_chatter_min_toggles: int = (
         4  # that many open/close transitions in the window is chatter
     )
+
+    def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
+        """Return a copy with ``values`` applied, validating keys and types.
+
+        Every key must name an existing field (a typo or a renamed field fails loudly
+        instead of being silently ignored) and every value must match that field's type
+        (all fields are ``float`` or ``int``).
+        """
+        hints = get_type_hints(type(self))
+        known = {f.name for f in fields(self)}
+        unknown = sorted(set(values) - known)
+        if unknown:
+            raise ValueError(f"{source}: unknown config key(s): {', '.join(unknown)}")
+        changes = {k: _coerce(hints[k], v, f"{source}: {k}") for k, v in values.items()}
+        return replace(self, **changes)
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> Config:
+        """Load threshold/penalty overrides from a TOML file (see README for keys)."""
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"{path}: invalid TOML: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a table of config keys")
+        return cls().with_overrides(data, source=str(path))
 
 
 @dataclass

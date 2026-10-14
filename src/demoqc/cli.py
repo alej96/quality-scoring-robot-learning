@@ -28,6 +28,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     score.add_argument("source", help="local dataset directory or Hub repo id, e.g. lerobot/pusht")
     score.add_argument("--revision", help="Hub branch, tag or commit")
+    score.add_argument(
+        "--config",
+        type=Path,
+        metavar="FILE.toml",
+        help="TOML file overriding Config thresholds/penalties (see README's config table)",
+    )
     score.add_argument("--json", type=Path, help="write the full report as JSON")
     score.add_argument("--csv", type=Path, help="write one row per episode as CSV")
     score.add_argument(
@@ -55,6 +61,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     dedupe.add_argument("source", help="local dataset directory or Hub repo id")
     dedupe.add_argument("--revision", help="Hub branch, tag or commit")
+    dedupe.add_argument(
+        "--config",
+        type=Path,
+        metavar="FILE.toml",
+        help="TOML file overriding Config thresholds/penalties (see README's config table)",
+    )
     dedupe.add_argument("--json", type=Path, help="write the duplicate groups as JSON")
 
     export = sub.add_parser(
@@ -106,11 +118,23 @@ def _load(args: argparse.Namespace):
         return None
 
 
+def _config(args: argparse.Namespace) -> Config | None:
+    if not args.config:
+        return Config()
+    try:
+        return Config.from_file(args.config)
+    except (OSError, ValueError) as exc:
+        print(f"demoqc: {exc}", file=sys.stderr)
+        return None
+
+
 def _score(args: argparse.Namespace) -> int:
     ds = _load(args)
     if ds is None:
         return 2
-    cfg = Config()
+    cfg = _config(args)
+    if cfg is None:
+        return 2
     results = evaluate(ds, cfg)
     ctx = DatasetContext.build(ds, cfg)
     duplicate_groups = find_duplicates(ds, results, ctx, cfg)
@@ -133,7 +157,9 @@ def _dedupe(args: argparse.Namespace) -> int:
     ds = _load(args)
     if ds is None:
         return 2
-    cfg = Config()
+    cfg = _config(args)
+    if cfg is None:
+        return 2
     results = evaluate(ds, cfg)
     ctx = DatasetContext.build(ds, cfg)
     groups = find_duplicates(ds, results, ctx, cfg)
