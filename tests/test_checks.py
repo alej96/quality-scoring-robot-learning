@@ -73,6 +73,34 @@ def test_video_and_metadata_mismatch(make_dataset):
     assert "metadata" in _checks(results[4])
 
 
+def test_disable_check_suppresses_flags_and_metrics(make_dataset):
+    # a dataset with a real sync defect: --disable-check sync must silence it completely,
+    # not just hide the flag, so a noisy check can be turned off without polluting the
+    # report with metrics for a check the user doesn't trust
+    specs = clean_specs()
+    specs[6] = EpisodeSpec(state_lag_frames=6, seed=6)
+    ds = load_dataset(make_dataset(specs))
+
+    results = evaluate(ds, disabled_checks=frozenset({"sync"}))
+
+    assert all("sync" not in _checks(r) for r in results)
+    assert all("sync_lag_frames" not in r.metrics for r in results)
+
+
+def test_disable_check_leaves_other_checks_running(make_dataset):
+    # disabling one check must not affect the (split) metadata/video_sync checks or any
+    # other check in the same episode
+    specs = clean_specs()
+    specs[1] = EpisodeSpec(video_span_s=6.0, seed=1)
+    specs[4] = EpisodeSpec(meta_length_delta=-12, seed=4)
+    ds = load_dataset(make_dataset(specs))
+
+    results = evaluate(ds, disabled_checks=frozenset({"video_sync"}))
+
+    assert "video_sync" not in _checks(results[1])
+    assert "metadata" in _checks(results[4])
+
+
 def test_fixed_duration_recordings_are_not_length_outliers(make_dataset):
     # same wall-clock length, tiny spread: no episode should be called "aborted"
     specs = [EpisodeSpec(seconds=10, trail_idle_s=1.0 + 0.01 * i, seed=i) for i in range(12)]
@@ -85,6 +113,18 @@ def test_short_active_episode_is_flagged(make_dataset):
     specs[9] = EpisodeSpec(seconds=3.0, seed=9)
     results = _results(make_dataset, specs)
     assert "length" in _checks(results[9])
+
+
+def test_disable_check_length_has_no_episode_half_but_still_works(make_dataset):
+    # "length" is only ever emitted by check_relative (there's no EPISODE_CHECKS entry to
+    # disable), so it needs its own disabled_checks plumbing through evaluate()
+    specs = clean_specs()
+    specs[9] = EpisodeSpec(seconds=3.0, seed=9)
+    ds = load_dataset(make_dataset(specs))
+
+    results = evaluate(ds, disabled_checks=frozenset({"length"}))
+
+    assert all("length" not in _checks(r) for r in results)
 
 
 def test_sync_lag_outlier(make_dataset):

@@ -249,6 +249,9 @@ def check_metadata(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeRe
                 20,
             )
         )
+
+
+def check_video_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
     tolerance = cfg.gap_factor / ctx.fps
     data_duration = ep.length / ctx.fps
     bad = []
@@ -504,38 +507,45 @@ def check_gripper_chatter(
         )
 
 
-def check_relative(results: list[EpisodeResult], ctx: DatasetContext, cfg: Config) -> None:
+def check_relative(
+    results: list[EpisodeResult],
+    ctx: DatasetContext,
+    cfg: Config,
+    disabled_checks: frozenset[str] = frozenset(),
+) -> None:
     """Checks that compare an episode to its peers in the same dataset."""
     if len(results) < 5:
         return
     # Many recorders use a fixed episode duration, so compare active (trimmed) time and
     # require a material relative difference, not just a large z on a tiny spread.
-    active = np.array([_active_s(r) for r in results])
-    median = float(np.median(active))
-    for r, value in zip(results, active, strict=True):
-        r.metrics["active_s"] = value
-        z = _robust_z(value, active)
-        r.metrics["active_z"] = z
-        material = abs(value - median) > cfg.min_relative_length_diff * median
-        if z < -cfg.outlier_z and material:
-            r.flags.append(
-                Flag(
-                    "length",
-                    WARN,
-                    f"unusually short: {value:.1f}s of activity vs median "
-                    f"{median:.1f}s (z={z:.1f}); aborted demo?",
-                    10,
+    if "length" not in disabled_checks:
+        active = np.array([_active_s(r) for r in results])
+        median = float(np.median(active))
+        for r, value in zip(results, active, strict=True):
+            r.metrics["active_s"] = value
+            z = _robust_z(value, active)
+            r.metrics["active_z"] = z
+            material = abs(value - median) > cfg.min_relative_length_diff * median
+            if z < -cfg.outlier_z and material:
+                r.flags.append(
+                    Flag(
+                        "length",
+                        WARN,
+                        f"unusually short: {value:.1f}s of activity vs median "
+                        f"{median:.1f}s (z={z:.1f}); aborted demo?",
+                        10,
+                    )
                 )
-            )
-        elif z > cfg.outlier_z and material:
-            r.flags.append(
-                Flag(
-                    "length",
-                    INFO,
-                    f"unusually long: {value:.1f}s of activity vs median {median:.1f}s (z={z:.1f})",
-                    5,
+            elif z > cfg.outlier_z and material:
+                r.flags.append(
+                    Flag(
+                        "length",
+                        INFO,
+                        f"unusually long: {value:.1f}s of activity vs median "
+                        f"{median:.1f}s (z={z:.1f})",
+                        5,
+                    )
                 )
-            )
 
     ldlj = np.array([r.metrics.get("ldlj", np.nan) for r in results])
     valid = ldlj[np.isfinite(ldlj)]
@@ -586,24 +596,34 @@ def _active_s(r: EpisodeResult) -> float:
 
 
 EPISODE_CHECKS = [
-    check_timing,
-    check_metadata,
-    check_idle,
-    check_smoothness,
-    check_staleness,
-    check_sync,
-    check_gripper_chatter,
+    ("timing", check_timing),
+    ("metadata", check_metadata),
+    ("video_sync", check_video_sync),
+    ("idle", check_idle),
+    ("smoothness", check_smoothness),
+    ("stale_state", check_staleness),
+    ("sync", check_sync),
+    ("gripper_chatter", check_gripper_chatter),
 ]
 
+# Every name that can appear as a Flag.check, usable with --disable-check. "length" and
+# "duplicate" aren't in EPISODE_CHECKS: "length" is only ever emitted by check_relative
+# (no per-episode half to skip) and "duplicate" comes from dedupe.find_duplicates/
+# flag_duplicates, run separately by the CLI.
+CHECK_NAMES = tuple(name for name, _ in EPISODE_CHECKS) + ("length", "duplicate")
 
-def evaluate(ds: Dataset, cfg: Config | None = None) -> list[EpisodeResult]:
+
+def evaluate(
+    ds: Dataset, cfg: Config | None = None, disabled_checks: frozenset[str] = frozenset()
+) -> list[EpisodeResult]:
     cfg = cfg or Config()
     ctx = DatasetContext.build(ds, cfg)
+    checks = [(name, fn) for name, fn in EPISODE_CHECKS if name not in disabled_checks]
     results = []
     for ep in ds.episodes:
         r = EpisodeResult(ep.index, ep.length, ep.length / ds.fps, ep.task)
-        for check in EPISODE_CHECKS:
+        for _, check in checks:
             check(ep, ctx, cfg, r)
         results.append(r)
-    check_relative(results, ctx, cfg)
+    check_relative(results, ctx, cfg, disabled_checks)
     return results

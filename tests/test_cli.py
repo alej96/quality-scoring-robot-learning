@@ -1,6 +1,8 @@
 import csv
 import json
 
+import pytest
+
 from demoqc.cli import main
 from tests.conftest import EpisodeSpec, clean_specs
 
@@ -64,6 +66,41 @@ def test_score_reports_duplicates(make_dataset, tmp_path, capsys):
     assert len(groups) == 1 and groups[0]["kind"] == "exact"
     dup = next(e for e in report["episodes"] if e["episode_index"] == 9)
     assert any(f["check"] == "duplicate" for f in dup["flags"])
+
+
+def test_disable_check_duplicate_suppresses_group_and_flags(make_dataset, tmp_path, capsys):
+    specs = clean_specs()
+    specs[9] = specs[2]  # byte-identical re-run
+    root = make_dataset(specs)
+    out_json = tmp_path / "r.json"
+
+    assert (
+        main(
+            [
+                "score",
+                str(root),
+                "--disable-check",
+                "duplicate",
+                "--json",
+                str(out_json),
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(out_json.read_text())
+    assert report["summary"]["duplicate_groups"] == []
+    dup = next(e for e in report["episodes"] if e["episode_index"] == 9)
+    assert all(f["check"] != "duplicate" for f in dup["flags"])
+
+
+def test_disable_check_rejects_unknown_name(make_dataset, capsys):
+    root = make_dataset(clean_specs())
+    with pytest.raises(SystemExit) as exc:
+        main(["score", str(root), "--disable-check", "not_a_check"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_dedupe_command(make_dataset, tmp_path, capsys):

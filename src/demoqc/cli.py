@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from demoqc import __version__
-from demoqc.checks import Config, DatasetContext, evaluate
+from demoqc.checks import CHECK_NAMES, Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
 from demoqc.export import export_dataset, keep_from_report, trim_from_report
@@ -44,6 +44,14 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=70.0,
         help="episodes below this go on the reject list (default: 70)",
+    )
+    score.add_argument(
+        "--disable-check",
+        action="append",
+        choices=CHECK_NAMES,
+        metavar="NAME",
+        help="skip a check entirely (repeatable), e.g. a dataset with no gripper but a "
+        "noisy sync check from an unsynced third camera clock",
     )
     score.add_argument("--top", type=int, default=10, help="lowest-scoring episodes to print")
     score.add_argument(
@@ -135,10 +143,13 @@ def _score(args: argparse.Namespace) -> int:
     cfg = _config(args)
     if cfg is None:
         return 2
-    results = evaluate(ds, cfg)
-    ctx = DatasetContext.build(ds, cfg)
-    duplicate_groups = find_duplicates(ds, results, ctx, cfg)
-    flag_duplicates(results, duplicate_groups)
+    disabled = frozenset(args.disable_check or [])
+    results = evaluate(ds, cfg, disabled)
+    duplicate_groups = []
+    if "duplicate" not in disabled:
+        ctx = DatasetContext.build(ds, cfg)
+        duplicate_groups = find_duplicates(ds, results, ctx, cfg)
+        flag_duplicates(results, duplicate_groups)
     report = build_report(ds, results, min_score=args.min_score, duplicate_groups=duplicate_groups)
     if args.json:
         write_json(report, args.json)
