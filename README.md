@@ -124,6 +124,19 @@ Unknown keys or values of the wrong type are rejected with an error naming the k
 typo fails loudly instead of being silently ignored. Keys not listed in the file keep their
 default.
 
+To turn off a check entirely (e.g. a dataset with no gripper but a noisy `sync` check
+from an unsynced third camera clock, or duplicate detection on a dataset where every demo
+is intentionally similar), pass `--disable-check NAME` to `demoqc score` once per check:
+
+```bash
+demoqc score user/dataset --disable-check gripper_chatter --disable-check sync
+```
+
+Valid names are `timing`, `metadata`, `video_sync`, `idle`, `smoothness`, `stale_state`,
+`sync`, `gripper_chatter`, `length` and `duplicate`; an unknown name is rejected up front.
+Disabling a check removes both its flags and its metrics from the report, and (for
+`duplicate`) skips `duplicate_groups` and the duplicate-detection pass entirely.
+
 ## Development
 
 ```bash

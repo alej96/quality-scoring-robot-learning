@@ -82,11 +82,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
       clear error (naming the key) instead of being silently ignored or miscalibrating the
       run; `tomli` is pulled in as a dependency only on Python < 3.11 (stdlib `tomllib`
       covers 3.11+).
-      Follow-up: **`--disable-check NAME`** to skip individual checks entirely (e.g. a
-      dataset with no gripper but a noisy `sync` check from an unsynced third camera clock).
-      Needs a per-check name registry shared between `EPISODE_CHECKS` and the names
-      `check_relative` emits (`length`, plus the peer-comparison halves of `smoothness` and
-      `sync`), which this slice didn't touch.
+      Follow-up (shipped 2026-10-15 as `--disable-check NAME`; see the Log entry): a
+      per-check name registry (`checks.CHECK_NAMES`) shared between `EPISODE_CHECKS` and the
+      names `check_relative` emits, so a noisy check (e.g. `sync` on a dataset with an
+      unsynced third camera clock) can be turned off entirely instead of re-tuned.
 - [x] **Markdown report output (`--md`)** for pasting into dataset cards or PRs.
       Shipped as `demoqc score --md report.md` and `src/demoqc/report.py::format_markdown`:
       a score/flags table, duplicate-group counts, and a table of the lowest-scoring
@@ -219,3 +218,26 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `Config` directly, TOML parsing, a synthetic gripper-chatter episode that only flags once
   `gripper_chatter_min_toggles` is lowered via config, and both CLI paths) fails on 7/8
   cases without this change.
+- 2026-10-15: Added **`--disable-check NAME`** to `demoqc score` (the follow-up noted under
+  the `--config` item). Lets a check that's noise for a particular dataset (no gripper but a
+  jittery `sync` from an unsynced third camera clock; intentional near-identical demos that
+  shouldn't count as `duplicate`) be turned off instead of fought with thresholds. Split
+  `check_metadata` into `check_metadata` (episode length) and the new `check_video_sync`
+  (video span) so they're independently disableable; added `checks.CHECK_NAMES` (the
+  registry the original follow-up asked for, shared between `EPISODE_CHECKS` and
+  `check_relative`'s own `length` flag) and threaded `disabled_checks` through
+  `evaluate()`/`check_relative()`. `length` has no `EPISODE_CHECKS` entry (it's peer-only)
+  and `duplicate` isn't part of `checks.py` at all (the CLI calls
+  `dedupe.find_duplicates`/`flag_duplicates` separately), so both are special-cased in
+  `evaluate()` and `cli._score()` respectively; disabling a check removes its metrics too,
+  not just its flags. argparse `choices=CHECK_NAMES` rejects a typo'd name up front. 5 new
+  tests (disabling suppresses flags+metrics on a real sync defect, the metadata/video_sync
+  split stays independent, `length`'s peer-only path, the CLI's `duplicate` path, and the
+  argparse rejection) all fail without this change. Validated on
+  lerobot/svla_so101_pickplace (50 ep): disabling `gripper_chatter`+`sync` left
+  `flags_by_check` and mean score (97.13) byte-for-byte identical to the baseline (neither
+  check fires on this dataset) and left no `sync_*`/`gripper_*` metrics in the report. On
+  masato-ka/so100_cutlery_handling_simple (50 ep): disabling `duplicate`+`length` dropped
+  the 2 `length` flags from `flags_by_check` (`idle: 52, length: 2` -> `idle: 52`) and raised
+  mean score from 92.92 to 93.32, with `duplicate_groups` empty either way (none to
+  suppress) — confirms the flag removed is exactly the one disabled, nothing else moves.
