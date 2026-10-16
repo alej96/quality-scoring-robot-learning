@@ -95,9 +95,22 @@ Work top-down through **Next up**. Each item should ship in one focused session
       Follow-up: this is the Markdown half of the `push-report` item above; once that ships,
       it should reuse `format_markdown` as the PR/dataset-card body instead of generating its
       own text.
-- [ ] **Scale to large datasets.** Stream per data file instead of loading everything at
-      once; add `--episodes 0-99` and `--max-episodes`. Target: DROID-scale metadata without
-      running out of memory.
+- [x] **Scale to large datasets (slice 1): `--episodes` and `--max-episodes`.** Load only
+      some of a dataset's episodes. From the Hub, only the data file(s) that contain the
+      requested episodes are downloaded; locally, data files that contain none of them are
+      never opened.
+      Shipped as `demoqc score`/`demoqc dedupe --episodes SPEC`/`--max-episodes N`
+      (`load_dataset(..., episodes=, max_episodes=)` in `src/demoqc/dataset.py`). Metadata
+      (`meta/*`, always small) is downloaded first, then `meta/episodes`'
+      `data/chunk_index`/`data/file_index` columns (v3.0) or the `episode_<n>.parquet`
+      filename convention (v2.x) map the requested episodes to the exact data file(s) to
+      fetch or open; narrowing is best-effort and falls back to reading everything if a
+      layout can't be mapped from metadata alone, so it's never less correct, only
+      sometimes not faster.
+      Follow-up: this still doesn't bound peak memory when scoring *all* of a huge
+      dataset — `_read_frames` still concatenates every needed file into one DataFrame.
+      True per-file streaming (bounding memory independent of `--episodes`) is still open,
+      as is extending `--episodes`/`--max-episodes` to `demoqc export`.
 - [ ] **Video checks (optional `[video]` extra).** Sample frames with PyAV at low
       resolution to detect frozen or black camera frames and decode errors. Never required
       for the core path.
@@ -241,3 +254,23 @@ Work top-down through **Next up**. Each item should ship in one focused session
   the 2 `length` flags from `flags_by_check` (`idle: 52, length: 2` -> `idle: 52`) and raised
   mean score from 92.92 to 93.32, with `duplicate_groups` empty either way (none to
   suppress) — confirms the flag removed is exactly the one disabled, nothing else moves.
+- 2026-10-16: Added **`--episodes SPEC`/`--max-episodes N`** to `demoqc score`/`demoqc
+  dedupe` (the roadmap's "scale to large datasets" slice 1), so trying the tool on a huge
+  dataset doesn't require loading all of it first. Validated on
+  masato-ka/so100_cutlery_handling_simple (50 ep, v2.1): a full `score` downloads all 54
+  files (588 KiB, ~24s on this run); `--episodes 0-2` downloads only 4 meta files + 3
+  episode parquet files (204 KiB, ~1.7s) and scores exactly episodes 0-2. Confirmed the
+  score/metrics for those 3 episodes match a full-dataset load almost exactly (idle penalty
+  6.13 vs 6.07 for episode 0) — the tiny difference is `DatasetContext`'s robust stats
+  (e.g. `idle_speed`) being computed over the loaded subset rather than all 50 episodes,
+  which is the documented "thresholds are relative to the dataset" behavior, not a bug;
+  noted as a caveat in the README. Also validated on lerobot/svla_so101_pickplace (50 ep,
+  v3.0, single data file since the dataset is smaller than one chunk): `--episodes 0-2`
+  loads exactly 3 episodes; narrowing is a no-op here since there's only one file to begin
+  with, which is the expected fallback, not a bug. New tests in `tests/test_dataset.py`
+  corrupt the data file(s) a requested `--episodes` subset doesn't need (both v3.0
+  multi-file and v2.1 per-episode-file layouts) and confirm loading still succeeds with
+  exactly the requested episodes, proving those files are never opened; plus CLI spec
+  parsing, `--max-episodes`, combining both, and an unknown-episode error. 10 of the 14 new
+  tests fail with `TypeError`/`SystemExit` without this change (confirmed via `git stash`
+  on just the implementation files).
