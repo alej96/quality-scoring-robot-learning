@@ -137,6 +137,33 @@ Valid names are `timing`, `metadata`, `video_sync`, `idle`, `smoothness`, `stale
 Disabling a check removes both its flags and its metrics from the report, and (for
 `duplicate`) skips `duplicate_groups` and the duplicate-detection pass entirely.
 
+## Scoring a subset of episodes
+
+`demoqc score` and `demoqc dedupe` take `--episodes SPEC` (e.g. `0-99` or `5,10,20-30`,
+comma-separated indices and/or ranges) and `--max-episodes N` to load only some of a
+dataset's episodes, for trying the tool on a huge dataset (DROID-scale and up) without
+loading all of it:
+
+```bash
+demoqc score user/huge-dataset --episodes 0-199 --json report.json
+demoqc score user/huge-dataset --max-episodes 500   # just the first 500
+```
+
+From the Hugging Face Hub, only the data file(s) that actually contain the requested
+episodes are downloaded (metadata is always small and downloaded in full); locally, data
+files that contain none of the requested episodes are never opened. On a v2.x dataset
+(one file per episode) this is close to proportional: scoring 3 of 50 episodes of
+`masato-ka/so100_cutlery_handling_simple` downloads 3 episode files instead of 50. The
+narrowing is best-effort and falls back to reading everything if a dataset's layout can't
+be mapped from its metadata alone; either way the episodes loaded are exactly the ones
+requested.
+
+Checks and thresholds are relative to whatever is loaded (see "Configurable thresholds"
+above), so a score or flag computed from a small `--episodes` subset is relative to that
+subset, not the full dataset, and can differ slightly from a full-dataset run; checks that
+need 5+ episodes (`length`, smoothness/sync outlier comparisons) are silently skipped
+below that.
+
 ## Development
 
 ```bash
