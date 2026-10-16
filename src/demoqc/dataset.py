@@ -9,6 +9,7 @@ frames by ``episode_index`` instead of relying on file layout.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,32 +56,55 @@ class Dataset:
 
 
 def load_dataset(
-    source: str | Path, revision: str | None = None, cache_dir: str | Path | None = None
+    source: str | Path,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    episodes: Iterable[int] | None = None,
+    max_episodes: int | None = None,
 ) -> Dataset:
-    """Load a dataset from a local LeRobot directory or a Hub repo id like ``lerobot/pusht``."""
+    """Load a dataset from a local LeRobot directory or a Hub repo id like ``lerobot/pusht``.
+
+    ``episodes`` and/or ``max_episodes`` restrict which episodes are loaded, useful for a
+    huge dataset (e.g. DROID-scale) where loading everything isn't practical. From the Hub,
+    only the data file(s) that actually contain the requested episodes are downloaded
+    (metadata is always small and downloaded in full); locally, data files that contain none
+    of the requested episodes are never opened. The narrowing is best-effort: if a dataset's
+    layout can't be mapped from metadata alone, it falls back to reading everything, still
+    correct but without the savings.
+    """
     path = Path(source).expanduser()
     repo_id = None
+    narrowing = episodes is not None or max_episodes is not None
     if not path.exists():
         repo_id = str(source)
-        path = _download(repo_id, revision=revision, cache_dir=cache_dir)
+        path = _download(repo_id, revision, cache_dir, ["meta/*", "meta/**"] if narrowing else None)
 
     info_path = path / "meta" / "info.json"
     if not info_path.exists():
         raise FileNotFoundError(f"{info_path} not found; is this a LeRobot dataset?")
     info = json.loads(info_path.read_text())
 
-    frames = _read_frames(path)
     episode_meta = _read_episode_meta(path)
+    want = _resolve_episodes(episode_meta, episodes, max_episodes)
+
+    if repo_id is not None and narrowing:
+        names = _needed_data_filenames(path, info, want) if want is not None else None
+        patterns = None
+        if names is not None:
+            patterns = [f"data/*/{n}" for n in sorted(names)] + ["meta/*", "meta/**"]
+        path = _download(repo_id, revision, cache_dir, patterns)
+
+    frames = _read_frames(path, want, info)
     tasks = _read_tasks(path)
 
-    episodes = []
+    episodes_out = []
     for ep_idx, group in frames.groupby("episode_index", sort=True):
         group = group.sort_values("frame_index", kind="stable")
         meta = episode_meta.get(int(ep_idx), {})
         task = meta.get("task")
         if task is None and "task_index" in group and len(tasks):
             task = tasks.get(int(group["task_index"].iloc[0]))
-        episodes.append(
+        episodes_out.append(
             Episode(
                 index=int(ep_idx),
                 timestamps=group["timestamp"].to_numpy(dtype=np.float64),
@@ -98,30 +122,89 @@ def load_dataset(
         fps=float(info["fps"]),
         codebase_version=str(info.get("codebase_version", "unknown")),
         robot_type=info.get("robot_type"),
-        episodes=episodes,
+        episodes=episodes_out,
         repo_id=repo_id,
         action_names=info.get("features", {}).get("action", {}).get("names"),
         state_names=info.get("features", {}).get("observation.state", {}).get("names"),
     )
 
 
-def _download(repo_id: str, revision: str | None, cache_dir: str | Path | None) -> Path:
+def _resolve_episodes(
+    episode_meta: dict[int, dict], episodes: Iterable[int] | None, max_episodes: int | None
+) -> frozenset[int] | None:
+    """The concrete set of episode indices to load, or ``None`` for "all of them"."""
+    if episodes is None and max_episodes is None:
+        return None
+    existing = sorted(episode_meta)
+    if episodes is not None:
+        want = sorted({int(e) for e in episodes})
+        unknown = sorted(set(want) - set(existing))
+        if unknown:
+            raise ValueError(f"episode(s) not in the dataset: {unknown}")
+    else:
+        want = existing
+    if max_episodes is not None:
+        want = want[:max_episodes]
+    if not want:
+        raise ValueError("no episodes selected")
+    return frozenset(want)
+
+
+def _needed_data_filenames(root: Path, info: dict, want: frozenset[int]) -> set[str] | None:
+    """Basenames of the data files that contain any of ``want``'s episodes.
+
+    Returns ``None`` when metadata alone can't narrow it down (an unrecognised layout), so
+    the caller falls back to reading/downloading everything.
+    """
+    version = str(info.get("codebase_version", ""))
+    if not version.startswith("v3"):
+        # v2.x: one episode per file, named episode_<index>.parquet regardless of chunk dir
+        return {f"episode_{idx:06d}.parquet" for idx in want}
+
+    template = info.get("data_path")
+    episode_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
+    if not template or not episode_files:
+        return None
+    cols = ["episode_index", "data/chunk_index", "data/file_index"]
+    frames = []
+    for f in episode_files:
+        if not set(cols).issubset(pq.read_schema(f).names):
+            return None
+        frames.append(pq.read_table(f, columns=cols).to_pandas())
+    df = pd.concat(frames, ignore_index=True)
+    hit = df[df["episode_index"].isin(want)]
+    pairs = hit[["data/chunk_index", "data/file_index"]].drop_duplicates()
+    return {
+        Path(template.format(chunk_index=int(c), file_index=int(fi))).name
+        for c, fi in pairs.itertuples(index=False)
+    }
+
+
+def _download(
+    repo_id: str, revision: str | None, cache_dir: str | Path | None, patterns: list[str] | None
+) -> Path:
     from huggingface_hub import snapshot_download
 
     local = snapshot_download(
         repo_id,
         repo_type="dataset",
         revision=revision,
-        allow_patterns=HUB_PATTERNS,
+        allow_patterns=patterns or HUB_PATTERNS,
         cache_dir=cache_dir,
     )
     return Path(local)
 
 
-def _read_frames(root: Path) -> pd.DataFrame:
+def _read_frames(root: Path, want: frozenset[int] | None, info: dict) -> pd.DataFrame:
     files = sorted((root / "data").rglob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"no parquet files under {root / 'data'}")
+    if want is not None:
+        names = _needed_data_filenames(root, info, want)
+        if names is not None:
+            narrowed = [f for f in files if f.name in names]
+            if narrowed:
+                files = narrowed
     tables = []
     for f in files:
         names = set(pq.read_schema(f).names)
@@ -133,6 +216,8 @@ def _read_frames(root: Path) -> pd.DataFrame:
     for required in ("episode_index", "frame_index", "timestamp"):
         if required not in df:
             raise ValueError(f"dataset frames are missing the '{required}' column")
+    if want is not None:
+        df = df[df["episode_index"].isin(want)]
     return df
 
 

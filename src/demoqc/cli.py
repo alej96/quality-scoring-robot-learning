@@ -15,6 +15,50 @@ from demoqc.export import export_dataset, keep_from_report, trim_from_report
 from demoqc.report import build_report, format_markdown, format_summary, write_csv, write_json
 
 
+def _episode_spec(spec: str) -> list[int]:
+    """Parse '0-9,20,35-40' into a sorted list of episode indices."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            start, end = int(start), int(end)
+            if start > end:
+                raise ValueError(f"invalid range '{part}': start > end")
+            out.update(range(start, end + 1))
+        else:
+            out.add(int(part))
+    if not out:
+        raise ValueError("no episodes in spec")
+    return sorted(out)
+
+
+def _positive_int(spec: str) -> int:
+    n = int(spec)
+    if n < 1:
+        raise ValueError("must be >= 1")
+    return n
+
+
+def _add_episode_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--episodes",
+        type=_episode_spec,
+        metavar="SPEC",
+        help="only load these episodes, e.g. '0-99' or '5,10,20-30' (comma-separated indices "
+        "and/or ranges); from the Hub, downloads only the data file(s) that contain them",
+    )
+    parser.add_argument(
+        "--max-episodes",
+        type=_positive_int,
+        metavar="N",
+        help="only load the first N episodes (combinable with --episodes); "
+        "for trying the tool on a huge dataset without loading all of it",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="demoqc", description=__doc__)
     p.add_argument("--version", action="version", version=f"demoqc {__version__}")
@@ -28,6 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     score.add_argument("source", help="local dataset directory or Hub repo id, e.g. lerobot/pusht")
     score.add_argument("--revision", help="Hub branch, tag or commit")
+    _add_episode_args(score)
     score.add_argument(
         "--config",
         type=Path,
@@ -69,6 +114,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     dedupe.add_argument("source", help="local dataset directory or Hub repo id")
     dedupe.add_argument("--revision", help="Hub branch, tag or commit")
+    _add_episode_args(dedupe)
     dedupe.add_argument(
         "--config",
         type=Path,
@@ -120,7 +166,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _load(args: argparse.Namespace):
     try:
-        return load_dataset(args.source, revision=args.revision)
+        return load_dataset(
+            args.source,
+            revision=args.revision,
+            episodes=getattr(args, "episodes", None),
+            max_episodes=getattr(args, "max_episodes", None),
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
         return None

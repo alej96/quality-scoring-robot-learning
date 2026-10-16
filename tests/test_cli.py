@@ -115,3 +115,55 @@ def test_dedupe_command(make_dataset, tmp_path, capsys):
     groups = json.loads(out_json.read_text())
     assert len(groups) == 1
     assert sorted(groups[0]["episodes"]) == [2, 9]
+
+
+def test_score_episodes_spec_restricts_dataset(make_dataset, tmp_path):
+    root = make_dataset(clean_specs(6))
+    out_json = tmp_path / "r.json"
+
+    assert (
+        main(["score", str(root), "--episodes", "1,4-5", "--json", str(out_json), "--quiet"]) == 0
+    )
+
+    report = json.loads(out_json.read_text())
+    assert sorted(e["episode_index"] for e in report["episodes"]) == [1, 4, 5]
+    assert report["dataset"]["episodes"] == 3
+
+
+def test_score_max_episodes(make_dataset, tmp_path):
+    root = make_dataset(clean_specs(6))
+    out_json = tmp_path / "r.json"
+
+    assert (
+        main(["score", str(root), "--max-episodes", "2", "--json", str(out_json), "--quiet"]) == 0
+    )
+
+    report = json.loads(out_json.read_text())
+    assert sorted(e["episode_index"] for e in report["episodes"]) == [0, 1]
+
+
+def test_score_episodes_rejects_bad_spec(make_dataset, capsys):
+    root = make_dataset(clean_specs())
+    with pytest.raises(SystemExit) as exc:
+        main(["score", str(root), "--episodes", "not-a-spec"])
+    assert exc.value.code == 2
+    assert "--episodes" in capsys.readouterr().err
+
+
+def test_score_episodes_rejects_unknown_episode(make_dataset, capsys):
+    root = make_dataset(clean_specs(3))
+    assert main(["score", str(root), "--episodes", "99", "--quiet"]) == 2
+    assert "99" in capsys.readouterr().err
+
+
+def test_dedupe_episodes_spec(make_dataset, tmp_path):
+    specs = clean_specs(6)
+    specs[5] = specs[1]  # byte-identical re-run
+    root = make_dataset(specs)
+    out_json = tmp_path / "dups.json"
+
+    assert main(["dedupe", str(root), "--episodes", "0-3", "--json", str(out_json)]) == 0
+
+    # the duplicate pair (1, 5) isn't fully in the loaded subset, so it isn't found
+    groups = json.loads(out_json.read_text())
+    assert groups == []
