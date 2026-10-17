@@ -8,6 +8,7 @@ frames by ``episode_index`` instead of relying on file layout.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -33,6 +34,9 @@ class Episode:
     meta_length: int | None = None
     # camera key -> (from_timestamp, to_timestamp) in seconds, v3.0 only
     video_spans: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # camera key -> (pixel mean, pixel std) over the whole episode, from LeRobot's own
+    # per-episode video stats (meta/episodes on v3.0, meta/episodes_stats.jsonl on v2.x)
+    camera_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     @property
     def length(self) -> int:
@@ -84,7 +88,12 @@ def load_dataset(
         raise FileNotFoundError(f"{info_path} not found; is this a LeRobot dataset?")
     info = json.loads(info_path.read_text())
 
-    episode_meta = _read_episode_meta(path)
+    camera_names = sorted(
+        name
+        for name, feat in info.get("features", {}).items()
+        if isinstance(feat, dict) and feat.get("dtype") == "video"
+    )
+    episode_meta = _read_episode_meta(path, camera_names)
     want = _resolve_episodes(episode_meta, episodes, max_episodes)
 
     if repo_id is not None and narrowing:
@@ -114,6 +123,7 @@ def load_dataset(
                 task=task,
                 meta_length=meta.get("length"),
                 video_spans=meta.get("video_spans", {}),
+                camera_stats=meta.get("camera_stats", {}),
             )
         )
 
@@ -231,8 +241,35 @@ def _stack(group: pd.DataFrame, column: str) -> np.ndarray | None:
     return arr.reshape(len(values), -1)
 
 
-def _read_episode_meta(root: Path) -> dict[int, dict]:
-    """Per-episode metadata: task, declared length and (v3.0) video time spans."""
+def _flatten_numbers(value: object, out: list[float]) -> None:
+    if value is None:
+        return
+    if isinstance(value, list | tuple | np.ndarray):
+        for v in value:
+            _flatten_numbers(v, out)
+        return
+    with contextlib.suppress(TypeError, ValueError):
+        out.append(float(value))
+
+
+def _image_stat_scalar(value: object) -> float | None:
+    """Collapse a nested per-channel video stat (e.g. ``[[[0.58]], [[0.61]], [[0.55]]]``)
+    to a single scalar by averaging across channels and any other nesting. Parquet round-
+    trips these as ragged (non-rectangular) arrays, so this walks them recursively instead
+    of relying on ``np.asarray`` to infer a uniform shape."""
+    out: list[float] = []
+    _flatten_numbers(value, out)
+    if not out:
+        return None
+    arr = np.array(out, dtype=np.float64)
+    if not np.isfinite(arr).all():
+        return None
+    return float(arr.mean())
+
+
+def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, dict]:
+    """Per-episode metadata: task, declared length, (v3.0) video time spans, and each
+    camera's whole-episode pixel mean/std from LeRobot's own per-episode video stats."""
     meta: dict[int, dict] = {}
     v3_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
     if v3_files:
@@ -244,6 +281,11 @@ def _read_episode_meta(root: Path) -> dict[int, dict]:
                 if c.startswith("videos/") and c.endswith("/from_timestamp")
             }
         )
+        stat_cams = [
+            cam
+            for cam in camera_names
+            if f"stats/{cam}/mean" in df.columns and f"stats/{cam}/std" in df.columns
+        ]
         for row in df.to_dict("records"):
             spans = {
                 cam: (
@@ -253,23 +295,60 @@ def _read_episode_meta(root: Path) -> dict[int, dict]:
                 for cam in cameras
                 if pd.notna(row.get(f"videos/{cam}/from_timestamp"))
             }
+            camera_stats = {}
+            for cam in stat_cams:
+                mean = _image_stat_scalar(row.get(f"stats/{cam}/mean"))
+                std = _image_stat_scalar(row.get(f"stats/{cam}/std"))
+                if mean is not None and std is not None:
+                    camera_stats[cam] = (mean, std)
             meta[int(row["episode_index"])] = {
                 "length": int(row["length"]) if "length" in row else None,
                 "task": _first_task(row.get("tasks")),
                 "video_spans": spans,
+                "camera_stats": camera_stats,
             }
         return meta
 
+    episode_stats = _read_v2_episode_stats(root, camera_names)
     jsonl = root / "meta" / "episodes.jsonl"
     if jsonl.exists():
         for line in jsonl.read_text().splitlines():
             if line.strip():
                 row = json.loads(line)
-                meta[int(row["episode_index"])] = {
+                ep_idx = int(row["episode_index"])
+                meta[ep_idx] = {
                     "length": row.get("length"),
                     "task": _first_task(row.get("tasks")),
+                    "camera_stats": episode_stats.get(ep_idx, {}),
                 }
     return meta
+
+
+def _read_v2_episode_stats(
+    root: Path, camera_names: list[str]
+) -> dict[int, dict[str, tuple[float, float]]]:
+    """v2.x per-episode video stats from ``meta/episodes_stats.jsonl``: camera -> (pixel
+    mean, pixel std) over the whole episode."""
+    out: dict[int, dict[str, tuple[float, float]]] = {}
+    jsonl = root / "meta" / "episodes_stats.jsonl"
+    if not camera_names or not jsonl.exists():
+        return out
+    for line in jsonl.read_text().splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        stats = row.get("stats") or {}
+        cams = {}
+        for cam in camera_names:
+            s = stats.get(cam)
+            if not s:
+                continue
+            mean = _image_stat_scalar(s.get("mean"))
+            std = _image_stat_scalar(s.get("std"))
+            if mean is not None and std is not None:
+                cams[cam] = (mean, std)
+        out[int(row["episode_index"])] = cams
+    return out
 
 
 def _read_tasks(root: Path) -> dict[int, str]:

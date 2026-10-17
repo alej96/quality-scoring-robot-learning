@@ -184,6 +184,19 @@ def test_sync_survives_extra_unmatched_action_dim(make_dataset):
     assert all("sync" not in _checks(r) for i, r in enumerate(results) if i != 6)
 
 
+@pytest.mark.parametrize("version", ["v3.0", "v2.1"])
+def test_camera_dead(make_dataset, version):
+    # one episode's camera stats are near-black for the whole episode: a disconnected
+    # camera or a lens cap left on, caught from metadata alone (no video ever opened)
+    specs = clean_specs()
+    specs[4] = EpisodeSpec(camera_dead=True, seed=4)
+    results = evaluate(load_dataset(make_dataset(specs, version=version)))
+
+    assert "camera" in _checks(results[4])
+    assert results[4].metrics["camera_dead_count"] == 1
+    assert all("camera" not in _checks(r) for i, r in enumerate(results) if i != 4)
+
+
 def test_gripper_chatter(make_dataset):
     # the operator rapidly double-taps the gripper for half a second: an anxious squeeze,
     # not a deliberate open/close

@@ -62,6 +62,8 @@ class Config:
     gripper_chatter_min_toggles: int = (
         4  # that many open/close transitions in the window is chatter
     )
+    camera_dark_mean_max: float = 0.03  # pixel mean below this (0-1 scale) is near-black
+    camera_dark_std_max: float = 0.02  # pixel std below this means almost no variation either
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -265,6 +267,31 @@ def check_video_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
                 ERROR,
                 f"video span != data duration {data_duration:.2f}s: " + ", ".join(bad),
                 20,
+            )
+        )
+
+
+def check_camera(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
+    """A camera that's near-black for the whole episode: a disconnected camera, a lens cap
+    left on, or video that failed to record. Uses the per-episode pixel mean/std LeRobot
+    already writes to its own metadata (``meta/episodes`` on v3.0, ``episodes_stats.jsonl``
+    on v2.x); no video file is ever opened."""
+    if not ep.camera_stats:
+        return
+    dead = [
+        f"{cam} (mean={mean:.3f}, std={std:.3f})"
+        for cam, (mean, std) in sorted(ep.camera_stats.items())
+        if mean <= cfg.camera_dark_mean_max and std <= cfg.camera_dark_std_max
+    ]
+    if dead:
+        out.metrics["camera_dead_count"] = len(dead)
+        out.flags.append(
+            Flag(
+                "camera",
+                ERROR,
+                "near-black for the whole episode (disconnected camera or lens cap?): "
+                + "; ".join(dead),
+                min(50.0, 25.0 * len(dead)),
             )
         )
 
@@ -599,6 +626,7 @@ EPISODE_CHECKS = [
     ("timing", check_timing),
     ("metadata", check_metadata),
     ("video_sync", check_video_sync),
+    ("camera", check_camera),
     ("idle", check_idle),
     ("smoothness", check_smoothness),
     ("stale_state", check_staleness),

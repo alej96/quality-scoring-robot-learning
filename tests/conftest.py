@@ -29,6 +29,7 @@ class EpisodeSpec:
     state_lag_frames: int = 1  # observation.state tracks action with this many frames' delay
     state_decorrelated: bool = False  # state is unrelated motion, not a delayed copy of action
     gripper_chatter_at: tuple[int, int] | None = None  # [start, end) frames of rapid toggling
+    camera_dead: bool = False  # the episode's camera stats are near-black (disconnected?)
     seed: int = 0
 
 
@@ -86,14 +87,23 @@ def _stats(x: np.ndarray) -> dict[str, list]:
     }
 
 
-def _image_stats(rng: np.random.Generator, count: int) -> dict[str, list]:
-    """Per-episode video stats are (channels, 1, 1) nested lists; the values are arbitrary."""
-    mean = rng.uniform(0.3, 0.7, 3)
+def _image_stats(rng: np.random.Generator, count: int, dead: bool = False) -> dict[str, list]:
+    """Per-episode video stats are (channels, 1, 1) nested lists; the values are arbitrary.
+
+    ``dead`` mimics a disconnected camera or a lens cap: a near-zero mean and std, as if
+    every frame of the episode were (almost) solid black.
+    """
+    if dead:
+        mean = np.full(3, 0.005)
+        std = np.full(3, 0.001)
+    else:
+        mean = rng.uniform(0.3, 0.7, 3)
+        std = rng.uniform(0.05, 0.2, 3)
     return {
         "min": [[[0.0]]] * 3,
-        "max": [[[float(m + 0.2)]] for m in mean],
+        "max": [[[float(m + (0.0 if dead else 0.2))]] for m in mean],
         "mean": [[[float(m)]] for m in mean],
-        "std": [[[float(rng.uniform(0.05, 0.2))]] for _ in mean],
+        "std": [[[float(s)]] for s in std],
         "count": [count],
     }
 
@@ -115,7 +125,7 @@ def write_dataset(
     """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
-    frames, episodes = [], []
+    frames, episodes, episode_stats = [], [], []
     index = 0
     rng = np.random.default_rng(123)
     for ep, spec in enumerate(specs):
@@ -145,8 +155,9 @@ def write_dataset(
             "observation.state": _stats(state),
             "index": _stats(np.arange(index, index + n)),
             "episode_index": _stats(np.full(n, ep)),
-            "observation.images.top": _image_stats(rng, n),
+            "observation.images.top": _image_stats(rng, n, dead=spec.camera_dead),
         }
+        episode_stats.append(stats)
         episodes.append(
             {
                 "episode_index": ep,
@@ -230,6 +241,9 @@ def write_dataset(
         (root / "meta" / "tasks.jsonl").write_text(
             json.dumps({"task_index": 0, "task": "pick the cube"}) + "\n"
         )
+        with (root / "meta" / "episodes_stats.jsonl").open("w") as fh:
+            for ep, stats in enumerate(episode_stats):
+                fh.write(json.dumps({"episode_index": ep, "stats": stats}) + "\n")
     return root
 
 
