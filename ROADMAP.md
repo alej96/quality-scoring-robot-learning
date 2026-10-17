@@ -111,9 +111,18 @@ Work top-down through **Next up**. Each item should ship in one focused session
       dataset — `_read_frames` still concatenates every needed file into one DataFrame.
       True per-file streaming (bounding memory independent of `--episodes`) is still open,
       as is extending `--episodes`/`--max-episodes` to `demoqc export`.
-- [ ] **Video checks (optional `[video]` extra).** Sample frames with PyAV at low
-      resolution to detect frozen or black camera frames and decode errors. Never required
-      for the core path.
+- [x] **Video checks (slice 1): black/dead camera from metadata alone.** LeRobot already
+      writes each episode's per-camera pixel mean/std into `meta/episodes` (v3.0) or
+      `meta/episodes_stats.jsonl` (v2.x) when it records a dataset. Read it and flag a
+      camera that's near-black for the whole episode (mean and std both near zero): a
+      disconnected camera, a lens cap left on, or video that failed to record. No video
+      file is ever opened, so this needed no new dependency and stays in the core path.
+      Shipped as the `camera` check (`src/demoqc/dataset.py`'s `Episode.camera_stats`,
+      `checks.check_camera`, `Config.camera_dark_mean_max`/`camera_dark_std_max`).
+      Follow-up: this only catches a camera that's dead for an *entire* episode. Detecting
+      a frame that freezes or goes black mid-episode, or a decode error, needs actual frame
+      sampling (PyAV, at low resolution, behind an optional `[video]` extra, never in the
+      default path) — still open.
 - [ ] **Benchmark the community.** `scripts/benchmark.py` scores the N most-downloaded
       community LeRobot datasets and writes `docs/benchmarks.md` (scores, idle seconds,
       top flags). Refresh it periodically; it doubles as a regression test for the
@@ -274,3 +283,24 @@ Work top-down through **Next up**. Each item should ship in one focused session
   parsing, `--max-episodes`, combining both, and an unknown-episode error. 10 of the 14 new
   tests fail with `TypeError`/`SystemExit` without this change (confirmed via `git stash`
   on just the implementation files).
+- 2026-10-17: Added the **`camera` check** (video checks slice 1), flagging a camera
+  that's near-black for an entire episode using the per-episode pixel mean/std LeRobot
+  already writes to its own metadata (`meta/episodes` on v3.0, `meta/episodes_stats.jsonl`
+  on v2.x) — no video file is ever downloaded or opened, so this needed no new dependency
+  and the `push-report`/"benchmark" items below stayed next in line, not this. `HF_TOKEN`
+  is still unset in this environment, so `push-report` stays blocked. Validated on
+  lerobot/svla_so101_pickplace (50 ep, v3.0, 2 cameras), masato-ka/so100_cutlery_handling_simple
+  (50 ep, v2.1, 1 camera), aaronsu11/so100_lego (100 ep, v2.1, 2 cameras) and shylee/so100_cube
+  (200 ep, v2.1, 3 cameras): per-episode pixel mean/std load correctly from both metadata
+  formats (confirmed by printing `Episode.camera_stats`) and no episode on any of the four
+  is flagged — all real cameras here are well above the near-black threshold (lowest
+  real per-episode mean seen: 0.45; lowest std: 0.14), and mean scores are unchanged from
+  before this change (97.1 / 92.9 / 92.2 / 99.2). New `tests/test_checks.py::test_camera_dead`
+  (parametrized over v3.0 and v2.1) injects a near-black `camera_dead` episode via a new
+  `EpisodeSpec` field and `tests/conftest.py` now also writes `meta/episodes_stats.jsonl`
+  for synthetic v2.x datasets (it previously wrote none, so this check's v2.x path was
+  untestable); both parametrizations fail with `AssertionError` before this change. Also
+  fixed a bug caught by the v3.0 test while building this: parquet round-trips the nested
+  per-channel video stats as a ragged (non-rectangular) array, which `np.asarray` rejects
+  with `ValueError`, so the first version of `_image_stat_scalar` silently returned `None`
+  for every v3.0 episode; it now flattens the nesting recursively instead.
