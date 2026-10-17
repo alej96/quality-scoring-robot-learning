@@ -88,6 +88,7 @@ data. Episodes with no suggested trim are kept in full.
 | `timing` | dropped frames, non-monotonic or missing timestamps | timestamp gaps vs `1/fps`, `frame_index` continuity |
 | `metadata` | episode length in metadata ≠ frames in data | `meta/episodes` vs data |
 | `video_sync` | video segment duration ≠ data duration (v3.0) | `videos/*/from_timestamp`, `to_timestamp` |
+| `camera` | a camera near-black for a whole episode (disconnected, lens cap) | per-episode pixel mean/std LeRobot already writes to its metadata; no video is ever opened |
 | `idle` | dead time at start/end (trimmable), long pauses, mostly-idle demos | action speed below 10% of the dataset's 75th-percentile speed |
 | `smoothness` | single-frame glitches, abrupt jumps, demos far jerkier than their peers | per-dimension step size vs dataset p99; log dimensionless jerk (LDLJ) robust z-score |
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
@@ -132,8 +133,9 @@ is intentionally similar), pass `--disable-check NAME` to `demoqc score` once pe
 demoqc score user/dataset --disable-check gripper_chatter --disable-check sync
 ```
 
-Valid names are `timing`, `metadata`, `video_sync`, `idle`, `smoothness`, `stale_state`,
-`sync`, `gripper_chatter`, `length` and `duplicate`; an unknown name is rejected up front.
+Valid names are `timing`, `metadata`, `video_sync`, `camera`, `idle`, `smoothness`,
+`stale_state`, `sync`, `gripper_chatter`, `length` and `duplicate`; an unknown name is
+rejected up front.
 Disabling a check removes both its flags and its metrics from the report, and (for
 `duplicate`) skips `duplicate_groups` and the duplicate-detection pass entirely.
 
