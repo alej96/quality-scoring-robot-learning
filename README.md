@@ -174,6 +174,18 @@ ruff check . && ruff format --check . && pytest -q
 pytest -m network   # end-to-end against public Hub datasets
 ```
 
+`scripts/benchmark.py` scores a curated list of real community datasets and writes
+[docs/benchmarks.md](docs/benchmarks.md) (mean/median score, trimmable idle, duplicate
+groups, top flags per dataset). Re-run it after changing a check or threshold and diff
+the file against the previous commit to see exactly which real datasets moved, and by
+how much — it doubles as a regression check for the heuristics:
+
+```bash
+python scripts/benchmark.py                        # default dataset list -> docs/benchmarks.md
+python scripts/benchmark.py --repo user/dataset     # add/replace datasets (repeatable)
+python scripts/benchmark.py --max-episodes 0        # disable the per-dataset episode cap
+```
+
 See [ROADMAP.md](ROADMAP.md) for what's next (pushing reports to the Hub, disabling
 individual checks, scaling to large datasets).
 

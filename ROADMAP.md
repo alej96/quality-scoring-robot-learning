@@ -123,10 +123,23 @@ Work top-down through **Next up**. Each item should ship in one focused session
       a frame that freezes or goes black mid-episode, or a decode error, needs actual frame
       sampling (PyAV, at low resolution, behind an optional `[video]` extra, never in the
       default path) — still open.
-- [ ] **Benchmark the community.** `scripts/benchmark.py` scores the N most-downloaded
-      community LeRobot datasets and writes `docs/benchmarks.md` (scores, idle seconds,
-      top flags). Refresh it periodically; it doubles as a regression test for the
-      heuristics.
+- [x] **Benchmark the community.** `scripts/benchmark.py` scores a curated list of real
+      community LeRobot datasets and writes `docs/benchmarks.md` (scores, trimmable idle,
+      duplicate groups, top flags). Refresh it periodically; it doubles as a regression
+      test for the heuristics.
+      Shipped as `scripts/benchmark.py` and `docs/benchmarks.md`. Scores each dataset in
+      isolation and catches any exception (unreachable repo, unrecognised format, a bug in
+      a check) into an error row instead of stopping the whole run, so one bad dataset
+      doesn't lose the rest. Took a curated list (`DEFAULT_REPOS`: the reference and
+      community so100 datasets already used for validation) rather than the Hub's actual
+      most-downloaded LeRobot datasets, which are enormous OpenX/DROID re-releases
+      (hundreds of GB of tabular data even with videos excluded) this tool isn't calibrated
+      for and that would make the benchmark slow and its numbers meaningless; `--max-episodes`
+      (default 200) caps runtime further. `--repo` adds/replaces the list, for anyone who
+      wants to benchmark a different set.
+      Follow-up: querying the Hub for real most-downloaded small/medium teleoperation
+      datasets (e.g. filtering `list_datasets(filter="LeRobot", sort="downloads")` by
+      dataset size or episode count rather than a hand-picked list) is still open.
 
 ## Needs the owner
 
@@ -304,3 +317,17 @@ Work top-down through **Next up**. Each item should ship in one focused session
   per-channel video stats as a ragged (non-rectangular) array, which `np.asarray` rejects
   with `ValueError`, so the first version of `_image_stat_scalar` silently returned `None`
   for every v3.0 episode; it now flattens the nesting recursively instead.
+- 2026-10-18: Added `scripts/benchmark.py` and `docs/benchmarks.md` (the "benchmark the
+  community" item). Scores a curated list of real datasets and renders a Markdown table
+  (episodes, frames, mean/median score, trimmable idle, duplicate groups, top flags);
+  each dataset is scored independently and a failure becomes an error row instead of
+  aborting the run. Ran it end to end against all 6 datasets in `DEFAULT_REPOS`
+  (lerobot/svla_so101_pickplace, lerobot/pusht, masato-ka/so100_cutlery_handling_simple,
+  aaronsu11/so100_lego, shylee/so100_cube, jccj/so100_block_in_cup): all 6 scored with no
+  errors and no new flags beyond what earlier validation runs already found (mean scores
+  97.1/100.0/92.9/92.2/99.2/95.2), confirming the script reproduces the existing,
+  already-validated numbers rather than introducing new false positives. `tests/test_benchmark.py`
+  covers `score_repo` on synthetic local datasets (clean, `--max-episodes`-capped, a real
+  injected idle defect, and a missing/unreadable dataset producing an error row instead of
+  raising) and `format_benchmark_markdown` on both a normal and an error row, all against
+  the existing `EpisodeSpec` fixtures — no network needed for the test suite.
