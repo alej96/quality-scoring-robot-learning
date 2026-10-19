@@ -38,13 +38,17 @@ Work top-down through **Next up**. Each item should ship in one focused session
       `meta/stats.json` (exact for tabular features, count-weighted combination of the
       per-episode stats for video features) and the per-episode `stats/index` and
       `stats/episode_index` columns, which would otherwise go stale.
-      Follow-ups: (1) **v2.x export.** v3.0 only for now, but most community datasets
-      (e.g. the so100 ones used for validation) are v2.1, so this is the most useful next
-      slice of export (per-episode parquet and videos, `episodes.jsonl`, `episodes_stats.jsonl`).
+      Follow-ups: (1) ~~v2.x export~~ shipped 2026-10-19 (`_export_v2` in `src/demoqc/export.py`;
+      see the Log entry) — slice 1 only (drop/renumber, no `--apply-trim`).
       (2) An option to copy or symlink the source `videos/` directory for local sources (they
-      are never read today; the export only notes that they must be copied). (3) `--min-score`
+      are never read today; the export only notes that they must be copied, and for v2.x also
+      renamed to match the new episode indices — see the Log entry). (3) `--min-score`
       on `export` itself, so a separate `score --json` run isn't required. (4) Single `train`
       split only: other `splits` entries in `info.json` are collapsed into `train`.
+      (5) **v2.x `--apply-trim`.** The v3.0 trim logic (renumber `frame_index`, shift
+      `timestamp`, narrow video spans) needs a v2.x-specific implementation since episode
+      metadata and per-episode stats are laid out completely differently (JSONL rows, not
+      `meta/episodes` parquet columns).
 - [x] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
@@ -331,3 +335,40 @@ Work top-down through **Next up**. Each item should ship in one focused session
   injected idle defect, and a missing/unreadable dataset producing an error row instead of
   raising) and `format_benchmark_markdown` on both a normal and an error row, all against
   the existing `EpisodeSpec` fixtures — no network needed for the test suite.
+- 2026-10-19: Added **v2.x export** (`demoqc export`'s highest-priority follow-up: most
+  community datasets, including every so100 one used for validation, are v2.1, and export
+  previously rejected them outright). `src/demoqc/export.py` now dispatches on
+  `codebase_version`: `_export_v3` is the existing (refactored, behaviour-unchanged) v3.0 path,
+  and the new `_export_v2` handles v2.x's different layout (one parquet per episode, JSONL
+  episode/stats metadata instead of `meta/episodes` parquet columns) — renumbering episodes,
+  rewriting `meta/episodes.jsonl` and `meta/episodes_stats.jsonl` (including each episode's own
+  `index`/`episode_index` stats, which describe the new numbering), updating `meta/info.json`
+  totals (`total_chunks`, `total_videos` included), and recomputing `meta/stats.json` (exact for
+  tabular features, count-weighted combination of per-episode stats for video features, same as
+  v3.0) when the source has one — some real datasets ship none, which export now detects and
+  leaves a warning for instead of guessing. The stats-combination math was extracted into a
+  shared `_combine_from_arrays` helper used by both formats, so the v3.0 behaviour is provably
+  unchanged (all pre-existing v3.0 export tests still pass unmodified). This is slice 1 only: no
+  `--apply-trim` yet (v2.x needs its own trim implementation; passing `--apply-trim` on a v2.x
+  source now errors out clearly instead of silently misbehaving) — tracked as a new follow-up
+  above. Also surfaced and documented a real correctness gap videos never need: a v2.x video
+  file is named after its episode's index directly, so renumbering episodes invalidates
+  `videos/`'s filenames (unlike v3.0, where chunk/file indices in `meta/episodes` still point at
+  the right file); `demoqc export` now prints a warning with the exact renaming rule instead of
+  the (wrong, for v2.x) "copy videos/ unchanged" message. Validated on real datasets: scoring
+  and exporting masato-ka/so100_cutlery_handling_simple (50 ep, `--min-score 90`, 45 kept, no
+  `meta/stats.json` in the source — export correctly warns and writes none) and re-scoring the
+  export reproduced the original per-episode scores almost exactly (max diff 0.07, from
+  `DatasetContext`'s robust stats over a smaller episode set, the same documented caveat as
+  `--episodes`); aaronsu11/so100_lego (100 ep, `--min-score 95`, 27 kept, this dataset *does*
+  ship `meta/stats.json`, with `mean`/`std`/`min`/`max`/`q01`/`q99` but no `count` key — a real-
+  world stats-key variant the synthetic fixtures didn't cover, confirmed it recomputes
+  correctly anyway since exact tabular recompute doesn't need `count`) — the recomputed
+  `action` mean/min/max matched a direct recomputation from the exported frames, `index`/
+  `episode_index` maxed out at the correct new values (14985 / 26), and `info.json`'s
+  `total_videos` (54 = 27 kept episodes * 2 cameras) and `total_chunks` (1) were both right;
+  also ran on shylee/so100_cube (200 ep, `--min-score 97`, 191 kept). New
+  `tests/test_export.py` cases (mirroring the existing v3.0 coverage) fail without this change;
+  `tests/conftest.py`'s synthetic v2.x writer also had its `data_path`/`video_path` templates
+  fixed to the real v2.x convention (`episode_chunk`/`episode_index` placeholders; it had been
+  silently reusing v3.0's template, untested until this export path needed it).

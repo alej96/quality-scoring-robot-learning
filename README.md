@@ -60,26 +60,33 @@ Hugging Face dataset card or a GitHub/Hub pull request.
 
 ## Exporting a cleaned dataset
 
-`demoqc export <source> --keep-from report.json -o <dir>` writes a LeRobot **v3.0** dataset
-that contains only the episodes in the report's `summary.keep`. It does what filtering rows
-by hand gets wrong: episodes are renumbered `0..k-1`, the global `index` stays contiguous,
-`meta/episodes` gets the new indices and `dataset_from_index`/`dataset_to_index` ranges,
-`meta/info.json` totals and `splits` are updated, and `meta/stats.json` (and the per-episode
-`stats/index` and `stats/episode_index` columns) are recomputed for the kept episodes, so the
-normalisation statistics no longer include the episodes you dropped. Tabular features are
-recomputed exactly; video features are combined from the per-episode stats.
+`demoqc export <source> --keep-from report.json -o <dir>` writes a LeRobot dataset (**v3.0**
+or **v2.x**, matching the source) that contains only the episodes in the report's
+`summary.keep`. It does what filtering rows by hand gets wrong: episodes are renumbered
+`0..k-1`, the global `index` stays contiguous, per-episode metadata gets the new indices,
+`meta/info.json` totals and `splits` are updated, and `meta/stats.json` (plus any per-episode
+`index`/`episode_index` stats) is recomputed for the kept episodes, so the normalisation
+statistics no longer include the episodes you dropped. Tabular features are recomputed
+exactly; video features are combined from the per-episode stats, when the source has them
+(some real datasets ship no `meta/stats.json` at all; export leaves a warning and writes none,
+rather than guessing).
 
-Only tabular data and metadata are written; videos are never read or copied. Their time spans
-and file indices are unchanged, so copy the source `videos/` directory into the output to
-train on it. The report must come from the same dataset (episode and frame counts are
-checked). v2.x export is not implemented yet.
+Only tabular data and metadata are written; videos are never read or copied. For **v3.0**,
+their time spans and file indices are unchanged, so copy the source `videos/` directory into
+the output to train on it. For **v2.x**, a video file is named after its episode's index
+directly (`episode_<n>.mp4`), so renumbering episodes means each kept episode's video files
+(every camera) must be renamed from `episode_<old index>.mp4` to `episode_<new index>.mp4`
+before training on the export; `demoqc export` prints a warning with the exact rule (new
+index = position in `kept`) since it never touches the video files itself. The report must
+come from the same dataset (episode and frame counts are checked).
 
 `--apply-trim` additionally cuts each kept episode's idle start/end frames, using the same
 `trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered, `timestamp` is
 shifted so the episode still starts near 0, and `meta/episodes`' `length` and each camera's
 `videos/*/from_timestamp`/`to_timestamp` are narrowed by the same number of frames, so the
 (uncopied, unmodified) video file's window for that episode still lines up with the trimmed
-data. Episodes with no suggested trim are kept in full.
+data. Episodes with no suggested trim are kept in full. `--apply-trim` is v3.0 only for now;
+on a v2.x source it errors out instead of silently ignoring the flag.
 
 ## What it checks
 
