@@ -126,11 +126,12 @@ def _parser() -> argparse.ArgumentParser:
     export = sub.add_parser(
         "export",
         help="write a cleaned copy of a dataset without the rejected episodes",
-        description="Write a LeRobot v3.0 dataset containing only the episodes a `demoqc score "
-        "--json` report keeps. Episodes are renumbered and meta/info.json, meta/episodes and "
-        "meta/stats.json are rewritten. With --apply-trim, each kept episode's idle start/end "
+        description="Write a LeRobot v3.0 or v2.x dataset containing only the episodes a "
+        "`demoqc score --json` report keeps. Episodes are renumbered and the metadata/stats "
+        "are rewritten. With --apply-trim (v3.0 only), each kept episode's idle start/end "
         "frames are also cut. Only tabular data and metadata are written; videos are neither "
-        "read nor copied.",
+        "read nor copied (for v2.x, each kept episode's video files must be renamed to match "
+        "its new index; see the printed warning).",
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
@@ -263,7 +264,7 @@ def _export(args: argparse.Namespace) -> int:
         )
     for w in result.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    if result.has_videos:
+    if result.has_videos and result.version.startswith("v3"):
         print(
             "videos were not copied. Their episode time spans are unchanged, so copy the "
             "source videos/ directory into the output to use it for training."

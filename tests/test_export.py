@@ -175,10 +175,10 @@ def test_refuses_bad_input(make_dataset, tmp_path):
     assert (tmp_path / "c" / "x").read_text() == "keep me"
 
 
-def test_v2_is_rejected_with_a_clear_message(make_dataset, tmp_path):
+def test_v2_apply_trim_is_rejected_with_a_clear_message(make_dataset, tmp_path):
     src = make_dataset(clean_specs(3), version="v2.1")
-    with pytest.raises(ValueError, match=r"v3\.0.*v2\.1"):
-        export_dataset(src, tmp_path / "out", [0])
+    with pytest.raises(ValueError, match=r"apply-trim.*v2\.1"):
+        export_dataset(src, tmp_path / "out", [0, 1], trim={0: (1, 2)})
 
 
 def test_keep_from_report_rejects_a_report_for_another_dataset(make_dataset, tmp_path):
@@ -358,3 +358,170 @@ def test_trim_from_report_rejects_a_report_for_another_dataset(make_dataset, tmp
     other = load_dataset(write_dataset(tmp_path / "other", clean_specs(4)))
     with pytest.raises(ValueError, match="different dataset"):
         trim_from_report(report, other)
+
+
+# -- v2.x export (slice 1: drop/renumber, no --apply-trim) ------------------------------------
+
+
+def _jsonl(path):
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+@pytest.fixture
+def exported_v2(make_dataset, tmp_path):
+    specs = [EpisodeSpec(seconds=6.0 + i, seed=i) for i in range(6)]
+    src = make_dataset(specs, version="v2.1")
+    result = export_dataset(src, tmp_path / "out", KEEP)
+    return src, tmp_path / "out", result
+
+
+def test_v2_frames_are_filtered_and_reindexed(exported_v2):
+    src, out, result = exported_v2
+    before, after = _frames(src), _frames(out)
+
+    assert result.kept == KEEP and result.dropped == [1, 4]
+    assert result.version == "v2.x"
+    assert after["episode_index"].unique().tolist() == [0, 1, 2, 3]
+    assert after["index"].tolist() == list(range(len(after)))
+    assert result.frames == len(after) == (before["episode_index"].isin(KEEP)).sum()
+    for new, old in enumerate(KEEP):
+        a = np.stack(before[before["episode_index"] == old]["action"])
+        b = np.stack(after[after["episode_index"] == new]["action"])
+        np.testing.assert_array_equal(a, b)
+    # v2.x writes one file per episode, named after the new index
+    assert sorted(p.name for p in (out / "data" / "chunk-000").iterdir()) == [
+        f"episode_{i:06d}.parquet" for i in range(4)
+    ]
+
+
+def test_v2_episodes_jsonl_is_filtered_and_reindexed(exported_v2):
+    src, out, _ = exported_v2
+    rows = _jsonl(out / "meta" / "episodes.jsonl")
+    assert [r["episode_index"] for r in rows] == [0, 1, 2, 3]
+    assert [r["tasks"] for r in rows] == [["pick the cube"]] * 4
+    after_frames = _frames(out)
+    for r in rows:
+        n = (after_frames["episode_index"] == r["episode_index"]).sum()
+        assert r["length"] == n
+
+
+def test_v2_tasks_jsonl_is_copied_unchanged(exported_v2):
+    src, out, _ = exported_v2
+    assert (out / "meta" / "tasks.jsonl").read_text() == (src / "meta" / "tasks.jsonl").read_text()
+
+
+def test_v2_info_json_is_updated(exported_v2):
+    _, out, result = exported_v2
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 4
+    assert info["total_frames"] == result.frames
+    assert info["splits"] == {"train": "0:4"}
+    assert info["total_chunks"] == 1
+    assert info["total_videos"] == 4  # one camera feature
+    assert result.has_videos
+    assert not (out / "videos").exists()
+
+
+def test_v2_stats_are_recomputed_for_tabular_and_video_features(exported_v2):
+    src, out, _ = exported_v2
+    stats = json.loads((out / "meta" / "stats.json").read_text())
+    frames = _frames(out)
+
+    action = np.stack(frames["action"]).astype(np.float64)
+    np.testing.assert_allclose(stats["action"]["mean"], action.mean(0))
+    np.testing.assert_allclose(stats["action"]["std"], action.std(0))
+    assert stats["action"]["count"] == [len(frames)]
+    assert stats["index"]["max"] == [len(frames) - 1]
+    assert stats["episode_index"]["max"] == [3]
+
+    old_stats = {
+        r["episode_index"]: r["stats"] for r in _jsonl(src / "meta" / "episodes_stats.jsonl")
+    }
+    means = np.array([old_stats[i]["observation.images.top"]["mean"] for i in KEEP])
+    counts = np.array([old_stats[i]["observation.images.top"]["count"][0] for i in KEEP])
+    w = counts / counts.sum()
+    mean = (w[:, None, None, None] * np.asarray(means.tolist())).sum(0)
+    np.testing.assert_allclose(
+        np.array(stats["observation.images.top"]["mean"]).reshape(-1),
+        np.asarray(mean).reshape(-1),
+    )
+    assert stats["observation.images.top"]["count"] == [int(counts.sum())]
+
+
+def test_v2_per_episode_stats_jsonl_is_filtered_and_reindexed(exported_v2):
+    src, out, _ = exported_v2
+    rows = {r["episode_index"]: r for r in _jsonl(out / "meta" / "episodes_stats.jsonl")}
+    assert sorted(rows) == [0, 1, 2, 3]
+    # index/episode_index stats describe the *new* numbering, not the original one
+    frames = _frames(out)
+    for new_idx, row in rows.items():
+        n = (frames["episode_index"] == new_idx).sum()
+        assert row["stats"]["episode_index"]["min"] == [new_idx]
+        assert row["stats"]["episode_index"]["max"] == [new_idx]
+        assert row["stats"]["index"]["count"] == [n]
+    # content of a feature untouched by reindexing (action) is carried over verbatim
+    old_rows = {r["episode_index"]: r for r in _jsonl(src / "meta" / "episodes_stats.jsonl")}
+    for new_idx, old_idx in enumerate(KEEP):
+        assert rows[new_idx]["stats"]["action"] == old_rows[old_idx]["stats"]["action"]
+
+
+def test_v2_exported_dataset_loads_and_scores(exported_v2):
+    _, out, _ = exported_v2
+    ds = load_dataset(out)
+    assert [e.index for e in ds.episodes] == [0, 1, 2, 3]
+    assert all(e.meta_length == e.length for e in ds.episodes)
+
+
+def test_v2_keep_everything_reproduces_the_source(make_dataset, tmp_path):
+    # meta/stats.json's video feature is independent random data in the fixture (not actually
+    # derived from the per-episode stats, same as the v3.0 fixture), so only compare its keys;
+    # tabular features and the JSONL metadata are checked exactly below.
+    src = make_dataset(clean_specs(5), version="v2.1")
+    export_dataset(src, tmp_path / "out", range(5))
+    for rel in ("meta/info.json", "meta/stats.json"):
+        a = json.loads((src / rel).read_text())
+        b = json.loads((tmp_path / "out" / rel).read_text())
+        assert a.keys() == b.keys()
+    stats_a = json.loads((src / "meta" / "stats.json").read_text())
+    stats_b = json.loads((tmp_path / "out" / "meta" / "stats.json").read_text())
+    for feature in ("action", "observation.state", "index", "episode_index"):
+        assert stats_a[feature] == stats_b[feature]
+    assert _jsonl(src / "meta" / "episodes.jsonl") == _jsonl(
+        tmp_path / "out" / "meta" / "episodes.jsonl"
+    )
+    assert _jsonl(src / "meta" / "episodes_stats.jsonl") == _jsonl(
+        tmp_path / "out" / "meta" / "episodes_stats.jsonl"
+    )
+    pd.testing.assert_frame_equal(_frames(src), _frames(tmp_path / "out"))
+
+
+def test_v2_refuses_bad_input(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    with pytest.raises(ValueError, match="not in the dataset"):
+        export_dataset(src, tmp_path / "a", [0, 9])
+
+
+def test_v2_export_command_warns_about_renaming_videos(make_dataset, tmp_path, capsys):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    report, out = tmp_path / "r.json", tmp_path / "clean"
+    assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0
+    capsys.readouterr()
+
+    assert main(["export", str(src), "--keep-from", str(report), "-o", str(out)]) == 0
+
+    said = capsys.readouterr()
+    assert "kept 4 of 4" in said.out
+    assert "renamed" in said.err and "episode_<old index>" in said.err
+    assert "videos were not copied. Their episode time spans are unchanged" not in said.out
+
+
+def test_v2_export_command_rejects_apply_trim(make_dataset, tmp_path, capsys):
+    specs = clean_specs(3)
+    specs[0] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=0)
+    src = make_dataset(specs, version="v2.1")
+    report, out = tmp_path / "r.json", tmp_path / "clean"
+    assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0
+    assert (
+        main(["export", str(src), "--keep-from", str(report), "--apply-trim", "-o", str(out)]) == 2
+    )
+    assert "apply-trim" in capsys.readouterr().err
