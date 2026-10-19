@@ -1,20 +1,26 @@
-"""Write a cleaned copy of a LeRobot v3.0 dataset: tabular data and metadata only.
+"""Write a cleaned copy of a LeRobot dataset: tabular data and metadata only.
 
-Dropping episodes from a v3.0 dataset is more than filtering rows. ``episode_index`` and the
-global ``index`` must stay contiguous, ``meta/episodes`` rows need their new indices and
-``dataset_from_index``/``dataset_to_index`` ranges, ``meta/info.json`` totals change, and the
-normalisation statistics in ``meta/stats.json`` (plus the per-episode ``stats/index`` and
-``stats/episode_index`` columns) would otherwise describe episodes that are no longer there.
+Dropping episodes is more than filtering rows. ``episode_index`` and the global ``index`` must
+stay contiguous, per-episode metadata needs new indices, ``meta/info.json`` totals change, and
+the normalisation statistics in ``meta/stats.json`` (plus any per-episode ``index``/
+``episode_index`` stats) would otherwise describe episodes that are no longer there.
 
-Data and episode-metadata files keep their relative paths, so the ``data/*`` and ``videos/*``
-chunk/file indices stored in ``meta/episodes`` stay valid, and the original ``videos/``
-directory can be copied next to the export unchanged (videos are never read or copied here).
+v3.0 (``_export_v3``) and v2.x (``_export_v2``) lay out data differently (many episodes per
+consolidated parquet/``meta/episodes`` file vs. one parquet per episode and JSONL metadata), so
+they're handled separately, sharing only the stats-recomputation helpers below.
+
+For v3.0, data and episode-metadata files keep their relative paths, so the ``data/*`` and
+``videos/*`` chunk/file indices stored in ``meta/episodes`` stay valid, and the original
+``videos/`` directory can be copied next to the export unchanged (videos are never read or
+copied here). For v2.x, video files are named after ``episode_index`` directly, so renumbering
+episodes means each kept episode's video files must be renamed to match (see the warning
+``_export_v2`` returns); copying ``videos/`` unchanged is not enough.
 
 Optionally, ``export_dataset`` can also apply the ``trim`` suggested by ``demoqc score`` for an
 episode: drop the idle frames at its start/end, renumber ``frame_index`` and shift ``timestamp``
 so it still starts near 0, and shrink its ``videos/*/from_timestamp``/``to_timestamp`` window by
 the same number of frames. The video itself is never read or re-encoded; trimming only narrows
-which part of it a kept episode's metadata points at.
+which part of it a kept episode's metadata points at. ``--apply-trim`` is v3.0 only for now.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,7 +41,9 @@ from demoqc.dataset import Dataset
 # per-episode stats that describe the (now rewritten) indices rather than the demonstrations
 _REINDEXED = ("episode_index", "index")
 _QUANTILE_KEY = re.compile(r"q(\d\d)$")
-_HANDLED_META = {"info.json", "stats.json"}
+_HANDLED_META_V3 = {"info.json", "stats.json"}
+_HANDLED_META_V2 = {"info.json", "stats.json", "episodes.jsonl", "episodes_stats.jsonl"}
+_DEFAULT_DATA_PATH_V2 = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 
 
 @dataclass
@@ -45,6 +53,7 @@ class ExportResult:
     dropped: list[int]
     frames: int
     has_videos: bool
+    version: str = "v3.0"
     trimmed_frames: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -96,26 +105,41 @@ def trim_from_report(report_path: Path, ds: Dataset) -> dict[int, tuple[int, int
 def export_dataset(
     src: Path, out: Path, keep: Iterable[int], trim: dict[int, tuple[int, int]] | None = None
 ) -> ExportResult:
-    """Write the episodes in ``keep`` from the v3.0 dataset at ``src`` to ``out``.
+    """Write the episodes in ``keep`` from the LeRobot dataset at ``src`` to ``out``.
 
     Kept episodes are renumbered 0..k-1 in their original order. ``trim`` optionally maps an
     original episode index to the ``[start, end)`` frame range to keep for it (see
-    :func:`trim_from_report`); episodes not in ``trim`` are kept in full.
+    :func:`trim_from_report`); episodes not in ``trim`` are kept in full. ``trim`` is only
+    supported for v3.0 datasets.
     """
     src, out = Path(src), Path(out)
     info = json.loads((src / "meta" / "info.json").read_text())
     version = str(info.get("codebase_version", "unknown"))
     fps = float(info["fps"])
-    if not version.startswith("v3"):
-        raise ValueError(
-            f"export supports LeRobot v3.0 datasets; this one is {version} "
-            "(v2.x export is not implemented yet)"
-        )
     if out.resolve() == src.resolve():
         raise ValueError("the output directory must differ from the source dataset")
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f"{out} already exists and is not empty")
 
+    keep_ids = np.unique(np.asarray(list(keep), dtype=np.int64))
+    if keep_ids.size == 0:
+        raise ValueError("no episodes to keep")
+
+    if not version.startswith("v3"):
+        if trim:
+            raise ValueError(f"--apply-trim is not implemented for {version} datasets yet")
+        return _export_v2(src, out, info, keep_ids)
+    return _export_v3(src, out, info, fps, keep_ids, trim)
+
+
+def _export_v3(
+    src: Path,
+    out: Path,
+    info: dict,
+    fps: float,
+    keep_ids: np.ndarray,
+    trim: dict[int, tuple[int, int]] | None,
+) -> ExportResult:
     data_files = sorted((src / "data").rglob("*.parquet"))
     episode_files = sorted((src / "meta" / "episodes").rglob("*.parquet"))
     if not data_files or not episode_files:
@@ -124,9 +148,6 @@ def export_dataset(
     stats_path = src / "meta" / "stats.json"
     old_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
 
-    keep_ids = np.unique(np.asarray(list(keep), dtype=np.int64))
-    if keep_ids.size == 0:
-        raise ValueError("no episodes to keep")
     all_ep = np.concatenate(
         [pq.read_table(f, columns=["episode_index"])[0].to_numpy() for f in data_files]
     )
@@ -228,8 +249,12 @@ def export_dataset(
         _write(table, out / f.relative_to(src))
 
     if old_stats:
+        episodes_table = pa.concat_tables([t for _, t in episode_tables])
         stats = _recompute_stats(
-            old_stats, stat_arrays, pa.concat_tables([t for _, t in episode_tables]), warnings
+            old_stats,
+            stat_arrays,
+            warnings,
+            lambda feature, keys: _combine_episode_stats(episodes_table, feature, keys),
         )
         (out / "meta").mkdir(parents=True, exist_ok=True)
         (out / "meta" / "stats.json").write_text(json.dumps(stats, indent=4) + "\n")
@@ -243,7 +268,7 @@ def export_dataset(
 
     for p in sorted((src / "meta").rglob("*")):
         rel = p.relative_to(src / "meta")
-        if p.is_file() and rel.parts[0] != "episodes" and rel.as_posix() not in _HANDLED_META:
+        if p.is_file() and rel.parts[0] != "episodes" and rel.as_posix() not in _HANDLED_META_V3:
             (out / "meta" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, out / "meta" / rel)
 
@@ -254,9 +279,154 @@ def export_dataset(
         dropped=dropped.tolist(),
         frames=int(ends[-1]),
         has_videos=any(f.get("dtype") == "video" for f in info.get("features", {}).values()),
+        version="v3.0",
         trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
     )
+
+
+def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> ExportResult:
+    """Write the episodes in ``keep_ids`` from a v2.x dataset (one parquet per episode,
+    JSONL metadata) to ``out``. No trimming: this is v2.x export slice 1.
+
+    Unlike v3.0, a v2.x video file is named after its episode's index, so renaming episodes
+    invalidates the ``videos/`` directory's filenames; the caller is warned to rename them.
+    """
+    episode_rows = {
+        int(r["episode_index"]): r for r in _read_jsonl(src / "meta" / "episodes.jsonl")
+    }
+    present = np.array(sorted(episode_rows), dtype=np.int64)
+    unknown = np.setdiff1d(keep_ids, present)
+    if unknown.size:
+        raise ValueError(f"episodes not in the dataset: {unknown.tolist()}")
+
+    data_files: dict[int, Path] = {}
+    for f in sorted((src / "data").rglob("episode_*.parquet")):
+        m = re.fullmatch(r"episode_(\d+)\.parquet", f.name)
+        if m:
+            data_files[int(m.group(1))] = f
+    missing = [int(e) for e in keep_ids.tolist() if e not in data_files]
+    if missing:
+        raise ValueError(f"no data file for episode(s): {missing}")
+
+    stat_rows_by_ep = {
+        int(r["episode_index"]): r for r in _read_jsonl(src / "meta" / "episodes_stats.jsonl")
+    }
+    video_features = sorted(
+        name
+        for name, feat in info.get("features", {}).items()
+        if isinstance(feat, dict) and feat.get("dtype") == "video"
+    )
+    chunks_size = int(info.get("chunks_size", 1000))
+    data_path = info.get("data_path") or _DEFAULT_DATA_PATH_V2
+
+    stats_path = src / "meta" / "stats.json"
+    old_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
+
+    stat_arrays: dict[str, list[np.ndarray]] = {k: [] for k in old_stats}
+    new_episode_rows: list[dict] = []
+    new_stat_rows: list[dict] = []
+    offset = 0
+    for new_idx, orig_idx in enumerate(keep_ids.tolist()):
+        table = pq.read_table(data_files[orig_idx])
+        n = table.num_rows
+        table = _set(table, "episode_index", np.full(n, new_idx, dtype=np.int64))
+        table = _set(table, "index", offset + np.arange(n))
+        for name in stat_arrays:
+            if name in table.column_names:
+                stat_arrays[name].append(_as_matrix(table[name]))
+        dest = out / data_path.format(episode_chunk=new_idx // chunks_size, episode_index=new_idx)
+        _write(table, dest)
+
+        row = dict(episode_rows[orig_idx])
+        row["episode_index"] = new_idx
+        new_episode_rows.append(row)
+
+        stat_row = stat_rows_by_ep.get(orig_idx)
+        if stat_row is not None:
+            stats = dict(stat_row.get("stats") or {})
+            for feature, values in (
+                ("index", offset + np.arange(n)),
+                ("episode_index", np.full(n, new_idx)),
+            ):
+                if feature in stats:
+                    stats[feature] = _summarise(
+                        values.astype(np.float64)[:, None], list(stats[feature])
+                    )
+            new_stat_rows.append({"episode_index": new_idx, "stats": stats})
+
+        offset += n
+
+    (out / "meta").mkdir(parents=True, exist_ok=True)
+    _write_jsonl(out / "meta" / "episodes.jsonl", new_episode_rows)
+
+    warnings: list[str] = []
+    if new_stat_rows:
+        _write_jsonl(out / "meta" / "episodes_stats.jsonl", new_stat_rows)
+        if len(new_stat_rows) != len(keep_ids):
+            warnings.append(
+                "meta/episodes_stats.jsonl is missing rows for some kept episodes; "
+                "meta/stats.json was not fully recomputed from them"
+            )
+
+    if old_stats:
+        stats = _recompute_stats(
+            old_stats,
+            stat_arrays,
+            warnings,
+            lambda feature, keys: _combine_episode_stats_v2(new_stat_rows, feature, keys),
+        )
+        (out / "meta" / "stats.json").write_text(json.dumps(stats, indent=4) + "\n")
+    else:
+        warnings.append("no meta/stats.json in the source; none written")
+
+    info = dict(info)
+    info["total_episodes"] = len(keep_ids)
+    info["total_frames"] = offset
+    info["splits"] = {"train": f"0:{len(keep_ids)}"}
+    if "total_chunks" in info:
+        info["total_chunks"] = max(1, -(-len(keep_ids) // chunks_size))
+    if "total_videos" in info and video_features:
+        info["total_videos"] = len(keep_ids) * len(video_features)
+    (out / "meta" / "info.json").write_text(json.dumps(info, indent=4) + "\n")
+
+    for p in sorted((src / "meta").rglob("*")):
+        rel = p.relative_to(src / "meta")
+        if p.is_file() and rel.as_posix() not in _HANDLED_META_V2:
+            (out / "meta" / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, out / "meta" / rel)
+
+    if video_features:
+        warnings.append(
+            "videos were not copied or renamed: a v2.x video file is named after its episode's "
+            "index, so copy each kept episode's video (every camera) from "
+            "episode_<old index>.mp4 to episode_<new index>.mp4, where <new index> is its "
+            "0-based position in `kept`"
+        )
+
+    dropped = np.setdiff1d(present, keep_ids)
+    return ExportResult(
+        out=out,
+        kept=keep_ids.tolist(),
+        dropped=dropped.tolist(),
+        frames=offset,
+        has_videos=bool(video_features),
+        version="v2.x",
+        warnings=sorted(set(warnings)),
+    )
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
 
 
 def _write(table: pa.Table, path: Path) -> None:
@@ -345,12 +515,15 @@ def _restat_indices(table: pa.Table, starts: np.ndarray, ends: np.ndarray) -> pa
 
 
 def _recompute_stats(
-    old: dict, arrays: dict[str, list[np.ndarray]], episodes: pa.Table, warnings: list[str]
+    old: dict,
+    arrays: dict[str, list[np.ndarray]],
+    warnings: list[str],
+    combine: Callable[[str, list[str]], dict | None],
 ) -> dict:
     """Dataset-level stats for the kept episodes.
 
-    Tabular features are recomputed exactly from the kept frames. Video features (which we
-    cannot read) are combined from the per-episode stats in ``meta/episodes``.
+    Tabular features are recomputed exactly from the kept frames (``arrays``). Video features
+    (which we cannot read) are combined from each format's own per-episode stats via ``combine``.
     """
     stats = {}
     for feature, old_stats in old.items():
@@ -358,7 +531,7 @@ def _recompute_stats(
         if arrays.get(feature):
             stats[feature] = _summarise(np.concatenate(arrays[feature]), keys)
             continue
-        combined = _combine_episode_stats(episodes, feature, keys)
+        combined = combine(feature, keys)
         if combined is None:
             warnings.append(
                 f"stats for '{feature}' could not be recomputed and still describe the "
@@ -371,6 +544,7 @@ def _recompute_stats(
 
 
 def _combine_episode_stats(episodes: pa.Table, feature: str, keys: list[str]) -> dict | None:
+    """v3.0: per-episode stats as ``stats/{feature}/{key}`` columns of ``meta/episodes``."""
     names = [f"stats/{feature}/{k}" for k in keys]
     if not all(n in episodes.column_names for n in names):
         return None
@@ -381,6 +555,25 @@ def _combine_episode_stats(episodes: pa.Table, feature: str, keys: list[str]) ->
         }
     except (TypeError, ValueError):
         return None  # null stats for some episode
+    return _combine_from_arrays(per_episode, keys)
+
+
+def _combine_episode_stats_v2(stat_rows: list[dict], feature: str, keys: list[str]) -> dict | None:
+    """v2.x: per-episode stats as nested dicts, one ``meta/episodes_stats.jsonl`` row each."""
+    if not stat_rows:
+        return None
+    try:
+        per_episode = {
+            k: np.array([np.asarray(r["stats"][feature][k], dtype=np.float64) for r in stat_rows])
+            for k in keys
+        }
+    except (KeyError, TypeError, ValueError):
+        return None  # feature/key missing or null stats for some episode
+    return _combine_from_arrays(per_episode, keys)
+
+
+def _combine_from_arrays(per_episode: dict[str, np.ndarray], keys: list[str]) -> dict | None:
+    """Count-weighted combination of one feature's per-episode stats into dataset-level stats."""
     if "count" not in per_episode:
         return None
     count = per_episode["count"].reshape(len(per_episode["count"]), -1)[:, 0]

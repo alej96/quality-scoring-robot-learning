@@ -206,8 +206,17 @@ def write_dataset(
     }
     info["total_tasks"] = 1
     info["chunks_size"] = 1000
-    info["data_path"] = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
-    info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    if version.startswith("v3"):
+        info["data_path"] = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+        info["video_path"] = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    else:
+        # real v2.x convention: one data/video file per episode, named by episode_index
+        info["data_path"] = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+        info["video_path"] = (
+            "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+        )
+        info["total_chunks"] = 1
+        info["total_videos"] = len(specs)
     (root / "meta" / "info.json").write_text(json.dumps(info))
     all_frames = pd.concat(frames)
     dataset_stats = {
