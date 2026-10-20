@@ -42,8 +42,8 @@ Work top-down through **Next up**. Each item should ship in one focused session
       see the Log entry) — slice 1 only (drop/renumber, no `--apply-trim`).
       (2) An option to copy or symlink the source `videos/` directory for local sources (they
       are never read today; the export only notes that they must be copied, and for v2.x also
-      renamed to match the new episode indices — see the Log entry). (3) `--min-score`
-      on `export` itself, so a separate `score --json` run isn't required. (4) Single `train`
+      renamed to match the new episode indices — see the Log entry). (3) ~~`--min-score` on
+      `export` itself~~ shipped 2026-10-20 (see the Log entry). (4) Single `train`
       split only: other `splits` entries in `info.json` are collapsed into `train`.
       (5) **v2.x `--apply-trim`.** The v3.0 trim logic (renumber `frame_index`, shift
       `timestamp`, narrow video spans) needs a v2.x-specific implementation since episode
@@ -372,3 +372,21 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `tests/conftest.py`'s synthetic v2.x writer also had its `data_path`/`video_path` templates
   fixed to the real v2.x convention (`episode_chunk`/`episode_index` placeholders; it had been
   silently reusing v3.0's template, untested until this export path needed it).
+- 2026-10-20: Added **`--min-score N`** to `demoqc export` as an alternative to `--keep-from`
+  (an export follow-up: previously every export needed a separate `demoqc score --json` run
+  just to produce the keep list). `--keep-from`/`--min-score` are now a mutually exclusive,
+  required argparse group; `--min-score` scores the dataset in-process at default thresholds
+  (`evaluate` + duplicate detection + `build_report`, the same path `demoqc score` uses) and
+  feeds the resulting keep/trim lists straight into `export_dataset`, reusing the existing
+  report-derived logic via two new pure helpers (`keep_from_report_dict`/`trim_from_report_dict`
+  in `src/demoqc/export.py`) that the file-based `keep_from_report`/`trim_from_report` now also
+  call. `push-report` stayed blocked again this run (`HF_TOKEN` is still unset in this
+  environment) even though the Hugging Face Hub itself was reachable. Validated on
+  masato-ka/so100_cutlery_handling_simple (50 ep, v2.1): `export --min-score 90` and
+  `export --keep-from <score --json output> --min-score 90` produced byte-for-byte identical
+  output directories (`diff -rq`), both dropping the same 5 episodes. Also validated on
+  lerobot/svla_so101_pickplace (50 ep, v3.0) with `--apply-trim` added: both paths trimmed the
+  same 1411 idle frames and again produced byte-identical directories. New tests in
+  `tests/test_export.py` (`test_export_command_min_score_matches_a_separate_score_json_run`,
+  `test_export_command_requires_exactly_one_keep_source`) fail without this change (confirmed
+  via `git stash` on just `src/demoqc/cli.py`/`src/demoqc/export.py`).

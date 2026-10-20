@@ -31,6 +31,9 @@ demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episode
 demoqc score user/dataset --json report.json --min-score 80
 demoqc export user/dataset --keep-from report.json -o ./clean_dataset
 
+# or skip the separate score --json run and score+export in one step
+demoqc export user/dataset --min-score 80 -o ./clean_dataset
+
 # also cut each kept episode's idle start/end frames
 demoqc export user/dataset --keep-from report.json --apply-trim -o ./clean_dataset
 ```
@@ -62,8 +65,12 @@ Hugging Face dataset card or a GitHub/Hub pull request.
 
 `demoqc export <source> --keep-from report.json -o <dir>` writes a LeRobot dataset (**v3.0**
 or **v2.x**, matching the source) that contains only the episodes in the report's
-`summary.keep`. It does what filtering rows by hand gets wrong: episodes are renumbered
-`0..k-1`, the global `index` stays contiguous, per-episode metadata gets the new indices,
+`summary.keep`. Pass `--min-score N` instead of `--keep-from` to score the dataset in the
+same command (at default thresholds) and keep everything scoring `N` or above, without a
+separate `demoqc score --json` run first; `--keep-from` and `--min-score` are mutually
+exclusive and exactly one is required. It does what filtering rows by hand gets wrong:
+episodes are renumbered `0..k-1`, the global `index` stays contiguous, per-episode metadata
+gets the new indices,
 `meta/info.json` totals and `splits` are updated, and `meta/stats.json` (plus any per-episode
 `index`/`episode_index` stats) is recomputed for the kept episodes, so the normalisation
 statistics no longer include the episodes you dropped. Tabular features are recomputed
