@@ -214,6 +214,53 @@ def test_export_command_drops_rejected_episodes(make_dataset, tmp_path, capsys):
     assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == len(keep)
 
 
+def test_export_command_min_score_matches_a_separate_score_json_run(make_dataset, tmp_path, capsys):
+    specs = clean_specs()
+    specs[3] = EpisodeSpec(seconds=8.0, spikes_at=[40, 80, 120, 160, 200], seed=3)
+    src = make_dataset(specs)
+    report = tmp_path / "r.json"
+    assert main(["score", str(src), "--json", str(report), "--quiet", "--min-score", "90"]) == 0
+    keep = json.loads(report.read_text())["summary"]["keep"]
+    assert 3 not in keep and len(keep) < len(specs)
+    capsys.readouterr()
+
+    # --min-score alone (no separate score --json run) keeps exactly the same episodes
+    out_a = tmp_path / "from_report"
+    assert main(["export", str(src), "--keep-from", str(report), "-o", str(out_a)]) == 0
+    out_b = tmp_path / "from_min_score"
+    assert main(["export", str(src), "--min-score", "90", "-o", str(out_b)]) == 0
+
+    said = capsys.readouterr().out
+    assert f"kept {len(keep)} of {len(specs)}" in said
+    pd.testing.assert_frame_equal(_frames(out_a), _frames(out_b))
+    pd.testing.assert_frame_equal(_episodes(out_a), _episodes(out_b))
+
+
+def test_export_command_requires_exactly_one_keep_source(make_dataset, tmp_path, capsys):
+    src = make_dataset(clean_specs(4))
+    report = tmp_path / "r.json"
+    main(["score", str(src), "--json", str(report), "--quiet"])
+
+    with pytest.raises(SystemExit) as exc:
+        main(["export", str(src), "-o", str(tmp_path / "a")])
+    assert exc.value.code == 2
+
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "export",
+                str(src),
+                "--keep-from",
+                str(report),
+                "--min-score",
+                "90",
+                "-o",
+                str(tmp_path / "b"),
+            ]
+        )
+    assert exc.value.code == 2
+
+
 def test_export_command_errors_exit_2(make_dataset, tmp_path, capsys):
     src = make_dataset(clean_specs(4))
     report = tmp_path / "r.json"

@@ -11,7 +11,13 @@ from demoqc import __version__
 from demoqc.checks import CHECK_NAMES, Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
-from demoqc.export import export_dataset, keep_from_report, trim_from_report
+from demoqc.export import (
+    export_dataset,
+    keep_from_report,
+    keep_from_report_dict,
+    trim_from_report,
+    trim_from_report_dict,
+)
 from demoqc.report import build_report, format_markdown, format_summary, write_csv, write_json
 
 
@@ -135,12 +141,19 @@ def _parser() -> argparse.ArgumentParser:
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
-    export.add_argument(
+    keep_source = export.add_mutually_exclusive_group(required=True)
+    keep_source.add_argument(
         "--keep-from",
         type=Path,
-        required=True,
         metavar="REPORT.json",
         help="report from `demoqc score --json` for this dataset; its summary.keep list is kept",
+    )
+    keep_source.add_argument(
+        "--min-score",
+        type=float,
+        metavar="N",
+        help="score the dataset here (default thresholds) and keep episodes scoring >= N, "
+        "instead of requiring a separate `demoqc score --json` run",
     )
     export.add_argument(
         "-o", "--output", type=Path, required=True, help="directory to write (must be empty)"
@@ -246,8 +259,20 @@ def _export(args: argparse.Namespace) -> int:
     if ds is None:
         return 2
     try:
-        keep = keep_from_report(args.keep_from, ds)
-        trim = trim_from_report(args.keep_from, ds) if args.apply_trim else None
+        if args.keep_from is not None:
+            keep = keep_from_report(args.keep_from, ds)
+            trim = trim_from_report(args.keep_from, ds) if args.apply_trim else None
+        else:
+            cfg = Config()
+            results = evaluate(ds, cfg)
+            ctx = DatasetContext.build(ds, cfg)
+            duplicate_groups = find_duplicates(ds, results, ctx, cfg)
+            flag_duplicates(results, duplicate_groups)
+            report = build_report(
+                ds, results, min_score=args.min_score, duplicate_groups=duplicate_groups
+            )
+            keep = keep_from_report_dict(report)
+            trim = trim_from_report_dict(report) if args.apply_trim else None
         result = export_dataset(ds.root, args.output, keep, trim=trim)
     except (ValueError, FileExistsError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
