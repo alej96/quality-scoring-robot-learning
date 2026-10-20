@@ -77,27 +77,39 @@ def _load_report(report_path: Path, ds: Dataset) -> dict:
     return report
 
 
+def keep_from_report_dict(report: dict) -> list[int]:
+    """Episode indices to keep according to an in-memory ``demoqc score`` report."""
+    return [int(i) for i in report["summary"]["keep"]]
+
+
+def trim_from_report_dict(report: dict) -> dict[int, tuple[int, int]]:
+    """Per-episode ``[start, end)`` frame ranges to keep, from an in-memory report.
+
+    Only episodes with a suggested trim (idle time at the start/end) are included.
+    """
+    return {
+        int(e["episode_index"]): (int(e["trim"][0]), int(e["trim"][1]))
+        for e in report["episodes"]
+        if e.get("trim")
+    }
+
+
 def keep_from_report(report_path: Path, ds: Dataset) -> list[int]:
-    """Episode indices to keep according to a ``demoqc score --json`` report."""
+    """Episode indices to keep according to a ``demoqc score --json`` report file."""
     report = _load_report(report_path, ds)
     try:
-        return [int(i) for i in report["summary"]["keep"]]
+        return keep_from_report_dict(report)
     except (KeyError, TypeError) as exc:
         raise ValueError(f"{report_path} is not a demoqc score report ({exc!r})") from exc
 
 
 def trim_from_report(report_path: Path, ds: Dataset) -> dict[int, tuple[int, int]]:
-    """Per-episode ``[start, end)`` frame ranges to keep, from a ``demoqc score --json`` report.
-
-    Only episodes with a suggested trim (idle time at the start/end) are included.
+    """Per-episode ``[start, end)`` frame ranges to keep, from a ``demoqc score --json`` report
+    file. Only episodes with a suggested trim (idle time at the start/end) are included.
     """
     report = _load_report(report_path, ds)
     try:
-        return {
-            int(e["episode_index"]): (int(e["trim"][0]), int(e["trim"][1]))
-            for e in report["episodes"]
-            if e.get("trim")
-        }
+        return trim_from_report_dict(report)
     except (KeyError, TypeError, IndexError) as exc:
         raise ValueError(f"{report_path} is not a demoqc score report ({exc!r})") from exc
 
