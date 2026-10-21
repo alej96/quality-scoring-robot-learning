@@ -88,12 +88,16 @@ index = position in `kept`) since it never touches the video files itself. The r
 come from the same dataset (episode and frame counts are checked).
 
 `--apply-trim` additionally cuts each kept episode's idle start/end frames, using the same
-`trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered, `timestamp` is
-shifted so the episode still starts near 0, and `meta/episodes`' `length` and each camera's
-`videos/*/from_timestamp`/`to_timestamp` are narrowed by the same number of frames, so the
+`trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered and `timestamp`
+is shifted so the episode still starts near 0. Episodes with no suggested trim are kept in
+full. For **v3.0**, `meta/episodes`' `length` and each camera's
+`videos/*/from_timestamp`/`to_timestamp` are also narrowed by the same number of frames, so the
 (uncopied, unmodified) video file's window for that episode still lines up with the trimmed
-data. Episodes with no suggested trim are kept in full. `--apply-trim` is v3.0 only for now;
-on a v2.x source it errors out instead of silently ignoring the flag.
+data. For **v2.x**, `meta/episodes.jsonl`'s `length` is updated the same way, but a v2.x video
+file has no per-episode time span stored in its metadata to narrow instead -- it simply covers
+the whole original episode -- so `demoqc export` prints an additional warning: the video itself
+must be cut to the same `trim` frame range (on top of being renamed) before training on the
+export, or it will run longer than the now-trimmed data.
 
 ## What it checks
 
