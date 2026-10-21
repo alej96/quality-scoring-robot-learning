@@ -175,12 +175,6 @@ def test_refuses_bad_input(make_dataset, tmp_path):
     assert (tmp_path / "c" / "x").read_text() == "keep me"
 
 
-def test_v2_apply_trim_is_rejected_with_a_clear_message(make_dataset, tmp_path):
-    src = make_dataset(clean_specs(3), version="v2.1")
-    with pytest.raises(ValueError, match=r"apply-trim.*v2\.1"):
-        export_dataset(src, tmp_path / "out", [0, 1], trim={0: (1, 2)})
-
-
 def test_keep_from_report_rejects_a_report_for_another_dataset(make_dataset, tmp_path):
     a = make_dataset(clean_specs(6))
     report = tmp_path / "r.json"
@@ -562,13 +556,75 @@ def test_v2_export_command_warns_about_renaming_videos(make_dataset, tmp_path, c
     assert "videos were not copied. Their episode time spans are unchanged" not in said.out
 
 
-def test_v2_export_command_rejects_apply_trim(make_dataset, tmp_path, capsys):
+def test_v2_apply_trim_cuts_frames_shifts_timestamps_and_updates_length(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    before = _frames(src)
+    ep1_before = before[before["episode_index"] == 1]
+    ep1_len = len(ep1_before)
+    lead, trail = 10, 5
+    trim = {1: (lead, ep1_len - trail)}
+
+    result = export_dataset(src, tmp_path / "out", keep=[0, 1, 2, 3], trim=trim)
+
+    assert result.trimmed_frames == lead + trail
+    after = _frames(tmp_path / "out")
+    assert after["index"].tolist() == list(range(len(after)))
+    ep1_after = after[after["episode_index"] == 1]
+    assert len(ep1_after) == ep1_len - lead - trail
+    assert ep1_after["frame_index"].tolist() == list(range(len(ep1_after)))
+    np.testing.assert_array_equal(
+        np.stack(ep1_after["action"]), np.stack(ep1_before["action"])[lead : ep1_len - trail]
+    )
+    np.testing.assert_allclose(
+        ep1_after["timestamp"].to_numpy(),
+        ep1_before["timestamp"].to_numpy()[lead : ep1_len - trail] - lead / FPS,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+    rows = {r["episode_index"]: r for r in _jsonl(tmp_path / "out" / "meta" / "episodes.jsonl")}
+    assert rows[1]["length"] == len(ep1_after)
+    # the untrimmed episode 0 is carried over exactly, with its length still correct
+    assert rows[0]["length"] == len(before[before["episode_index"] == 0])
+    np.testing.assert_array_equal(
+        np.stack(after[after["episode_index"] == 0]["action"]),
+        np.stack(before[before["episode_index"] == 0]["action"]),
+    )
+
+
+def test_v2_apply_trim_rejects_out_of_range_trims(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(3), version="v2.1")
+    length = len(_frames(src).loc[lambda d: d["episode_index"] == 0])
+    with pytest.raises(ValueError, match="invalid trim"):
+        export_dataset(src, tmp_path / "a", keep=[0, 1, 2], trim={0: (5, 2)})
+    with pytest.raises(ValueError, match="invalid trim"):
+        export_dataset(src, tmp_path / "b", keep=[0, 1, 2], trim={0: (0, length + 10)})
+
+
+def test_v2_apply_trim_for_a_dropped_episode_is_ignored(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    result = export_dataset(src, tmp_path / "out", keep=[0, 2, 3], trim={1: (0, 999999)})
+    assert result.kept == [0, 2, 3] and result.trimmed_frames == 0
+
+
+def test_v2_export_command_apply_trim_warns_about_cutting_videos(make_dataset, tmp_path, capsys):
     specs = clean_specs(3)
     specs[0] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=0)
     src = make_dataset(specs, version="v2.1")
     report, out = tmp_path / "r.json", tmp_path / "clean"
     assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0
+    episodes = json.loads(report.read_text())["episodes"]
+    start, end = episodes[0]["trim"]
+    capsys.readouterr()
+
     assert (
-        main(["export", str(src), "--keep-from", str(report), "--apply-trim", "-o", str(out)]) == 2
+        main(["export", str(src), "--keep-from", str(report), "--apply-trim", "-o", str(out)]) == 0
     )
-    assert "apply-trim" in capsys.readouterr().err
+
+    said = capsys.readouterr()
+    assert "trimmed" in said.out
+    after = _frames(out)
+    ep0 = after[after["episode_index"] == 0]
+    assert len(ep0) == end - start
+    assert ep0["frame_index"].tolist() == list(range(end - start))
+    assert "must also be cut" in said.err
