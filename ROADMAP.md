@@ -45,10 +45,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
       renamed to match the new episode indices — see the Log entry). (3) ~~`--min-score` on
       `export` itself~~ shipped 2026-10-20 (see the Log entry). (4) Single `train`
       split only: other `splits` entries in `info.json` are collapsed into `train`.
-      (5) **v2.x `--apply-trim`.** The v3.0 trim logic (renumber `frame_index`, shift
-      `timestamp`, narrow video spans) needs a v2.x-specific implementation since episode
-      metadata and per-episode stats are laid out completely differently (JSONL rows, not
-      `meta/episodes` parquet columns).
+      (5) ~~v2.x `--apply-trim`~~ shipped 2026-10-21 (see the Log entry) — a v2.x video has no
+      per-episode time span to narrow like v3.0's, so the export warns that the video itself
+      must also be cut to match instead of narrowing a stored span.
 - [x] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
@@ -390,3 +389,29 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `tests/test_export.py` (`test_export_command_min_score_matches_a_separate_score_json_run`,
   `test_export_command_requires_exactly_one_keep_source`) fail without this change (confirmed
   via `git stash` on just `src/demoqc/cli.py`/`src/demoqc/export.py`).
+- 2026-10-21: Added **v2.x `--apply-trim`** (the export follow-up: v2.x is most of the real
+  validation set, and `--apply-trim` previously errored out on it unconditionally, so no v2.x
+  export could ever cut idle frames). `_export_v2` now accepts the same `trim` mapping as
+  `_export_v3`: for each kept episode it slices the parquet rows to the suggested `[start, end)`
+  range, renumbers `frame_index`/`index` and shifts `timestamp` by `start`, and rewrites
+  `meta/episodes.jsonl`'s `length` to the trimmed count (this now also always matches the data
+  even when a trim isn't applied, the same correctness fix `--apply-trim` made for v3.0's
+  `meta/episodes` `length` on 2026-10-10). Unlike v3.0, a v2.x video file has no per-episode
+  `from_timestamp`/`to_timestamp` span in its metadata to narrow -- it's simply the whole
+  original episode -- so trimming only the tabular data would leave a trimmed export's (still
+  uncut) video longer than its data; `demoqc export` now appends a warning to the existing
+  video-renaming one spelling this out, naming the `trim` frame range from the report as what
+  the video itself must be cut to. Validated on two real v2.x datasets:
+  masato-ka/so100_cutlery_handling_simple (50 ep, 47/50 episodes with a suggested trim) --
+  `--apply-trim` dropped total frames from 29853 to 25052 (4801 trimmed, 160.0s at 30 fps), and
+  re-scoring the export gave mean score 100.0 with 0 remaining trimmable idle and no new flags;
+  aaronsu11/so100_lego (100 ep, `--min-score 95`, 27 kept) -- trimmed 978 idle frames (32.6s),
+  re-scoring the export gave mean score 99.75 (up from the dataset's usual ~92, per the
+  2026-10-19 Log entry) with 0 remaining trimmable idle. Also re-ran the existing v3.0
+  `--apply-trim` validation on lerobot/svla_so101_pickplace (50 ep) to confirm no regression:
+  still 1411 frames / 47.0s trimmed, byte-identical to the 2026-10-10 numbers. New tests in
+  `tests/test_export.py` (`test_v2_apply_trim_cuts_frames_shifts_timestamps_and_updates_length`,
+  `test_v2_apply_trim_rejects_out_of_range_trims`, `test_v2_apply_trim_for_a_dropped_episode_is_ignored`,
+  `test_v2_export_command_apply_trim_warns_about_cutting_videos`) replace the old
+  "rejected with a clear message" tests and fail without this change (confirmed via `git stash`
+  on just `src/demoqc/export.py`/`src/demoqc/cli.py`).
