@@ -18,9 +18,12 @@ episodes means each kept episode's video files must be renamed to match (see the
 
 Optionally, ``export_dataset`` can also apply the ``trim`` suggested by ``demoqc score`` for an
 episode: drop the idle frames at its start/end, renumber ``frame_index`` and shift ``timestamp``
-so it still starts near 0, and shrink its ``videos/*/from_timestamp``/``to_timestamp`` window by
-the same number of frames. The video itself is never read or re-encoded; trimming only narrows
-which part of it a kept episode's metadata points at. ``--apply-trim`` is v3.0 only for now.
+so it still starts near 0. For v3.0 this also shrinks the episode's
+``videos/*/from_timestamp``/``to_timestamp`` window by the same number of frames, so the (never
+read or re-encoded) video stays aligned with the trimmed data. v2.x has no such per-episode time
+span to narrow -- its video file covers the whole original episode -- so a trimmed v2.x export
+instead leaves a warning that the video itself must also be cut to the same frame range before
+training on it.
 """
 
 from __future__ import annotations
@@ -121,8 +124,7 @@ def export_dataset(
 
     Kept episodes are renumbered 0..k-1 in their original order. ``trim`` optionally maps an
     original episode index to the ``[start, end)`` frame range to keep for it (see
-    :func:`trim_from_report`); episodes not in ``trim`` are kept in full. ``trim`` is only
-    supported for v3.0 datasets.
+    :func:`trim_from_report`); episodes not in ``trim`` are kept in full.
     """
     src, out = Path(src), Path(out)
     info = json.loads((src / "meta" / "info.json").read_text())
@@ -138,9 +140,7 @@ def export_dataset(
         raise ValueError("no episodes to keep")
 
     if not version.startswith("v3"):
-        if trim:
-            raise ValueError(f"--apply-trim is not implemented for {version} datasets yet")
-        return _export_v2(src, out, info, keep_ids)
+        return _export_v2(src, out, info, fps, keep_ids, trim)
     return _export_v3(src, out, info, fps, keep_ids, trim)
 
 
@@ -297,12 +297,22 @@ def _export_v3(
     )
 
 
-def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> ExportResult:
+def _export_v2(
+    src: Path,
+    out: Path,
+    info: dict,
+    fps: float,
+    keep_ids: np.ndarray,
+    trim: dict[int, tuple[int, int]] | None = None,
+) -> ExportResult:
     """Write the episodes in ``keep_ids`` from a v2.x dataset (one parquet per episode,
-    JSONL metadata) to ``out``. No trimming: this is v2.x export slice 1.
+    JSONL metadata) to ``out``.
 
     Unlike v3.0, a v2.x video file is named after its episode's index, so renaming episodes
     invalidates the ``videos/`` directory's filenames; the caller is warned to rename them.
+    A v2.x video also has no per-episode time span stored in its metadata to narrow when
+    trimming (unlike v3.0's ``videos/*/from_timestamp``/``to_timestamp``), so a trimmed export
+    leaves a warning that the video itself must be cut to match instead.
     """
     episode_rows = {
         int(r["episode_index"]): r for r in _read_jsonl(src / "meta" / "episodes.jsonl")
@@ -320,6 +330,18 @@ def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> Export
     missing = [int(e) for e in keep_ids.tolist() if e not in data_files]
     if missing:
         raise ValueError(f"no data file for episode(s): {missing}")
+
+    trim = dict(trim) if trim else {}
+    keep_set = set(keep_ids.tolist())
+    bad = []
+    for ep, (s, e) in trim.items():
+        if ep not in keep_set:
+            continue  # trimmed episode is being dropped, not kept
+        length = pq.read_metadata(data_files[ep]).num_rows
+        if not (0 <= s < e <= length):
+            bad.append((ep, s, e, length))
+    if bad:
+        raise ValueError(f"invalid trim (start, end, episode length): {bad}")
 
     stat_rows_by_ep = {
         int(r["episode_index"]): r for r in _read_jsonl(src / "meta" / "episodes_stats.jsonl")
@@ -339,11 +361,20 @@ def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> Export
     new_episode_rows: list[dict] = []
     new_stat_rows: list[dict] = []
     offset = 0
+    trimmed_frames = 0
     for new_idx, orig_idx in enumerate(keep_ids.tolist()):
         table = pq.read_table(data_files[orig_idx])
+        full_n = table.num_rows
+        start, end = trim.get(orig_idx, (0, full_n))
+        if (start, end) != (0, full_n):
+            table = table.slice(start, end - start)
+            trimmed_frames += full_n - (end - start)
         n = table.num_rows
         table = _set(table, "episode_index", np.full(n, new_idx, dtype=np.int64))
         table = _set(table, "index", offset + np.arange(n))
+        table = _set(table, "frame_index", np.arange(n))
+        if start and "timestamp" in table.column_names:
+            table = _set(table, "timestamp", table["timestamp"].to_numpy() - start / fps)
         for name in stat_arrays:
             if name in table.column_names:
                 stat_arrays[name].append(_as_matrix(table[name]))
@@ -352,6 +383,7 @@ def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> Export
 
         row = dict(episode_rows[orig_idx])
         row["episode_index"] = new_idx
+        row["length"] = n
         new_episode_rows.append(row)
 
         stat_row = stat_rows_by_ep.get(orig_idx)
@@ -409,12 +441,19 @@ def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> Export
             shutil.copyfile(p, out / "meta" / rel)
 
     if video_features:
-        warnings.append(
+        video_warning = (
             "videos were not copied or renamed: a v2.x video file is named after its episode's "
             "index, so copy each kept episode's video (every camera) from "
             "episode_<old index>.mp4 to episode_<new index>.mp4, where <new index> is its "
             "0-based position in `kept`"
         )
+        if trimmed_frames:
+            video_warning += (
+                "; a v2.x video also has no stored time span to narrow (unlike v3.0), so any "
+                "trimmed episode's video must also be cut to its `trim` frame range from the "
+                "report before training on it, or it will run longer than the trimmed data"
+            )
+        warnings.append(video_warning)
 
     dropped = np.setdiff1d(present, keep_ids)
     return ExportResult(
@@ -424,6 +463,7 @@ def _export_v2(src: Path, out: Path, info: dict, keep_ids: np.ndarray) -> Export
         frames=offset,
         has_videos=bool(video_features),
         version="v2.x",
+        trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
     )
 

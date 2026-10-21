@@ -134,10 +134,10 @@ def _parser() -> argparse.ArgumentParser:
         help="write a cleaned copy of a dataset without the rejected episodes",
         description="Write a LeRobot v3.0 or v2.x dataset containing only the episodes a "
         "`demoqc score --json` report keeps. Episodes are renumbered and the metadata/stats "
-        "are rewritten. With --apply-trim (v3.0 only), each kept episode's idle start/end "
-        "frames are also cut. Only tabular data and metadata are written; videos are neither "
-        "read nor copied (for v2.x, each kept episode's video files must be renamed to match "
-        "its new index; see the printed warning).",
+        "are rewritten. With --apply-trim, each kept episode's idle start/end frames are also "
+        "cut. Only tabular data and metadata are written; videos are neither read nor copied "
+        "(for v2.x, each kept episode's video files must be renamed to match its new index, "
+        "and a trimmed episode's video must also be cut to match; see the printed warning).",
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
