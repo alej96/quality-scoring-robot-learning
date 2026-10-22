@@ -268,6 +268,52 @@ def test_export_command_errors_exit_2(make_dataset, tmp_path, capsys):
     assert main(["export", str(src), "--keep-from", str(tmp_path / "nope.json"), "-o", "x"]) == 2
 
 
+def test_export_command_episodes_restricts_which_episodes_can_be_kept(make_dataset, tmp_path):
+    # --min-score 0 would keep every episode if loaded; --episodes must still exclude the rest
+    src = make_dataset(clean_specs(6))
+    out = tmp_path / "clean"
+    assert (
+        main(["export", str(src), "--episodes", "1,3-4", "--min-score", "0", "-o", str(out)]) == 0
+    )
+    info = json.loads((out / "meta" / "info.json").read_text())
+    assert info["total_episodes"] == 3
+    assert _episodes(out)["episode_index"].tolist() == [0, 1, 2]  # 1, 3, 4 renumbered
+
+
+def test_export_command_max_episodes_restricts_which_episodes_can_be_kept(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(6))
+    out = tmp_path / "clean"
+    assert (
+        main(["export", str(src), "--max-episodes", "2", "--min-score", "0", "-o", str(out)]) == 0
+    )
+    assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == 2
+
+
+def test_export_command_keep_from_rejects_a_report_for_a_different_episodes_subset(
+    make_dataset, tmp_path
+):
+    src = make_dataset(clean_specs(6))
+    report = tmp_path / "r.json"
+    assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0  # scored all 6
+
+    out = tmp_path / "clean"
+    rc = main(["export", str(src), "--episodes", "0-2", "--keep-from", str(report), "-o", str(out)])
+    assert rc == 2
+
+
+def test_export_command_episodes_skips_data_files_it_does_not_need(make_dataset, tmp_path):
+    """Simulates a Hub source where --episodes narrowed the download: files for episodes
+    outside --episodes are simply missing locally (meta/episodes.jsonl is always present in
+    full). Export must still succeed, using only the episodes it actually needs."""
+    src = make_dataset(clean_specs(6), version="v2.1")
+    for ep in (3, 4, 5):
+        (src / "data" / "chunk-000" / f"episode_{ep:06d}.parquet").unlink()
+
+    out = tmp_path / "clean"
+    assert main(["export", str(src), "--episodes", "0-2", "--min-score", "0", "-o", str(out)]) == 0
+    assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == 3
+
+
 def test_exported_dataset_loads_with_lerobot(exported):
     """The real loader accepts the export: indices, episode ranges and video paths all line up."""
     pytest.importorskip("lerobot")
