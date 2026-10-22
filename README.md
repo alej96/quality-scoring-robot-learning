@@ -159,15 +159,21 @@ Disabling a check removes both its flags and its metrics from the report, and (f
 
 ## Scoring a subset of episodes
 
-`demoqc score` and `demoqc dedupe` take `--episodes SPEC` (e.g. `0-99` or `5,10,20-30`,
-comma-separated indices and/or ranges) and `--max-episodes N` to load only some of a
-dataset's episodes, for trying the tool on a huge dataset (DROID-scale and up) without
+`demoqc score`, `demoqc dedupe` and `demoqc export` take `--episodes SPEC` (e.g. `0-99` or
+`5,10,20-30`, comma-separated indices and/or ranges) and `--max-episodes N` to load only some
+of a dataset's episodes, for trying the tool on a huge dataset (DROID-scale and up) without
 loading all of it:
 
 ```bash
 demoqc score user/huge-dataset --episodes 0-199 --json report.json
 demoqc score user/huge-dataset --max-episodes 500   # just the first 500
+demoqc export user/huge-dataset --episodes 0-199 --min-score 80 -o preview  # export just these
 ```
+
+On `export`, episodes outside `--episodes`/`--max-episodes` are dropped unconditionally, even
+if `--min-score` or a `--keep-from` report would otherwise keep them (they were never loaded,
+so there is nothing to keep); a `--keep-from` report must have been produced by a `demoqc score`
+run over the same subset, or it's rejected as made for a different dataset.
 
 From the Hugging Face Hub, only the data file(s) that actually contain the requested
 episodes are downloaded (metadata is always small and downloaded in full); locally, data

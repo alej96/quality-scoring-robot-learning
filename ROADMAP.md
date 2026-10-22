@@ -112,8 +112,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
       sometimes not faster.
       Follow-up: this still doesn't bound peak memory when scoring *all* of a huge
       dataset — `_read_frames` still concatenates every needed file into one DataFrame.
-      True per-file streaming (bounding memory independent of `--episodes`) is still open,
-      as is extending `--episodes`/`--max-episodes` to `demoqc export`.
+      True per-file streaming (bounding memory independent of `--episodes`) is still open.
+      ~~Extending `--episodes`/`--max-episodes` to `demoqc export`~~ shipped 2026-10-22; see
+      the Log entry.
 - [x] **Video checks (slice 1): black/dead camera from metadata alone.** LeRobot already
       writes each episode's per-camera pixel mean/std into `meta/episodes` (v3.0) or
       `meta/episodes_stats.jsonl` (v2.x) when it records a dataset. Read it and flag a
@@ -415,3 +416,22 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `test_v2_export_command_apply_trim_warns_about_cutting_videos`) replace the old
   "rejected with a clear message" tests and fail without this change (confirmed via `git stash`
   on just `src/demoqc/export.py`/`src/demoqc/cli.py`).
+- 2026-10-22: Added **`--episodes`/`--max-episodes` to `demoqc export`** (the "scale to large
+  datasets" follow-up: previously only `score`/`dedupe` could narrow a huge dataset, so trying
+  `export` on one meant downloading and scoring every episode first). `cli.py`'s export
+  subparser now calls the existing `_add_episode_args` helper; `_load()` already threaded
+  `episodes`/`max_episodes` through to `load_dataset` for every subcommand, so no change was
+  needed in `export.py` itself — episodes outside the requested subset are simply never loaded,
+  so neither `--min-score` scoring nor a `--keep-from` report can keep them, and `export_dataset`
+  then runs against whatever got downloaded/read for that subset. Validated on real datasets:
+  `demoqc export masato-ka/so100_cutlery_handling_simple --episodes 0-4 --min-score 0 -o out`
+  (v2.1) downloaded only 9 files (5 episode parquets + metadata) instead of all 54 and wrote
+  exactly 5 episodes / 2981 frames, matching a direct check of the source; also ran on
+  `lerobot/svla_so101_pickplace --episodes 0-9 --min-score 80` (v3.0, single data file, so no
+  download savings there since everything lives in one chunk — the documented best-effort
+  fallback, not a bug) and got 10 kept episodes as expected. New tests in `tests/test_export.py`
+  cover `--episodes`/`--max-episodes` restricting the keepable set even with a permissive
+  `--min-score`, a `--keep-from` report rejected when it doesn't match the `--episodes` subset,
+  and (mirroring `test_dataset.py`'s narrowing tests) a v2.x export succeeding when the data
+  files for episodes outside `--episodes` are missing entirely, simulating a Hub download that
+  was itself narrowed; all 4 fail with `SystemExit`/"unrecognized arguments" before this change.
