@@ -137,10 +137,13 @@ def _parser() -> argparse.ArgumentParser:
         "are rewritten. With --apply-trim, each kept episode's idle start/end frames are also "
         "cut. Only tabular data and metadata are written; videos are neither read nor copied "
         "(for v2.x, each kept episode's video files must be renamed to match its new index, "
-        "and a trimmed episode's video must also be cut to match; see the printed warning).",
+        "and a trimmed episode's video must also be cut to match; see the printed warning). "
+        "--episodes/--max-episodes restrict which episodes are considered at all (as for "
+        "score/dedupe); with --keep-from, the report must have been made from the same subset.",
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
+    _add_episode_args(export)
     keep_source = export.add_mutually_exclusive_group(required=True)
     keep_source.add_argument(
         "--keep-from",
