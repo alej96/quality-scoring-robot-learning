@@ -135,11 +135,13 @@ def _parser() -> argparse.ArgumentParser:
         description="Write a LeRobot v3.0 or v2.x dataset containing only the episodes a "
         "`demoqc score --json` report keeps. Episodes are renumbered and the metadata/stats "
         "are rewritten. With --apply-trim, each kept episode's idle start/end frames are also "
-        "cut. Only tabular data and metadata are written; videos are neither read nor copied "
-        "(for v2.x, each kept episode's video files must be renamed to match its new index, "
-        "and a trimmed episode's video must also be cut to match; see the printed warning). "
-        "--episodes/--max-episodes restrict which episodes are considered at all (as for "
-        "score/dedupe); with --keep-from, the report must have been made from the same subset.",
+        "cut. Only tabular data and metadata are written by default; videos are neither read "
+        "nor copied (for v2.x, each kept episode's video files must be renamed to match its "
+        "new index, and a trimmed episode's video must also be cut to match; see the printed "
+        "warning). --copy-videos copies (and, for v2.x, renames) the source's video files for "
+        "a local dataset, without reading, decoding or re-encoding them. --episodes/"
+        "--max-episodes restrict which episodes are considered at all (as for score/dedupe); "
+        "with --keep-from, the report must have been made from the same subset.",
     )
     export.add_argument("source", help="local dataset directory or Hub repo id")
     export.add_argument("--revision", help="Hub branch, tag or commit")
@@ -166,6 +168,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="cut each kept episode's idle start/end frames (per the report's trim "
         "suggestion), shifting timestamps and narrowing video spans to match",
+    )
+    export.add_argument(
+        "--copy-videos",
+        action="store_true",
+        help="copy (and, for v2.x, rename) the source's video files into the export; "
+        "local sources only, since videos are never downloaded from the Hub",
     )
     return p
 
@@ -261,6 +269,13 @@ def _export(args: argparse.Namespace) -> int:
     ds = _load(args)
     if ds is None:
         return 2
+    if args.copy_videos and ds.repo_id is not None:
+        print(
+            "demoqc: --copy-videos requires a local dataset directory; videos are never "
+            "downloaded from the Hub",
+            file=sys.stderr,
+        )
+        return 2
     try:
         if args.keep_from is not None:
             keep = keep_from_report(args.keep_from, ds)
@@ -276,7 +291,7 @@ def _export(args: argparse.Namespace) -> int:
             )
             keep = keep_from_report_dict(report)
             trim = trim_from_report_dict(report) if args.apply_trim else None
-        result = export_dataset(ds.root, args.output, keep, trim=trim)
+        result = export_dataset(ds.root, args.output, keep, trim=trim, copy_videos=args.copy_videos)
     except (ValueError, FileExistsError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
         return 2
@@ -292,11 +307,14 @@ def _export(args: argparse.Namespace) -> int:
         )
     for w in result.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    if result.has_videos and result.version.startswith("v3"):
+    if result.has_videos and result.version.startswith("v3") and not result.videos_copied:
         print(
             "videos were not copied. Their episode time spans are unchanged, so copy the "
-            "source videos/ directory into the output to use it for training."
+            "source videos/ directory into the output to use it for training, or re-run "
+            "with --copy-videos."
         )
+    if result.videos_copied:
+        print(f"videos copied to {result.out / 'videos'}")
     return 0
 
 

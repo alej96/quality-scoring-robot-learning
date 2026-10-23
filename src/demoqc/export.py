@@ -11,10 +11,14 @@ they're handled separately, sharing only the stats-recomputation helpers below.
 
 For v3.0, data and episode-metadata files keep their relative paths, so the ``data/*`` and
 ``videos/*`` chunk/file indices stored in ``meta/episodes`` stay valid, and the original
-``videos/`` directory can be copied next to the export unchanged (videos are never read or
-copied here). For v2.x, video files are named after ``episode_index`` directly, so renumbering
-episodes means each kept episode's video files must be renamed to match (see the warning
-``_export_v2`` returns); copying ``videos/`` unchanged is not enough.
+``videos/`` directory can be copied next to the export unchanged. For v2.x, video files are
+named after ``episode_index`` directly, so renumbering episodes means each kept episode's video
+files must be renamed to match (see the warning ``_export_v2`` returns); copying ``videos/``
+unchanged is not enough. ``export_dataset(..., copy_videos=True)`` does this copy/rename
+itself for a local source that has a ``videos/`` directory on disk (video bytes are copied
+as-is, never read, decoded or re-encoded); the CLI rejects ``--copy-videos`` for a Hub source
+up front, since videos are never downloaded by this tool and there would be nothing on disk
+to copy.
 
 Optionally, ``export_dataset`` can also apply the ``trim`` suggested by ``demoqc score`` for an
 episode: drop the idle frames at its start/end, renumber ``frame_index`` and shift ``timestamp``
@@ -47,6 +51,9 @@ _QUANTILE_KEY = re.compile(r"q(\d\d)$")
 _HANDLED_META_V3 = {"info.json", "stats.json"}
 _HANDLED_META_V2 = {"info.json", "stats.json", "episodes.jsonl", "episodes_stats.jsonl"}
 _DEFAULT_DATA_PATH_V2 = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+_DEFAULT_VIDEO_PATH_V2 = (
+    "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+)
 
 
 @dataclass
@@ -59,6 +66,7 @@ class ExportResult:
     version: str = "v3.0"
     trimmed_frames: int = 0
     warnings: list[str] = field(default_factory=list)
+    videos_copied: bool = False
 
 
 def _load_report(report_path: Path, ds: Dataset) -> dict:
@@ -118,13 +126,21 @@ def trim_from_report(report_path: Path, ds: Dataset) -> dict[int, tuple[int, int
 
 
 def export_dataset(
-    src: Path, out: Path, keep: Iterable[int], trim: dict[int, tuple[int, int]] | None = None
+    src: Path,
+    out: Path,
+    keep: Iterable[int],
+    trim: dict[int, tuple[int, int]] | None = None,
+    copy_videos: bool = False,
 ) -> ExportResult:
     """Write the episodes in ``keep`` from the LeRobot dataset at ``src`` to ``out``.
 
     Kept episodes are renumbered 0..k-1 in their original order. ``trim`` optionally maps an
     original episode index to the ``[start, end)`` frame range to keep for it (see
-    :func:`trim_from_report`); episodes not in ``trim`` are kept in full.
+    :func:`trim_from_report`); episodes not in ``trim`` are kept in full. ``copy_videos``
+    additionally copies (for v2.x, renaming to match the new episode indices) the source's
+    video files next to the export; it requires ``src`` to be a local directory that actually
+    has a ``videos/`` directory (never the case for a dataset downloaded from the Hub, since
+    videos are never downloaded by this tool).
     """
     src, out = Path(src), Path(out)
     info = json.loads((src / "meta" / "info.json").read_text())
@@ -140,8 +156,8 @@ def export_dataset(
         raise ValueError("no episodes to keep")
 
     if not version.startswith("v3"):
-        return _export_v2(src, out, info, fps, keep_ids, trim)
-    return _export_v3(src, out, info, fps, keep_ids, trim)
+        return _export_v2(src, out, info, fps, keep_ids, trim, copy_videos)
+    return _export_v3(src, out, info, fps, keep_ids, trim, copy_videos)
 
 
 def _export_v3(
@@ -151,6 +167,7 @@ def _export_v3(
     fps: float,
     keep_ids: np.ndarray,
     trim: dict[int, tuple[int, int]] | None,
+    copy_videos: bool = False,
 ) -> ExportResult:
     data_files = sorted((src / "data").rglob("*.parquet"))
     episode_files = sorted((src / "meta" / "episodes").rglob("*.parquet"))
@@ -284,16 +301,27 @@ def _export_v3(
             (out / "meta" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, out / "meta" / rel)
 
+    has_videos = any(f.get("dtype") == "video" for f in info.get("features", {}).values())
+    videos_copied = False
+    if copy_videos:
+        videos_src = src / "videos"
+        if videos_src.is_dir():
+            shutil.copytree(videos_src, out / "videos")
+            videos_copied = True
+        elif has_videos:
+            warnings.append("--copy-videos requested but the source has no videos/ directory")
+
     dropped = np.setdiff1d(present, keep_ids)
     return ExportResult(
         out=out,
         kept=keep_ids.tolist(),
         dropped=dropped.tolist(),
         frames=int(ends[-1]),
-        has_videos=any(f.get("dtype") == "video" for f in info.get("features", {}).values()),
+        has_videos=has_videos,
         version="v3.0",
         trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
+        videos_copied=videos_copied,
     )
 
 
@@ -304,6 +332,7 @@ def _export_v2(
     fps: float,
     keep_ids: np.ndarray,
     trim: dict[int, tuple[int, int]] | None = None,
+    copy_videos: bool = False,
 ) -> ExportResult:
     """Write the episodes in ``keep_ids`` from a v2.x dataset (one parquet per episode,
     JSONL metadata) to ``out``.
@@ -353,6 +382,7 @@ def _export_v2(
     )
     chunks_size = int(info.get("chunks_size", 1000))
     data_path = info.get("data_path") or _DEFAULT_DATA_PATH_V2
+    video_path = info.get("video_path") or _DEFAULT_VIDEO_PATH_V2
 
     stats_path = src / "meta" / "stats.json"
     old_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
@@ -360,6 +390,7 @@ def _export_v2(
     stat_arrays: dict[str, list[np.ndarray]] = {k: [] for k in old_stats}
     new_episode_rows: list[dict] = []
     new_stat_rows: list[dict] = []
+    missing_videos: set[tuple[str, int]] = set()
     offset = 0
     trimmed_frames = 0
     for new_idx, orig_idx in enumerate(keep_ids.tolist()):
@@ -380,6 +411,20 @@ def _export_v2(
                 stat_arrays[name].append(_as_matrix(table[name]))
         dest = out / data_path.format(episode_chunk=new_idx // chunks_size, episode_index=new_idx)
         _write(table, dest)
+
+        if copy_videos:
+            for camera in video_features:
+                src_video = src / video_path.format(
+                    episode_chunk=orig_idx // chunks_size, video_key=camera, episode_index=orig_idx
+                )
+                if not src_video.exists():
+                    missing_videos.add((camera, orig_idx))
+                    continue
+                dest_video = out / video_path.format(
+                    episode_chunk=new_idx // chunks_size, video_key=camera, episode_index=new_idx
+                )
+                dest_video.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(src_video, dest_video)
 
         row = dict(episode_rows[orig_idx])
         row["episode_index"] = new_idx
@@ -440,7 +485,7 @@ def _export_v2(
             (out / "meta" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, out / "meta" / rel)
 
-    if video_features:
+    if video_features and not copy_videos:
         video_warning = (
             "videos were not copied or renamed: a v2.x video file is named after its episode's "
             "index, so copy each kept episode's video (every camera) from "
@@ -454,6 +499,18 @@ def _export_v2(
                 "report before training on it, or it will run longer than the trimmed data"
             )
         warnings.append(video_warning)
+    elif video_features and copy_videos:
+        if missing_videos:
+            warnings.append(
+                f"--copy-videos: no video file found for (camera, episode) {sorted(missing_videos)}"
+            )
+        if trimmed_frames:
+            warnings.append(
+                "videos were copied and renamed to match the new episode indices, but a v2.x "
+                "video has no stored per-episode time span to narrow (unlike v3.0), so each "
+                "trimmed episode's copied video still covers the whole original span; cut it "
+                "to the `trim` frame range from the report before training on it"
+            )
 
     dropped = np.setdiff1d(present, keep_ids)
     return ExportResult(
@@ -465,6 +522,7 @@ def _export_v2(
         version="v2.x",
         trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
+        videos_copied=copy_videos and bool(video_features),
     )
 
 
