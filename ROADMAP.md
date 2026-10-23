@@ -40,14 +40,16 @@ Work top-down through **Next up**. Each item should ship in one focused session
       `stats/episode_index` columns, which would otherwise go stale.
       Follow-ups: (1) ~~v2.x export~~ shipped 2026-10-19 (`_export_v2` in `src/demoqc/export.py`;
       see the Log entry) — slice 1 only (drop/renumber, no `--apply-trim`).
-      (2) An option to copy or symlink the source `videos/` directory for local sources (they
-      are never read today; the export only notes that they must be copied, and for v2.x also
-      renamed to match the new episode indices — see the Log entry). (3) ~~`--min-score` on
+      (2) ~~An option to copy the source `videos/` directory for local sources~~ shipped
+      2026-10-23 as `--copy-videos` (see the Log entry). (3) ~~`--min-score` on
       `export` itself~~ shipped 2026-10-20 (see the Log entry). (4) Single `train`
       split only: other `splits` entries in `info.json` are collapsed into `train`.
       (5) ~~v2.x `--apply-trim`~~ shipped 2026-10-21 (see the Log entry) — a v2.x video has no
       per-episode time span to narrow like v3.0's, so the export warns that the video itself
       must also be cut to match instead of narrowing a stored span.
+      (6) `--copy-videos` only copies; a `--symlink-videos` variant (or auto-detecting when a
+      symlink is safe, e.g. v3.0 where the same file is unmodified) would save disk on a large
+      dataset — still open.
 - [x] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
@@ -435,3 +437,26 @@ Work top-down through **Next up**. Each item should ship in one focused session
   and (mirroring `test_dataset.py`'s narrowing tests) a v2.x export succeeding when the data
   files for episodes outside `--episodes` are missing entirely, simulating a Hub download that
   was itself narrowed; all 4 fail with `SystemExit`/"unrecognized arguments" before this change.
+- 2026-10-23: Added **`demoqc export --copy-videos`** (the export follow-up: previously every
+  export left videos untouched and printed a warning telling the user to copy/rename them by
+  hand, so a cleaned v2.x export wasn't directly trainable without a manual step). For v3.0,
+  `export_dataset(..., copy_videos=True)` copies the source's `videos/` directory into the
+  export unchanged (file indices stay valid, same as the existing manual instructions). For
+  v2.x, it copies and renames each kept episode's video file (every camera) from
+  `episode_<old index>.mp4` to `episode_<new index>.mp4` using `meta/info.json`'s `video_path`
+  template, replacing the old "copy this by hand" warning entirely; a trimmed v2.x export still
+  warns that the copied video's content itself (not just its filename) must be cut to the
+  `trim` range, since this tool copies bytes but never decodes or re-encodes video. The CLI
+  rejects `--copy-videos` for a Hub source up front (`ds.repo_id is not None`), since videos are
+  never downloaded by this tool and there would be nothing on disk to copy. Video bytes are
+  always copied as-is (`shutil.copyfile`/`copytree`), so this needed no new dependency and
+  stays in the core path. Validated on two real datasets: `masato-ka/so100_cutlery_handling_simple`
+  (50 ep, v2.1, `--min-score 90` dropping 5) — a script comparing every copied, renamed video's
+  bytes against the original file for its old index confirmed all 45 kept videos matched
+  exactly and the 5 dropped episodes' videos were not carried over under any name; and
+  `lerobot/svla_so101_pickplace` (50 ep, v3.0, `--min-score 80`, keeping all 50) — `diff -rq`
+  between the source and exported `videos/` directories reported no differences. New tests in
+  `tests/test_export.py` (8 cases covering the v3.0 whole-directory copy, the v2.x rename
+  mapping, a missing video file producing a warning instead of a crash, both CLI paths, the
+  `--apply-trim` + `--copy-videos` interaction, and the Hub-source rejection) all fail without
+  this change (confirmed via `git stash` on just `src/demoqc/export.py`/`src/demoqc/cli.py`).

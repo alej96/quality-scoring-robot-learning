@@ -36,6 +36,9 @@ demoqc export user/dataset --min-score 80 -o ./clean_dataset
 
 # also cut each kept episode's idle start/end frames
 demoqc export user/dataset --keep-from report.json --apply-trim -o ./clean_dataset
+
+# also copy (and, for v2.x, rename) the source's video files -- local datasets only
+demoqc export ./my_dataset --min-score 80 --copy-videos -o ./clean_dataset
 ```
 
 Example (real output, abridged):
@@ -78,14 +81,23 @@ exactly; video features are combined from the per-episode stats, when the source
 (some real datasets ship no `meta/stats.json` at all; export leaves a warning and writes none,
 rather than guessing).
 
-Only tabular data and metadata are written; videos are never read or copied. For **v3.0**,
-their time spans and file indices are unchanged, so copy the source `videos/` directory into
-the output to train on it. For **v2.x**, a video file is named after its episode's index
-directly (`episode_<n>.mp4`), so renumbering episodes means each kept episode's video files
-(every camera) must be renamed from `episode_<old index>.mp4` to `episode_<new index>.mp4`
-before training on the export; `demoqc export` prints a warning with the exact rule (new
-index = position in `kept`) since it never touches the video files itself. The report must
-come from the same dataset (episode and frame counts are checked).
+Only tabular data and metadata are written by default; videos are never read or copied. For
+**v3.0**, their time spans and file indices are unchanged, so copy the source `videos/`
+directory into the output to train on it. For **v2.x**, a video file is named after its
+episode's index directly (`episode_<n>.mp4`), so renumbering episodes means each kept
+episode's video files (every camera) must be renamed from `episode_<old index>.mp4` to
+`episode_<new index>.mp4` before training on the export; `demoqc export` prints a warning
+with the exact rule (new index = position in `kept`) since it never touches the video files
+itself. The report must come from the same dataset (episode and frame counts are checked).
+
+Pass `--copy-videos` to have `demoqc export` do this itself for a **local** source: it copies
+(and, for v2.x, renames) each video file next to the export, as raw bytes — never reading,
+decoding or re-encoding them, so no video dependency is needed. It's a no-op (with a warning)
+if the source has no `videos/` directory on disk, and the CLI rejects it for a Hub source
+up front, since videos are never downloaded by this tool. With `--apply-trim`, a copied v3.0
+video is already aligned (its per-episode time span was narrowed in the metadata); a copied
+v2.x video still covers the whole original episode and must still be cut to the `trim` frame
+range from the report, as `demoqc export` warns.
 
 `--apply-trim` additionally cuts each kept episode's idle start/end frames, using the same
 `trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered and `timestamp`
