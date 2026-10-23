@@ -674,3 +674,157 @@ def test_v2_export_command_apply_trim_warns_about_cutting_videos(make_dataset, t
     assert len(ep0) == end - start
     assert ep0["frame_index"].tolist() == list(range(end - start))
     assert "must also be cut" in said.err
+
+
+# -- --copy-videos ------------------------------------------------------------------------
+
+_CAMERA = "observation.images.top"
+
+
+def _write_fake_video_v3(src):
+    path = src / "videos" / _CAMERA / "chunk-000" / "file-000.mp4"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"fake-v3-video-bytes-shared-by-every-episode-in-this-file")
+    return path
+
+
+def _write_fake_videos_v2(src, episode_indices):
+    paths = {}
+    for ep in episode_indices:
+        path = src / "videos" / "chunk-000" / _CAMERA / f"episode_{ep:06d}.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"fake-video-for-episode-{ep}".encode())
+        paths[ep] = path
+    return paths
+
+
+def test_copy_videos_v3_copies_the_whole_directory_unchanged(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(6), data_files=3)
+    video = _write_fake_video_v3(src)
+
+    result = export_dataset(src, tmp_path / "out", KEEP, copy_videos=True)
+
+    assert result.videos_copied is True
+    copied = tmp_path / "out" / "videos" / _CAMERA / "chunk-000" / "file-000.mp4"
+    assert copied.read_bytes() == video.read_bytes()
+
+
+def test_copy_videos_v3_is_a_no_op_without_a_local_videos_directory(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4))  # no videos/ written at all
+    result = export_dataset(src, tmp_path / "out", [0, 1, 2, 3], copy_videos=True)
+    assert result.videos_copied is False
+    assert not (tmp_path / "out" / "videos").exists()
+    assert any("no videos/ directory" in w for w in result.warnings)
+
+
+def test_export_command_v3_copy_videos_flag(make_dataset, tmp_path, capsys):
+    src = make_dataset(clean_specs(4))
+    _write_fake_video_v3(src)
+    out = tmp_path / "clean"
+    capsys.readouterr()
+
+    assert main(["export", str(src), "--min-score", "0", "-o", str(out), "--copy-videos"]) == 0
+
+    said = capsys.readouterr()
+    assert f"videos copied to {out / 'videos'}" in said.out
+    assert "videos were not copied" not in said.out
+    assert (out / "videos" / _CAMERA / "chunk-000" / "file-000.mp4").exists()
+
+
+def test_copy_videos_v2_renames_video_files_to_match_new_indices(make_dataset, tmp_path):
+    src = make_dataset([EpisodeSpec(seconds=6.0 + i, seed=i) for i in range(6)], version="v2.1")
+    videos = _write_fake_videos_v2(src, range(6))
+
+    result = export_dataset(src, tmp_path / "out", KEEP, copy_videos=True)
+
+    assert result.videos_copied is True
+    for new_idx, orig_idx in enumerate(KEEP):
+        copied = tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / f"episode_{new_idx:06d}.mp4"
+        assert copied.read_bytes() == videos[orig_idx].read_bytes()
+    # the video for a dropped episode is not carried over under any name
+    all_bytes = {p.read_bytes() for p in (tmp_path / "out" / "videos").rglob("*.mp4")}
+    assert videos[1].read_bytes() not in all_bytes and videos[4].read_bytes() not in all_bytes
+
+
+def test_copy_videos_v2_warns_about_a_missing_video_file(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    _write_fake_videos_v2(src, [0, 2, 3])  # episode 1's video is missing
+
+    result = export_dataset(src, tmp_path / "out", [0, 1, 2, 3], copy_videos=True)
+
+    assert result.videos_copied is True
+    assert any("no video file found" in w and "1" in w for w in result.warnings)
+    assert (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000000.mp4").exists()
+    assert not (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000001.mp4").exists()
+
+
+def test_export_command_v2_copy_videos_flag_avoids_the_rename_warning(
+    make_dataset, tmp_path, capsys
+):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    _write_fake_videos_v2(src, range(4))
+    report, out = tmp_path / "r.json", tmp_path / "clean"
+    assert main(["score", str(src), "--json", str(report), "--quiet"]) == 0
+    capsys.readouterr()
+
+    assert (
+        main(
+            [
+                "export",
+                str(src),
+                "--keep-from",
+                str(report),
+                "-o",
+                str(out),
+                "--copy-videos",
+            ]
+        )
+        == 0
+    )
+
+    said = capsys.readouterr()
+    assert "renamed" not in said.err
+    assert f"videos copied to {out / 'videos'}" in said.out
+
+
+def test_copy_videos_v2_with_apply_trim_still_warns_the_video_content_is_uncut(
+    make_dataset, tmp_path
+):
+    specs = clean_specs(3)
+    specs[0] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=0)
+    src = make_dataset(specs, version="v2.1")
+    _write_fake_videos_v2(src, range(3))
+    before = _frames(src)
+    ep0_len = len(before[before["episode_index"] == 0])
+
+    result = export_dataset(
+        src, tmp_path / "out", [0, 1, 2], trim={0: (10, ep0_len - 5)}, copy_videos=True
+    )
+
+    assert result.videos_copied is True
+    assert (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000000.mp4").exists()
+    assert any("still covers the whole original span" in w for w in result.warnings)
+
+
+def test_export_command_copy_videos_requires_a_local_source(
+    make_dataset, tmp_path, monkeypatch, capsys
+):
+    src = make_dataset(clean_specs(3))
+    ds = load_dataset(src)
+    ds.repo_id = "user/some-hub-dataset"  # simulate a dataset loaded from the Hub
+    monkeypatch.setattr("demoqc.cli.load_dataset", lambda *a, **k: ds)
+
+    code = main(
+        [
+            "export",
+            "user/some-hub-dataset",
+            "--min-score",
+            "0",
+            "-o",
+            str(tmp_path / "out"),
+            "--copy-videos",
+        ]
+    )
+
+    assert code == 2
+    assert "requires a local dataset directory" in capsys.readouterr().err
