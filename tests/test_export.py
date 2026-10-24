@@ -828,3 +828,139 @@ def test_export_command_copy_videos_requires_a_local_source(
 
     assert code == 2
     assert "requires a local dataset directory" in capsys.readouterr().err
+
+
+# -- --symlink-videos ---------------------------------------------------------------------
+
+
+def test_symlink_videos_v3_links_the_whole_directory_unchanged(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(6), data_files=3)
+    video = _write_fake_video_v3(src)
+
+    result = export_dataset(src, tmp_path / "out", KEEP, symlink_videos=True)
+
+    assert result.videos_symlinked is True
+    assert result.videos_copied is False
+    linked_dir = tmp_path / "out" / "videos"
+    assert linked_dir.is_symlink()
+    linked = linked_dir / _CAMERA / "chunk-000" / "file-000.mp4"
+    assert linked.read_bytes() == video.read_bytes()
+
+
+def test_symlink_videos_v3_is_a_no_op_without_a_local_videos_directory(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4))  # no videos/ written at all
+    result = export_dataset(src, tmp_path / "out", [0, 1, 2, 3], symlink_videos=True)
+    assert result.videos_symlinked is False
+    assert not (tmp_path / "out" / "videos").exists()
+    assert any("no videos/ directory" in w for w in result.warnings)
+
+
+def test_export_command_v3_symlink_videos_flag(make_dataset, tmp_path, capsys):
+    src = make_dataset(clean_specs(4))
+    _write_fake_video_v3(src)
+    out = tmp_path / "clean"
+    capsys.readouterr()
+
+    assert main(["export", str(src), "--min-score", "0", "-o", str(out), "--symlink-videos"]) == 0
+
+    said = capsys.readouterr()
+    assert f"videos symlinked to {out / 'videos'}" in said.out
+    assert "videos were not copied" not in said.out
+    linked = out / "videos" / _CAMERA / "chunk-000" / "file-000.mp4"
+    assert linked.is_symlink() or (out / "videos").is_symlink()
+    assert linked.exists()
+
+
+def test_symlink_videos_v2_renames_video_files_to_match_new_indices(make_dataset, tmp_path):
+    src = make_dataset([EpisodeSpec(seconds=6.0 + i, seed=i) for i in range(6)], version="v2.1")
+    videos = _write_fake_videos_v2(src, range(6))
+
+    result = export_dataset(src, tmp_path / "out", KEEP, symlink_videos=True)
+
+    assert result.videos_symlinked is True
+    for new_idx, orig_idx in enumerate(KEEP):
+        linked = tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / f"episode_{new_idx:06d}.mp4"
+        assert linked.is_symlink()
+        assert linked.read_bytes() == videos[orig_idx].read_bytes()
+    # the video for a dropped episode is not carried over under any name
+    all_bytes = {p.read_bytes() for p in (tmp_path / "out" / "videos").rglob("*.mp4")}
+    assert videos[1].read_bytes() not in all_bytes and videos[4].read_bytes() not in all_bytes
+
+
+def test_symlink_videos_v2_warns_about_a_missing_video_file(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(4), version="v2.1")
+    _write_fake_videos_v2(src, [0, 2, 3])  # episode 1's video is missing
+
+    result = export_dataset(src, tmp_path / "out", [0, 1, 2, 3], symlink_videos=True)
+
+    assert result.videos_symlinked is True
+    assert any("no video file found" in w and "1" in w for w in result.warnings)
+    assert (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000000.mp4").exists()
+    assert not (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000001.mp4").exists()
+
+
+def test_symlink_videos_v2_with_apply_trim_still_warns_the_video_content_is_uncut(
+    make_dataset, tmp_path
+):
+    specs = clean_specs(3)
+    specs[0] = EpisodeSpec(seconds=8.0, lead_idle_s=2.0, trail_idle_s=1.5, seed=0)
+    src = make_dataset(specs, version="v2.1")
+    _write_fake_videos_v2(src, range(3))
+    before = _frames(src)
+    ep0_len = len(before[before["episode_index"] == 0])
+
+    result = export_dataset(
+        src, tmp_path / "out", [0, 1, 2], trim={0: (10, ep0_len - 5)}, symlink_videos=True
+    )
+
+    assert result.videos_symlinked is True
+    assert (tmp_path / "out" / "videos" / "chunk-000" / _CAMERA / "episode_000000.mp4").exists()
+    assert any("still covers the whole original span" in w for w in result.warnings)
+
+
+def test_export_dataset_rejects_copy_and_symlink_videos_together(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(3))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        export_dataset(src, tmp_path / "out", [0, 1, 2], copy_videos=True, symlink_videos=True)
+
+
+def test_export_command_rejects_copy_and_symlink_videos_together(make_dataset, tmp_path):
+    src = make_dataset(clean_specs(3))
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "export",
+                str(src),
+                "--min-score",
+                "0",
+                "-o",
+                str(tmp_path / "out"),
+                "--copy-videos",
+                "--symlink-videos",
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_export_command_symlink_videos_requires_a_local_source(
+    make_dataset, tmp_path, monkeypatch, capsys
+):
+    src = make_dataset(clean_specs(3))
+    ds = load_dataset(src)
+    ds.repo_id = "user/some-hub-dataset"  # simulate a dataset loaded from the Hub
+    monkeypatch.setattr("demoqc.cli.load_dataset", lambda *a, **k: ds)
+
+    code = main(
+        [
+            "export",
+            "user/some-hub-dataset",
+            "--min-score",
+            "0",
+            "-o",
+            str(tmp_path / "out"),
+            "--symlink-videos",
+        ]
+    )
+
+    assert code == 2
+    assert "requires a local dataset directory" in capsys.readouterr().err

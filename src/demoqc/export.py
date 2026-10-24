@@ -18,7 +18,11 @@ unchanged is not enough. ``export_dataset(..., copy_videos=True)`` does this cop
 itself for a local source that has a ``videos/`` directory on disk (video bytes are copied
 as-is, never read, decoded or re-encoded); the CLI rejects ``--copy-videos`` for a Hub source
 up front, since videos are never downloaded by this tool and there would be nothing on disk
-to copy.
+to copy. ``export_dataset(..., symlink_videos=True)`` does the same job with symlinks instead
+of byte copies: a single ``videos/`` symlink for v3.0 (the directory is unchanged, so one link
+suffices), or one symlink per kept-and-renamed video file for v2.x. This uses no extra disk
+space, which matters on a large dataset, but makes the export depend on the source directory
+staying where it is; ``--copy-videos`` is the safer default when the source might move.
 
 Optionally, ``export_dataset`` can also apply the ``trim`` suggested by ``demoqc score`` for an
 episode: drop the idle frames at its start/end, renumber ``frame_index`` and shift ``timestamp``
@@ -67,6 +71,7 @@ class ExportResult:
     trimmed_frames: int = 0
     warnings: list[str] = field(default_factory=list)
     videos_copied: bool = False
+    videos_symlinked: bool = False
 
 
 def _load_report(report_path: Path, ds: Dataset) -> dict:
@@ -131,6 +136,7 @@ def export_dataset(
     keep: Iterable[int],
     trim: dict[int, tuple[int, int]] | None = None,
     copy_videos: bool = False,
+    symlink_videos: bool = False,
 ) -> ExportResult:
     """Write the episodes in ``keep`` from the LeRobot dataset at ``src`` to ``out``.
 
@@ -138,10 +144,14 @@ def export_dataset(
     original episode index to the ``[start, end)`` frame range to keep for it (see
     :func:`trim_from_report`); episodes not in ``trim`` are kept in full. ``copy_videos``
     additionally copies (for v2.x, renaming to match the new episode indices) the source's
-    video files next to the export; it requires ``src`` to be a local directory that actually
-    has a ``videos/`` directory (never the case for a dataset downloaded from the Hub, since
-    videos are never downloaded by this tool).
+    video files next to the export; ``symlink_videos`` does the same but with symlinks instead
+    of byte copies, to avoid duplicating video data on disk. Either requires ``src`` to be a
+    local directory that actually has a ``videos/`` directory (never the case for a dataset
+    downloaded from the Hub, since videos are never downloaded by this tool); at most one of
+    them may be set.
     """
+    if copy_videos and symlink_videos:
+        raise ValueError("--copy-videos and --symlink-videos are mutually exclusive")
     src, out = Path(src), Path(out)
     info = json.loads((src / "meta" / "info.json").read_text())
     version = str(info.get("codebase_version", "unknown"))
@@ -156,8 +166,8 @@ def export_dataset(
         raise ValueError("no episodes to keep")
 
     if not version.startswith("v3"):
-        return _export_v2(src, out, info, fps, keep_ids, trim, copy_videos)
-    return _export_v3(src, out, info, fps, keep_ids, trim, copy_videos)
+        return _export_v2(src, out, info, fps, keep_ids, trim, copy_videos, symlink_videos)
+    return _export_v3(src, out, info, fps, keep_ids, trim, copy_videos, symlink_videos)
 
 
 def _export_v3(
@@ -168,6 +178,7 @@ def _export_v3(
     keep_ids: np.ndarray,
     trim: dict[int, tuple[int, int]] | None,
     copy_videos: bool = False,
+    symlink_videos: bool = False,
 ) -> ExportResult:
     data_files = sorted((src / "data").rglob("*.parquet"))
     episode_files = sorted((src / "meta" / "episodes").rglob("*.parquet"))
@@ -303,13 +314,19 @@ def _export_v3(
 
     has_videos = any(f.get("dtype") == "video" for f in info.get("features", {}).values())
     videos_copied = False
-    if copy_videos:
+    videos_symlinked = False
+    if copy_videos or symlink_videos:
         videos_src = src / "videos"
         if videos_src.is_dir():
-            shutil.copytree(videos_src, out / "videos")
-            videos_copied = True
+            if symlink_videos:
+                (out / "videos").symlink_to(videos_src.resolve())
+                videos_symlinked = True
+            else:
+                shutil.copytree(videos_src, out / "videos")
+                videos_copied = True
         elif has_videos:
-            warnings.append("--copy-videos requested but the source has no videos/ directory")
+            flag = "--symlink-videos" if symlink_videos else "--copy-videos"
+            warnings.append(f"{flag} requested but the source has no videos/ directory")
 
     dropped = np.setdiff1d(present, keep_ids)
     return ExportResult(
@@ -322,6 +339,7 @@ def _export_v3(
         trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
         videos_copied=videos_copied,
+        videos_symlinked=videos_symlinked,
     )
 
 
@@ -333,6 +351,7 @@ def _export_v2(
     keep_ids: np.ndarray,
     trim: dict[int, tuple[int, int]] | None = None,
     copy_videos: bool = False,
+    symlink_videos: bool = False,
 ) -> ExportResult:
     """Write the episodes in ``keep_ids`` from a v2.x dataset (one parquet per episode,
     JSONL metadata) to ``out``.
@@ -412,7 +431,7 @@ def _export_v2(
         dest = out / data_path.format(episode_chunk=new_idx // chunks_size, episode_index=new_idx)
         _write(table, dest)
 
-        if copy_videos:
+        if copy_videos or symlink_videos:
             for camera in video_features:
                 src_video = src / video_path.format(
                     episode_chunk=orig_idx // chunks_size, video_key=camera, episode_index=orig_idx
@@ -424,7 +443,10 @@ def _export_v2(
                     episode_chunk=new_idx // chunks_size, video_key=camera, episode_index=new_idx
                 )
                 dest_video.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(src_video, dest_video)
+                if symlink_videos:
+                    dest_video.symlink_to(src_video.resolve())
+                else:
+                    shutil.copyfile(src_video, dest_video)
 
         row = dict(episode_rows[orig_idx])
         row["episode_index"] = new_idx
@@ -485,7 +507,7 @@ def _export_v2(
             (out / "meta" / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, out / "meta" / rel)
 
-    if video_features and not copy_videos:
+    if video_features and not (copy_videos or symlink_videos):
         video_warning = (
             "videos were not copied or renamed: a v2.x video file is named after its episode's "
             "index, so copy each kept episode's video (every camera) from "
@@ -499,16 +521,18 @@ def _export_v2(
                 "report before training on it, or it will run longer than the trimmed data"
             )
         warnings.append(video_warning)
-    elif video_features and copy_videos:
+    elif video_features and (copy_videos or symlink_videos):
+        flag = "--symlink-videos" if symlink_videos else "--copy-videos"
+        verb = "symlinked" if symlink_videos else "copied"
         if missing_videos:
             warnings.append(
-                f"--copy-videos: no video file found for (camera, episode) {sorted(missing_videos)}"
+                f"{flag}: no video file found for (camera, episode) {sorted(missing_videos)}"
             )
         if trimmed_frames:
             warnings.append(
-                "videos were copied and renamed to match the new episode indices, but a v2.x "
+                f"videos were {verb} and renamed to match the new episode indices, but a v2.x "
                 "video has no stored per-episode time span to narrow (unlike v3.0), so each "
-                "trimmed episode's copied video still covers the whole original span; cut it "
+                f"trimmed episode's {verb} video still covers the whole original span; cut it "
                 "to the `trim` frame range from the report before training on it"
             )
 
@@ -523,6 +547,7 @@ def _export_v2(
         trimmed_frames=trimmed_frames,
         warnings=sorted(set(warnings)),
         videos_copied=copy_videos and bool(video_features),
+        videos_symlinked=symlink_videos and bool(video_features),
     )
 
 
