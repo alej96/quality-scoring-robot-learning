@@ -139,7 +139,9 @@ def _parser() -> argparse.ArgumentParser:
         "nor copied (for v2.x, each kept episode's video files must be renamed to match its "
         "new index, and a trimmed episode's video must also be cut to match; see the printed "
         "warning). --copy-videos copies (and, for v2.x, renames) the source's video files for "
-        "a local dataset, without reading, decoding or re-encoding them. --episodes/"
+        "a local dataset, without reading, decoding or re-encoding them; --symlink-videos does "
+        "the same with symlinks instead, to avoid duplicating video data on disk, at the cost "
+        "of the export depending on the source directory staying where it is. --episodes/"
         "--max-episodes restrict which episodes are considered at all (as for score/dedupe); "
         "with --keep-from, the report must have been made from the same subset.",
     )
@@ -169,11 +171,18 @@ def _parser() -> argparse.ArgumentParser:
         help="cut each kept episode's idle start/end frames (per the report's trim "
         "suggestion), shifting timestamps and narrowing video spans to match",
     )
-    export.add_argument(
+    video_mode = export.add_mutually_exclusive_group()
+    video_mode.add_argument(
         "--copy-videos",
         action="store_true",
         help="copy (and, for v2.x, rename) the source's video files into the export; "
         "local sources only, since videos are never downloaded from the Hub",
+    )
+    video_mode.add_argument(
+        "--symlink-videos",
+        action="store_true",
+        help="symlink (instead of copy) the source's video files into the export, saving disk "
+        "space; local sources only, and the export then depends on the source staying in place",
     )
     return p
 
@@ -269,9 +278,10 @@ def _export(args: argparse.Namespace) -> int:
     ds = _load(args)
     if ds is None:
         return 2
-    if args.copy_videos and ds.repo_id is not None:
+    if (args.copy_videos or args.symlink_videos) and ds.repo_id is not None:
+        flag = "--copy-videos" if args.copy_videos else "--symlink-videos"
         print(
-            "demoqc: --copy-videos requires a local dataset directory; videos are never "
+            f"demoqc: {flag} requires a local dataset directory; videos are never "
             "downloaded from the Hub",
             file=sys.stderr,
         )
@@ -291,7 +301,14 @@ def _export(args: argparse.Namespace) -> int:
             )
             keep = keep_from_report_dict(report)
             trim = trim_from_report_dict(report) if args.apply_trim else None
-        result = export_dataset(ds.root, args.output, keep, trim=trim, copy_videos=args.copy_videos)
+        result = export_dataset(
+            ds.root,
+            args.output,
+            keep,
+            trim=trim,
+            copy_videos=args.copy_videos,
+            symlink_videos=args.symlink_videos,
+        )
     except (ValueError, FileExistsError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
         return 2
@@ -307,14 +324,23 @@ def _export(args: argparse.Namespace) -> int:
         )
     for w in result.warnings:
         print(f"warning: {w}", file=sys.stderr)
-    if result.has_videos and result.version.startswith("v3") and not result.videos_copied:
+    if (
+        result.has_videos
+        and result.version.startswith("v3")
+        and not (result.videos_copied or result.videos_symlinked)
+    ):
         print(
             "videos were not copied. Their episode time spans are unchanged, so copy the "
             "source videos/ directory into the output to use it for training, or re-run "
-            "with --copy-videos."
+            "with --copy-videos or --symlink-videos."
         )
     if result.videos_copied:
         print(f"videos copied to {result.out / 'videos'}")
+    if result.videos_symlinked:
+        print(
+            f"videos symlinked to {result.out / 'videos'} "
+            "(the export now depends on the source directory staying where it is)"
+        )
     return 0
 
 
