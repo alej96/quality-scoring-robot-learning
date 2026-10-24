@@ -39,6 +39,9 @@ demoqc export user/dataset --keep-from report.json --apply-trim -o ./clean_datas
 
 # also copy (and, for v2.x, rename) the source's video files -- local datasets only
 demoqc export ./my_dataset --min-score 80 --copy-videos -o ./clean_dataset
+
+# or symlink them instead, to avoid duplicating video data on disk
+demoqc export ./my_dataset --min-score 80 --symlink-videos -o ./clean_dataset
 ```
 
 Example (real output, abridged):
@@ -98,6 +101,14 @@ up front, since videos are never downloaded by this tool. With `--apply-trim`, a
 video is already aligned (its per-episode time span was narrowed in the metadata); a copied
 v2.x video still covers the whole original episode and must still be cut to the `trim` frame
 range from the report, as `demoqc export` warns.
+
+`--symlink-videos` does the same job (copy for v3.0, copy+rename for v2.x) but with symlinks
+instead of byte copies: a single `videos/` symlink for v3.0 (its directory is unchanged, so one
+link is enough), or one symlink per kept-and-renamed video file for v2.x. This uses no extra
+disk space — useful on a large dataset where `--copy-videos` would double the video size on
+disk — but makes the export depend on the source directory staying where it is; move or delete
+the source and the exported videos stop resolving. `--copy-videos` and `--symlink-videos` are
+mutually exclusive.
 
 `--apply-trim` additionally cuts each kept episode's idle start/end frames, using the same
 `trim` range `demoqc score` suggests: `frame_index` and `index` are renumbered and `timestamp`

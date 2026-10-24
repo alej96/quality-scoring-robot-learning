@@ -47,9 +47,8 @@ Work top-down through **Next up**. Each item should ship in one focused session
       (5) ~~v2.x `--apply-trim`~~ shipped 2026-10-21 (see the Log entry) — a v2.x video has no
       per-episode time span to narrow like v3.0's, so the export warns that the video itself
       must also be cut to match instead of narrowing a stored span.
-      (6) `--copy-videos` only copies; a `--symlink-videos` variant (or auto-detecting when a
-      symlink is safe, e.g. v3.0 where the same file is unmodified) would save disk on a large
-      dataset — still open.
+      (6) ~~`--copy-videos` only copies; a `--symlink-videos` variant~~ shipped 2026-10-24
+      (see the Log entry).
 - [x] **Export slice 2: apply trims.** Cut idle frames using `trim`, shift timestamps and
       update video `from_timestamp`/`to_timestamp` so videos stay aligned without
       re-encoding.
@@ -460,3 +459,26 @@ Work top-down through **Next up**. Each item should ship in one focused session
   mapping, a missing video file producing a warning instead of a crash, both CLI paths, the
   `--apply-trim` + `--copy-videos` interaction, and the Hub-source rejection) all fail without
   this change (confirmed via `git stash` on just `src/demoqc/export.py`/`src/demoqc/cli.py`).
+- 2026-10-24: Added **`demoqc export --symlink-videos`** (the `--copy-videos` follow-up: on a
+  large dataset, `--copy-videos` doubles the on-disk video size, which can be prohibitive). Does
+  the same job as `--copy-videos` (copy the whole `videos/` directory for v3.0 since it's
+  unmodified by export; copy-and-rename each kept episode's video for v2.x) but with symlinks
+  (`Path.symlink_to`, resolved to the source's absolute real path) instead of byte copies, so it
+  uses no extra disk space. Mutually exclusive with `--copy-videos` at the CLI (argparse
+  mutually-exclusive group) and defensively in `export_dataset` itself (`ValueError` if both are
+  passed to the library function directly). Added `ExportResult.videos_symlinked` alongside the
+  existing `videos_copied`, and parallel warnings (missing video file, trimmed-but-uncut v2.x
+  video content) worded for symlinks. Validated on two real datasets with their actual videos
+  downloaded locally (`snapshot_download`, not just the metadata+parquet this tool normally
+  fetches): `masato-ka/so100_cutlery_handling_simple` (50 ep, v2.1, `--min-score 90` dropping 5)
+  — `--symlink-videos` produced a 1.8 MiB export vs. 325 MiB for the same export with
+  `--copy-videos`, and a script comparing every one of the 45 kept, renamed videos' bytes against
+  the `--copy-videos` output found zero mismatches, confirming the symlinks resolve to the right
+  (renamed) content; and `lerobot/svla_so101_pickplace` (50 ep, v3.0, `--min-score 90
+  --apply-trim`) — the single `videos/` symlink resolves to the source's `videos/` directory
+  exactly (`Path.resolve()` equality) and the export is 448 KiB total vs. the source's own 28 KiB
+  `du` for `videos/` alone (no extra video bytes either way). New tests in `tests/test_export.py`
+  (9 cases mirroring the existing `--copy-videos` coverage, plus mutual-exclusion checks at both
+  the library and CLI level) fail without this change — 8/9 with `SystemExit`/`AttributeError`,
+  the 9th incidentally passing either way since an unrecognized flag and a mutual-exclusion error
+  both exit 2 (confirmed via `git stash` on just `src/demoqc/export.py`/`src/demoqc/cli.py`).
