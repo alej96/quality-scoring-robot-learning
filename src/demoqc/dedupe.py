@@ -54,6 +54,24 @@ def _resample(traj: np.ndarray, n: int) -> np.ndarray:
     return np.stack([np.interp(x_new, x_old, traj[:, d]) for d in range(traj.shape[1])], axis=1)
 
 
+def _pairwise_mean_sq_l2(mat: np.ndarray) -> np.ndarray:
+    """Pairwise ``sqrt(mean squared difference))`` between rows of ``mat`` (n, D).
+
+    Mathematically ``np.sqrt(np.mean((mat[:, None] - mat[None, :]) ** 2, axis=2))``, but
+    never materializes that (n, n, D) intermediate: it is D times larger than the (n, n)
+    result this function actually returns, and D (resample length times active action
+    dims) is typically in the hundreds, so it is what actually limits how many episodes
+    this check can handle in memory -- not the (n, n) distance matrix itself. Uses
+    ``||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b``, computed with one BLAS matrix multiply, so
+    peak memory is O(n^2 + n*D) instead of O(n^2*D).
+    """
+    sq_norms = np.sum(mat * mat, axis=1)
+    gram = mat @ mat.T
+    sq_dist = sq_norms[:, None] + sq_norms[None, :] - 2.0 * gram
+    np.maximum(sq_dist, 0.0, out=sq_dist)  # clip tiny negative values from float error
+    return np.sqrt(sq_dist / mat.shape[1])
+
+
 class _UnionFind:
     def __init__(self, items: list[int]) -> None:
         self._parent = {i: i for i in items}
@@ -108,8 +126,7 @@ def find_duplicates(
         return groups
 
     mat = np.stack(vectors)
-    diffs = mat[:, None, :] - mat[None, :, :]
-    dist = np.sqrt(np.mean(diffs**2, axis=2))
+    dist = _pairwise_mean_sq_l2(mat)
     np.fill_diagonal(dist, np.inf)
     nn = dist.min(axis=1)
     median = float(np.median(nn))
