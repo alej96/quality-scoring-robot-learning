@@ -29,6 +29,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
       in memory; fine up to a few thousand episodes, but DTW (for duplicates recorded at
       different speeds beyond what resampling absorbs) and a chunked/approximate
       nearest-neighbour search (for huge datasets) are still open.
+      Follow-up (resolved 2026-10-25): that "fine up to a few thousand episodes" claim
+      undercounted the actual memory use by ~2-3 orders of magnitude -- see the Log entry.
+      DTW and a chunked/approximate search for datasets beyond what the (n, n) distance
+      matrix itself can hold are still open.
 - [x] **Export a cleaned dataset (slice 1): `demoqc export --keep-from report.json`.**
       Write a filtered LeRobot v3.0 dataset (tabular data and meta only): drop rejected
       episodes, re-index episodes and frames, recompute `meta/info.json` totals and
@@ -482,3 +486,26 @@ Work top-down through **Next up**. Each item should ship in one focused session
   the library and CLI level) fail without this change — 8/9 with `SystemExit`/`AttributeError`,
   the 9th incidentally passing either way since an unrecognized flag and a mutual-exclusion error
   both exit 2 (confirmed via `git stash` on just `src/demoqc/export.py`/`src/demoqc/cli.py`).
+- 2026-10-25: Fixed a near-duplicate-detection memory bug (the `duplicate` check's own
+  follow-up, which claimed the pairwise distance computation was "fine up to a few
+  thousand episodes" -- it undercounted by 2-3 orders of magnitude). `find_duplicates`
+  built an `(n, n, D)` broadcast intermediate (`mat[:, None] - mat[None, :]`) to get the
+  `(n, n)` distance matrix, where `D` is the resample length times active action dims
+  (hundreds, typically); at a "few thousand episodes" that intermediate alone is tens of
+  GB, long before the actual `(n, n)` result is a problem, so `demoqc score`/`demoqc dedupe`
+  would OOM on any dataset big enough for this tool's own `--episodes`/`--max-episodes`
+  support to matter. `dedupe.py` now has `_pairwise_mean_sq_l2`, which computes the same
+  values via the Gram-matrix identity `||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b` (one BLAS
+  matrix multiply), cutting peak memory from O(n²D) to O(n²+nD) with no change to the
+  result. New `tests/test_dedupe.py` cases: one checks the new helper against a brute-force
+  broadcast on a small matrix (values match to 1e-6; the tiny diagonal float-cancellation
+  noise never matters since the caller overwrites the diagonal with `inf` right after); the
+  other uses `tracemalloc` to assert peak memory for a 300x300 input stays under 20 MB --
+  confirmed the naive broadcast actually peaks at ~413 MB for the same input (measured
+  directly, not estimated), and the test fails both that way and via `ImportError` on the
+  unmodified module (confirmed via `git stash` on just `src/demoqc/dedupe.py`). Validated on
+  all 4 real datasets in the existing validation set (lerobot/svla_so101_pickplace,
+  masato-ka/so100_cutlery_handling_simple, aaronsu11/so100_lego, shylee/so100_cube): mean
+  scores (97.1/92.9/92.2/99.2) and `duplicate_groups` (0 on all 4) are byte-for-byte
+  unchanged from the existing validated numbers, confirming the optimization changed no
+  output.
