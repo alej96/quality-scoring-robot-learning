@@ -128,10 +128,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
       file is ever opened, so this needed no new dependency and stays in the core path.
       Shipped as the `camera` check (`src/demoqc/dataset.py`'s `Episode.camera_stats`,
       `checks.check_camera`, `Config.camera_dark_mean_max`/`camera_dark_std_max`).
-      Follow-up: this only catches a camera that's dead for an *entire* episode. Detecting
-      a frame that freezes or goes black mid-episode, or a decode error, needs actual frame
-      sampling (PyAV, at low resolution, behind an optional `[video]` extra, never in the
-      default path) — still open.
+      Follow-up (resolved 2026-10-26): detecting a camera going black or a video failing to
+      decode mid-episode shipped as the opt-in `video_freeze` check
+      (`--decode-video`, `demoqc[video]`); see the Log entry. Still open: it only supports
+      LeRobot v2.x (resolving a camera's local video file for v3.0 needs its own
+      chunk/file-index lookup, not yet implemented) and it detects a near-black run, not a
+      literally frozen (repeated) frame on a camera that never goes dark.
 - [x] **Benchmark the community.** `scripts/benchmark.py` scores a curated list of real
       community LeRobot datasets and writes `docs/benchmarks.md` (scores, trimmable idle,
       duplicate groups, top flags). Refresh it periodically; it doubles as a regression
@@ -509,3 +511,36 @@ Work top-down through **Next up**. Each item should ship in one focused session
   scores (97.1/92.9/92.2/99.2) and `duplicate_groups` (0 on all 4) are byte-for-byte
   unchanged from the existing validated numbers, confirming the optimization changed no
   output.
+- 2026-10-26: Added the **`video_freeze` check** (`--decode-video`, the `camera` check's
+  highest-priority follow-up: it only ever reads LeRobot's own per-episode pixel mean/std,
+  so a camera that goes black or a video that fails to decode *partway through* an episode
+  -- a loose cable, a brief occlusion, a corrupted download -- averages out across the whole
+  episode and is invisible to it). New optional `demoqc[video]` extra (`av`/PyAV, lazily
+  imported only when `--decode-video` is passed and never touched by the default code
+  path) and `src/demoqc/video.py`: samples up to 20 evenly-spaced frames per camera,
+  downscaled to grayscale, and flags a contiguous near-black run covering >=15% of the
+  samples (`video_dark_run_min_frac` in `Config`), or a file that raises on decode at all,
+  as a decode error. Skips a camera the (cheaper, metadata-only) `camera` check already
+  flagged dead for the whole episode, so the same defect isn't penalized twice. Scoped to
+  **local LeRobot v2.x datasets only** this round -- a v2.x video's path is deterministic
+  from its episode index (`Dataset.video_path_template`/`chunks_size`, now loaded from
+  `info.json`), while v3.0 needs its own per-camera chunk/file-index lookup, not yet
+  implemented (new follow-up on the `camera` check item above). The CLI rejects
+  `--decode-video` for a Hub source (videos are still never downloaded, even with this
+  flag) and for a missing `av` install, and warns and no-ops on a v3.0 dataset rather than
+  erroring. Validated on a real dataset: downloaded `masato-ka/so100_cutlery_handling_simple`
+  episodes 0-4's actual video files (`av1`-encoded, decoded fine via `libdav1d`) and ran
+  `demoqc score --episodes 0-4 --decode-video`; the report was byte-for-byte identical to
+  the same run without `--decode-video` (mean score 90.4 either way) -- no false positives
+  on real, clean footage. Also truncated one real episode's video file to 2000 bytes to
+  simulate a corrupted download: `video_freeze` fired on exactly that episode (ERROR
+  severity, "failed to decode") and every other episode scored unaffected, confirming a
+  bad video file doesn't abort the whole `score` run. New `tests/test_video.py` (13 cases):
+  pure-Python tests of `longest_dark_run`/`resolve_v2_video_path` run in CI with no
+  dependency; `av`-dependent tests (real tiny synthetic `.mp4`s, skipped via
+  `importorskip("av")` when the extra isn't installed, which is always true in CI since
+  `.[dev]` doesn't pull it in) cover a mid-episode dark run, an undecodable file, the
+  check staying silent by default (`decode_video=False`), not double-flagging a
+  `camera`-caught episode, and the CLI's three validation paths (Hub rejection, `av`
+  missing, v3.0 warning). All fail without this change (confirmed via `git stash` on the
+  implementation files, including an `ImportError` for the module itself).
