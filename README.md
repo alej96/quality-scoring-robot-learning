@@ -7,7 +7,8 @@ policies to hesitate. `demoqc` scores every episode of a
 and tells you what to trim or drop.
 
 - Works on a local dataset directory or straight from the Hugging Face Hub
-- Reads only metadata and parquet data; videos are never downloaded
+- Reads only metadata and parquet data; videos are never downloaded, except for the
+  opt-in `--decode-video` check on an already-local dataset
 - Supports LeRobot v2.x (per-episode files) and v3.0 (consolidated files)
 - Thresholds adapt to each dataset (robust statistics across its episodes), so the same
   defaults work for an SO-101 arm at 30 fps and a 2-D PushT agent at 10 fps
@@ -130,6 +131,7 @@ export, or it will run longer than the now-trimmed data.
 | `metadata` | episode length in metadata ≠ frames in data | `meta/episodes` vs data |
 | `video_sync` | video segment duration ≠ data duration (v3.0) | `videos/*/from_timestamp`, `to_timestamp` |
 | `camera` | a camera near-black for a whole episode (disconnected, lens cap) | per-episode pixel mean/std LeRobot already writes to its metadata; no video is ever opened |
+| `video_freeze` | a camera going black, or a video file failing to decode, partway through an episode | decode sampled frames and look for a partial near-black run or a decode error; opt-in (`--decode-video`), see below |
 | `idle` | dead time at start/end (trimmable), long pauses, mostly-idle demos | action speed below 10% of the dataset's 75th-percentile speed |
 | `smoothness` | single-frame glitches, abrupt jumps, demos far jerkier than their peers | per-dimension step size vs dataset p99; log dimensionless jerk (LDLJ) robust z-score |
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
@@ -174,9 +176,9 @@ is intentionally similar), pass `--disable-check NAME` to `demoqc score` once pe
 demoqc score user/dataset --disable-check gripper_chatter --disable-check sync
 ```
 
-Valid names are `timing`, `metadata`, `video_sync`, `camera`, `idle`, `smoothness`,
-`stale_state`, `sync`, `gripper_chatter`, `length` and `duplicate`; an unknown name is
-rejected up front.
+Valid names are `timing`, `metadata`, `video_sync`, `camera`, `video_freeze`, `idle`,
+`smoothness`, `stale_state`, `sync`, `gripper_chatter`, `length` and `duplicate`; an
+unknown name is rejected up front.
 Disabling a check removes both its flags and its metrics from the report, and (for
 `duplicate`) skips `duplicate_groups` and the duplicate-detection pass entirely.
 
@@ -212,6 +214,30 @@ above), so a score or flag computed from a small `--episodes` subset is relative
 subset, not the full dataset, and can differ slightly from a full-dataset run; checks that
 need 5+ episodes (`length`, smoothness/sync outlier comparisons) are silently skipped
 below that.
+
+## Frame-level video checks (`--decode-video`)
+
+Every other check reads only metadata and tabular data; videos are never downloaded or
+opened by default. `demoqc score --decode-video` is the one opt-in exception: it decodes
+each episode's video to catch a camera that goes black, or a video file that fails to
+decode, **partway through** an episode -- a disconnected cable or a brief occlusion that
+the metadata-only `camera` check can't see, since that check only has one pixel mean/std
+for the *whole* episode.
+
+```bash
+pip install 'demoqc[video]'   # pulls in the optional `av` (PyAV) dependency
+demoqc score ./my_dataset --decode-video
+```
+
+It needs a **local** LeRobot **v2.x** dataset with its video files already on disk (videos
+are still never downloaded from the Hub, even with this flag); scoring a Hub repo id or a
+v3.0 dataset with `--decode-video` either errors out (no local source) or prints a warning
+and skips the check (v3.0 not supported yet). For each camera, up to 20 evenly-spaced
+frames are sampled and downscaled to grayscale; a contiguous near-black run covering at
+least 15% of the samples is flagged as `video_freeze`, and a video that can't be decoded at
+all (corrupted or truncated) is flagged as a decode error. A camera already flagged dead
+for the whole episode by the `camera` check is skipped, so the same defect isn't penalized
+twice.
 
 ## Development
 
