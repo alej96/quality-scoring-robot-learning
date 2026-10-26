@@ -64,6 +64,8 @@ class Config:
     )
     camera_dark_mean_max: float = 0.03  # pixel mean below this (0-1 scale) is near-black
     camera_dark_std_max: float = 0.02  # pixel std below this means almost no variation either
+    video_decode_max_samples: int = 20  # frames sampled per camera when --decode-video is used
+    video_dark_run_min_frac: float = 0.15  # fraction of sampled frames that must be dark to flag
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -148,18 +150,36 @@ class DatasetContext:
     idle_speed: float  # speed threshold, scaled units / s
     gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
     sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
+    # --decode-video support (check_video_freeze); video_root is only set for a local,
+    # v2.x dataset, since that's the only layout this slice knows how to resolve a camera's
+    # video file from (see video.resolve_v2_video_path).
+    video_root: Path | None = None
+    video_path_template: str | None = None
+    chunks_size: int = 1000
+    camera_names: list[str] = field(default_factory=list)
 
     @classmethod
-    def build(cls, ds: Dataset, cfg: Config) -> DatasetContext:
+    def build(cls, ds: Dataset, cfg: Config, decode_video: bool = False) -> DatasetContext:
         gripper_dims = [
             i for i, name in enumerate(ds.action_names or []) if name and "gripper" in name.lower()
         ]
         a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
         s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
         sync_dims = _match_sync_dims(ds.action_names, ds.state_names, a_width, s_width)
+        video_root = (
+            ds.root
+            if decode_video and ds.repo_id is None and not ds.codebase_version.startswith("v3")
+            else None
+        )
+        video_ctx = dict(
+            video_root=video_root,
+            video_path_template=ds.video_path_template,
+            chunks_size=ds.chunks_size,
+            camera_names=ds.camera_names,
+        )
         actions = [e.action for e in ds.episodes if e.action is not None and len(e.action) > 1]
         if not actions:
-            return cls(ds.fps, None, None, 0.0, gripper_dims, sync_dims)
+            return cls(ds.fps, None, None, 0.0, gripper_dims, sync_dims, **video_ctx)
         allA = np.concatenate(actions)
         q75, q25 = np.percentile(allA, [75, 25], axis=0)
         scale = (q75 - q25) / 1.349
@@ -180,6 +200,7 @@ class DatasetContext:
             idle_speed=cfg.idle_fraction_of_p75 * p75,
             gripper_dims=gripper_dims,
             sync_dims=sync_dims,
+            **video_ctx,
         )
 
 
@@ -294,6 +315,48 @@ def check_camera(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResu
                 min(50.0, 25.0 * len(dead)),
             )
         )
+
+
+def check_video_freeze(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
+    """A camera that goes black, or a video file that fails to decode, partway through an
+    episode: real, training-blocking defects that the metadata-only ``camera`` check can't
+    see because it only has one mean/std for the whole episode. Opt-in (``--decode-video``):
+    needs the optional ``av`` dependency and a local, already-downloaded v2.x dataset (see
+    ``DatasetContext.video_root``), so ``ctx.video_root`` is ``None`` and this is a no-op
+    for every other run, including the default one."""
+    if ctx.video_root is None:
+        return
+    from demoqc import video
+
+    for camera in ctx.camera_names:
+        mean, _std = ep.camera_stats.get(camera, (1.0, 1.0))
+        if mean <= cfg.camera_dark_mean_max:
+            continue  # whole-episode dead camera; the cheaper `camera` check already flags it
+        path = video.resolve_v2_video_path(
+            ctx.video_root, ctx.video_path_template, ctx.chunks_size, ep.index, camera
+        )
+        if not path.exists():
+            continue
+        samples = video.decode_samples(path, cfg.video_decode_max_samples)
+        if not samples:
+            out.flags.append(
+                Flag("video_freeze", ERROR, f"{camera}: video file failed to decode", 40.0)
+            )
+            continue
+        run = video.longest_dark_run(
+            samples, cfg.camera_dark_mean_max, cfg.camera_dark_std_max, cfg.video_dark_run_min_frac
+        )
+        if run is not None:
+            start_t, end_t = samples[run[0]].t, samples[run[1] - 1].t
+            out.flags.append(
+                Flag(
+                    "video_freeze",
+                    WARN,
+                    f"{camera}: goes near-black from ~{start_t:.1f}s to ~{end_t:.1f}s "
+                    "mid-episode (disconnected or occluded camera?)",
+                    20.0,
+                )
+            )
 
 
 def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
@@ -627,6 +690,7 @@ EPISODE_CHECKS = [
     ("metadata", check_metadata),
     ("video_sync", check_video_sync),
     ("camera", check_camera),
+    ("video_freeze", check_video_freeze),
     ("idle", check_idle),
     ("smoothness", check_smoothness),
     ("stale_state", check_staleness),
@@ -642,10 +706,13 @@ CHECK_NAMES = tuple(name for name, _ in EPISODE_CHECKS) + ("length", "duplicate"
 
 
 def evaluate(
-    ds: Dataset, cfg: Config | None = None, disabled_checks: frozenset[str] = frozenset()
+    ds: Dataset,
+    cfg: Config | None = None,
+    disabled_checks: frozenset[str] = frozenset(),
+    decode_video: bool = False,
 ) -> list[EpisodeResult]:
     cfg = cfg or Config()
-    ctx = DatasetContext.build(ds, cfg)
+    ctx = DatasetContext.build(ds, cfg, decode_video=decode_video)
     checks = [(name, fn) for name, fn in EPISODE_CHECKS if name not in disabled_checks]
     results = []
     for ep in ds.episodes:

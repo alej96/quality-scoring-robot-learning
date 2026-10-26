@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from demoqc import __version__
+from demoqc import __version__, video
 from demoqc.checks import CHECK_NAMES, Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
 from demoqc.dedupe import find_duplicates, flag_duplicates, format_duplicates
@@ -103,6 +103,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="skip a check entirely (repeatable), e.g. a dataset with no gripper but a "
         "noisy sync check from an unsynced third camera clock",
+    )
+    score.add_argument(
+        "--decode-video",
+        action="store_true",
+        help="decode video frames to catch a camera going black or a file failing to decode "
+        "mid-episode (the `video_freeze` check); needs `pip install demoqc[video]` and a "
+        "local, v2.x dataset with its video files on disk -- videos are still never "
+        "downloaded from the Hub",
     )
     score.add_argument("--top", type=int, default=10, help="lowest-scoring episodes to print")
     score.add_argument(
@@ -228,8 +236,29 @@ def _score(args: argparse.Namespace) -> int:
     cfg = _config(args)
     if cfg is None:
         return 2
+    if args.decode_video:
+        if not video.is_available():
+            print(
+                "demoqc: --decode-video needs the optional 'av' dependency "
+                "(pip install 'demoqc[video]')",
+                file=sys.stderr,
+            )
+            return 2
+        if ds.repo_id is not None:
+            print(
+                "demoqc: --decode-video requires a local dataset directory; videos are "
+                "never downloaded from the Hub",
+                file=sys.stderr,
+            )
+            return 2
+        if ds.codebase_version.startswith("v3"):
+            print(
+                "demoqc: --decode-video doesn't support LeRobot v3.0 datasets yet; "
+                "skipping the video_freeze check",
+                file=sys.stderr,
+            )
     disabled = frozenset(args.disable_check or [])
-    results = evaluate(ds, cfg, disabled)
+    results = evaluate(ds, cfg, disabled, decode_video=args.decode_video)
     duplicate_groups = []
     if "duplicate" not in disabled:
         ctx = DatasetContext.build(ds, cfg)

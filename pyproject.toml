@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+video = ["av>=11"]
 
 [project.scripts]
 demoqc = "demoqc.cli:main"

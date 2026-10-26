@@ -53,6 +53,9 @@ class Dataset:
     repo_id: str | None = None
     action_names: list[str] | None = None  # per-dim feature names, e.g. "gripper.pos"
     state_names: list[str] | None = None  # observation.state per-dim feature names
+    camera_names: list[str] = field(default_factory=list)  # video-dtype feature names
+    video_path_template: str | None = None  # info.json's "video_path", v2.x layout
+    chunks_size: int = 1000  # info.json's "chunks_size", for v2.x episode_chunk math
 
     @property
     def total_frames(self) -> int:
@@ -136,6 +139,9 @@ def load_dataset(
         repo_id=repo_id,
         action_names=info.get("features", {}).get("action", {}).get("names"),
         state_names=info.get("features", {}).get("observation.state", {}).get("names"),
+        camera_names=camera_names,
+        video_path_template=info.get("video_path"),
+        chunks_size=int(info.get("chunks_size", 1000)),
     )
 
 
