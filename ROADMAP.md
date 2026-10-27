@@ -130,10 +130,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
       `checks.check_camera`, `Config.camera_dark_mean_max`/`camera_dark_std_max`).
       Follow-up (resolved 2026-10-26): detecting a camera going black or a video failing to
       decode mid-episode shipped as the opt-in `video_freeze` check
-      (`--decode-video`, `demoqc[video]`); see the Log entry. Still open: it only supports
-      LeRobot v2.x (resolving a camera's local video file for v3.0 needs its own
-      chunk/file-index lookup, not yet implemented) and it detects a near-black run, not a
-      literally frozen (repeated) frame on a camera that never goes dark.
+      (`--decode-video`, `demoqc[video]`); see the Log entry. Follow-up (resolved
+      2026-10-27): `video_freeze` now also supports LeRobot v3.0 (resolving a camera's local
+      video file via its `meta/episodes` chunk/file index, and narrowing decode to that
+      episode's own `from_timestamp`/`to_timestamp` span since a v3.0 video file holds
+      several episodes back to back); see the Log entry. Still open: it detects a near-black
+      run, not a literally frozen (repeated) frame on a camera that never goes dark.
 - [x] **Benchmark the community.** `scripts/benchmark.py` scores a curated list of real
       community LeRobot datasets and writes `docs/benchmarks.md` (scores, trimmable idle,
       duplicate groups, top flags). Refresh it periodically; it doubles as a regression
@@ -544,3 +546,39 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `camera`-caught episode, and the CLI's three validation paths (Hub rejection, `av`
   missing, v3.0 warning). All fail without this change (confirmed via `git stash` on the
   implementation files, including an `ImportError` for the module itself).
+- 2026-10-27: Added **LeRobot v3.0 support to `video_freeze`** (`--decode-video`'s
+  highest-priority follow-up from yesterday: v3.0 datasets, including the project's own
+  reference dataset, couldn't use the check at all). Unlike v2.x (one video file per
+  episode, resolved directly from the episode index), a v3.0 video file holds several
+  consecutive episodes' footage back to back, addressed by the `chunk_index`/`file_index`
+  each episode's `meta/episodes` row names per camera (`videos/{camera}/chunk_index`/
+  `file_index`, now loaded onto `Episode.video_chunk_file` in `dataset.py`) and resolved to
+  a path with the new `video.resolve_v3_video_path`. `video.decode_samples` gained an
+  optional `time_range` to narrow decoding to one episode's own
+  `from_timestamp`/`to_timestamp` span within that shared file (seeking near the start
+  first) instead of decoding the whole thing; `check_video_freeze` picks this path whenever
+  an episode has a `video_chunk_file` entry for a camera, falling back to the existing v2.x
+  per-episode-file path otherwise. The CLI's old "v3.0 not supported yet" warning is gone;
+  `DatasetContext.build` now sets `video_root` for any local dataset, not just v2.x.
+  Validated on a real dataset with its actual videos downloaded locally
+  (`snapshot_download`, not just the metadata+parquet this tool normally fetches):
+  `lerobot/svla_so101_pickplace` (50 ep, v3.0, 2 cameras, one shared video file per camera
+  holding all 50 episodes) — `demoqc score --decode-video` produced a report byte-for-byte
+  identical to the same run without `--decode-video` (mean score 97.13 either way, 0
+  `video_freeze` flags) in 59s, confirming no false positives on real, clean footage and
+  that the new per-episode seek-and-decode path doesn't change anything when there's
+  nothing to find. Then truncated one camera's shared video file to 1/3 of its original
+  byte length to simulate a corrupted/incomplete download: `video_freeze` fired a decode
+  error on exactly the 33 episodes (17-49) whose `from_timestamp` falls past the truncation
+  point, scoring each down by the check's fixed 40-point penalty, while all 17 earlier
+  episodes sharing that same (now-truncated) file scored byte-for-byte identical to the
+  clean baseline — confirming the per-episode time window is resolved and decoded
+  independently, a corrupted tail doesn't propagate backward to episodes whose footage is
+  still intact in the same file, and a bad shared file still doesn't abort the whole `score`
+  run. New `tests/test_video.py` cases (`resolve_v3_video_path` pure-path tests,
+  `decode_samples`'s `time_range` narrowing on a real tiny synthetic multi-segment `.mp4`,
+  and a full two-episode-sharing-one-file `check_video_freeze` integration test) all fail
+  without this change (confirmed via `git stash` on the implementation files -- the
+  integration test fails with `AttributeError` since `Episode` had no `video_chunk_file`
+  yet, and the CLI no-video-files test fails because the old code still printed and exited
+  via the removed v3.0 warning path).

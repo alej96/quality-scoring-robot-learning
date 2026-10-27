@@ -229,11 +229,12 @@ pip install 'demoqc[video]'   # pulls in the optional `av` (PyAV) dependency
 demoqc score ./my_dataset --decode-video
 ```
 
-It needs a **local** LeRobot **v2.x** dataset with its video files already on disk (videos
-are still never downloaded from the Hub, even with this flag); scoring a Hub repo id or a
-v3.0 dataset with `--decode-video` either errors out (no local source) or prints a warning
-and skips the check (v3.0 not supported yet). For each camera, up to 20 evenly-spaced
-frames are sampled and downscaled to grayscale; a contiguous near-black run covering at
+It needs a **local** dataset (LeRobot **v2.x or v3.0**) with its video files already on
+disk (videos are still never downloaded from the Hub, even with this flag); scoring a Hub
+repo id with `--decode-video` errors out, since there's no local source to read from. For
+each camera, up to 20 evenly-spaced frames are sampled and downscaled to grayscale; for
+v3.0, where several episodes share one video file, decoding is narrowed to that episode's
+own `from_timestamp`/`to_timestamp` span first. A contiguous near-black run covering at
 least 15% of the samples is flagged as `video_freeze`, and a video that can't be decoded at
 all (corrupted or truncated) is flagged as a decode error. A camera already flagged dead
 for the whole episode by the `camera` check is skipped, so the same defect isn't penalized
