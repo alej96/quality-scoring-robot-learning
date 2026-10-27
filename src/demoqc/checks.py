@@ -150,9 +150,9 @@ class DatasetContext:
     idle_speed: float  # speed threshold, scaled units / s
     gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
     sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
-    # --decode-video support (check_video_freeze); video_root is only set for a local,
-    # v2.x dataset, since that's the only layout this slice knows how to resolve a camera's
-    # video file from (see video.resolve_v2_video_path).
+    # --decode-video support (check_video_freeze); video_root is only set for a local
+    # dataset (v2.x or v3.0), since videos are never downloaded from the Hub (see
+    # video.resolve_v2_video_path/resolve_v3_video_path).
     video_root: Path | None = None
     video_path_template: str | None = None
     chunks_size: int = 1000
@@ -166,11 +166,7 @@ class DatasetContext:
         a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
         s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
         sync_dims = _match_sync_dims(ds.action_names, ds.state_names, a_width, s_width)
-        video_root = (
-            ds.root
-            if decode_video and ds.repo_id is None and not ds.codebase_version.startswith("v3")
-            else None
-        )
+        video_root = ds.root if decode_video and ds.repo_id is None else None
         video_ctx = dict(
             video_root=video_root,
             video_path_template=ds.video_path_template,
@@ -321,9 +317,9 @@ def check_video_freeze(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episo
     """A camera that goes black, or a video file that fails to decode, partway through an
     episode: real, training-blocking defects that the metadata-only ``camera`` check can't
     see because it only has one mean/std for the whole episode. Opt-in (``--decode-video``):
-    needs the optional ``av`` dependency and a local, already-downloaded v2.x dataset (see
-    ``DatasetContext.video_root``), so ``ctx.video_root`` is ``None`` and this is a no-op
-    for every other run, including the default one."""
+    needs the optional ``av`` dependency and a local, already-downloaded dataset (v2.x or
+    v3.0; see ``DatasetContext.video_root``), so ``ctx.video_root`` is ``None`` and this is
+    a no-op for every other run, including the default one."""
     if ctx.video_root is None:
         return
     from demoqc import video
@@ -332,12 +328,20 @@ def check_video_freeze(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episo
         mean, _std = ep.camera_stats.get(camera, (1.0, 1.0))
         if mean <= cfg.camera_dark_mean_max:
             continue  # whole-episode dead camera; the cheaper `camera` check already flags it
-        path = video.resolve_v2_video_path(
-            ctx.video_root, ctx.video_path_template, ctx.chunks_size, ep.index, camera
-        )
+        time_range = None
+        if camera in ep.video_chunk_file:
+            chunk_index, file_index = ep.video_chunk_file[camera]
+            path = video.resolve_v3_video_path(
+                ctx.video_root, ctx.video_path_template, chunk_index, file_index, camera
+            )
+            time_range = ep.video_spans.get(camera)
+        else:
+            path = video.resolve_v2_video_path(
+                ctx.video_root, ctx.video_path_template, ctx.chunks_size, ep.index, camera
+            )
         if not path.exists():
             continue
-        samples = video.decode_samples(path, cfg.video_decode_max_samples)
+        samples = video.decode_samples(path, cfg.video_decode_max_samples, time_range=time_range)
         if not samples:
             out.flags.append(
                 Flag("video_freeze", ERROR, f"{camera}: video file failed to decode", 40.0)

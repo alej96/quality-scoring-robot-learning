@@ -22,6 +22,11 @@ DEFAULT_VIDEO_PATH_V2 = (
     "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
 )
 
+# LeRobot v3.0's default ``info.json["video_path"]`` template: unlike v2.x, a v3.0 video file
+# is shared by several consecutive episodes (one per camera per chunk/file), so it's addressed
+# by chunk/file index rather than by episode index directly.
+DEFAULT_VIDEO_PATH_V3 = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+
 
 @dataclass
 class FrameSample:
@@ -47,8 +52,25 @@ def resolve_v2_video_path(
     )
 
 
-def decode_samples(path: Path, max_samples: int = 20) -> list[FrameSample] | None:
+def resolve_v3_video_path(
+    root: Path, template: str | None, chunk_index: int, file_index: int, camera: str
+) -> Path:
+    """Local path LeRobot v3.0 stores ``camera``'s video file at, for the chunk/file index
+    an episode's ``meta/episodes`` row names (``videos/{camera}/chunk_index``/``file_index``).
+    The file itself may hold several consecutive episodes; the caller narrows to one
+    episode's footage with its own ``from_timestamp``/``to_timestamp`` span."""
+    tpl = template or DEFAULT_VIDEO_PATH_V3
+    return root / tpl.format(chunk_index=chunk_index, file_index=file_index, video_key=camera)
+
+
+def decode_samples(
+    path: Path, max_samples: int = 20, time_range: tuple[float, float] | None = None
+) -> list[FrameSample] | None:
     """Up to ``max_samples`` evenly-spaced grayscale frame stats from the video at ``path``.
+
+    ``time_range``, when given, narrows decoding to ``[start, end)`` seconds within the
+    file instead of the whole thing -- needed for LeRobot v3.0, where one video file holds
+    several consecutive episodes' footage back to back (unlike v2.x, one file per episode).
 
     Returns ``None`` if the file can't be decoded at all (corrupted container, unsupported
     codec, truncated download) -- a real defect in its own right, not something to let
@@ -59,9 +81,26 @@ def decode_samples(path: Path, max_samples: int = 20) -> list[FrameSample] | Non
     try:
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
+            fps = float(stream.average_rate) if stream.average_rate else 1.0
+            if time_range is not None:
+                start_s, end_s = time_range
+                container.seek(max(0, int(start_s * 1_000_000)), backward=True)
+                in_range = []
+                for i, frame in enumerate(container.decode(stream)):
+                    t = float(frame.time) if frame.time is not None else i / fps
+                    if t < start_s:
+                        continue
+                    if t >= end_s:
+                        break
+                    arr = frame.to_ndarray(format="gray").astype(np.float64) / 255.0
+                    in_range.append(FrameSample(t, float(arr.mean()), float(arr.std())))
+                if len(in_range) <= max_samples:
+                    return in_range
+                positions = np.linspace(0, len(in_range) - 1, max_samples)
+                idx = sorted(set(positions.round(0).astype(int)))
+                return [in_range[i] for i in idx]
             total = stream.frames or 0
             step = max(1, total // max_samples) if total else 1
-            fps = float(stream.average_rate) if stream.average_rate else 1.0
             out = []
             for i, frame in enumerate(container.decode(stream)):
                 if i % step != 0:

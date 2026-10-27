@@ -109,8 +109,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="decode video frames to catch a camera going black or a file failing to decode "
         "mid-episode (the `video_freeze` check); needs `pip install demoqc[video]` and a "
-        "local, v2.x dataset with its video files on disk -- videos are still never "
-        "downloaded from the Hub",
+        "local dataset (v2.x or v3.0) with its video files on disk -- videos are still "
+        "never downloaded from the Hub",
     )
     score.add_argument("--top", type=int, default=10, help="lowest-scoring episodes to print")
     score.add_argument(
@@ -251,12 +251,6 @@ def _score(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if ds.codebase_version.startswith("v3"):
-            print(
-                "demoqc: --decode-video doesn't support LeRobot v3.0 datasets yet; "
-                "skipping the video_freeze check",
-                file=sys.stderr,
-            )
     disabled = frozenset(args.disable_check or [])
     results = evaluate(ds, cfg, disabled, decode_video=args.decode_video)
     duplicate_groups = []

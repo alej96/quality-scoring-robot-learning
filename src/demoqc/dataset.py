@@ -37,6 +37,10 @@ class Episode:
     # camera key -> (pixel mean, pixel std) over the whole episode, from LeRobot's own
     # per-episode video stats (meta/episodes on v3.0, meta/episodes_stats.jsonl on v2.x)
     camera_stats: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # camera key -> (chunk_index, file_index) of the video file holding this episode's
+    # footage, v3.0 only -- a v3.0 video file is shared by several episodes, so resolving
+    # it (unlike v2.x, where the episode index names the file directly) needs this lookup.
+    video_chunk_file: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     @property
     def length(self) -> int:
@@ -127,6 +131,7 @@ def load_dataset(
                 meta_length=meta.get("length"),
                 video_spans=meta.get("video_spans", {}),
                 camera_stats=meta.get("camera_stats", {}),
+                video_chunk_file=meta.get("video_chunk_file", {}),
             )
         )
 
@@ -301,6 +306,14 @@ def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, di
                 for cam in cameras
                 if pd.notna(row.get(f"videos/{cam}/from_timestamp"))
             }
+            chunk_file = {
+                cam: (int(row[f"videos/{cam}/chunk_index"]), int(row[f"videos/{cam}/file_index"]))
+                for cam in cameras
+                if f"videos/{cam}/chunk_index" in df.columns
+                and f"videos/{cam}/file_index" in df.columns
+                and pd.notna(row.get(f"videos/{cam}/chunk_index"))
+                and pd.notna(row.get(f"videos/{cam}/file_index"))
+            }
             camera_stats = {}
             for cam in stat_cams:
                 mean = _image_stat_scalar(row.get(f"stats/{cam}/mean"))
@@ -312,6 +325,7 @@ def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, di
                 "task": _first_task(row.get("tasks")),
                 "video_spans": spans,
                 "camera_stats": camera_stats,
+                "video_chunk_file": chunk_file,
             }
         return meta
 

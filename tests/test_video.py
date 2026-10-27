@@ -71,6 +71,21 @@ def test_resolve_v2_video_path_uses_a_custom_template():
     assert path == Path("/d/vids/top/000250-c2.mp4")
 
 
+def test_resolve_v3_video_path_uses_chunk_and_file_index():
+    path = video_mod.resolve_v3_video_path(
+        Path("/data"), None, chunk_index=2, file_index=7, camera="observation.images.top"
+    )
+    assert path == Path("/data/videos/observation.images.top/chunk-002/file-007.mp4")
+
+
+def test_resolve_v3_video_path_uses_a_custom_template():
+    tpl = "vids/{video_key}/{chunk_index:02d}-{file_index:02d}.mp4"
+    path = video_mod.resolve_v3_video_path(
+        Path("/d"), tpl, chunk_index=1, file_index=3, camera="top"
+    )
+    assert path == Path("/d/vids/top/01-03.mp4")
+
+
 # -- av-dependent: decode_samples and the full check, on real encoded video ----------------
 
 av = pytest.importorskip("av")
@@ -113,6 +128,26 @@ def test_decode_samples_returns_none_for_an_undecodable_file(tmp_path):
     assert video_mod.decode_samples(path) is None
 
 
+def test_decode_samples_time_range_narrows_to_one_segment_of_a_shared_file(tmp_path):
+    # a v3.0 video file holds several episodes back to back; a dark run outside the
+    # requested [start, end) window must not show up in that window's samples. The second
+    # segment's dark run is only *part* of the segment (not all of it), matching
+    # longest_dark_run's "partial run" contract -- a wholly-dark segment is the (cheaper,
+    # metadata-only) `camera` check's job instead.
+    path = tmp_path / "shared.mp4"
+    fps = 10
+    # [0, 2s): clean. [2, 4s): clean, dark (2.5-3.4s), clean. [4, 6s): clean.
+    _write_video(path, [220] * 20 + [220] * 5 + [2] * 10 + [220] * 5 + [220] * 20, fps=fps)
+
+    first = video_mod.decode_samples(path, max_samples=15, time_range=(0.0, 2.0))
+    second = video_mod.decode_samples(path, max_samples=15, time_range=(2.0, 4.0))
+
+    assert first and all(s.mean > 0.5 for s in first)
+    assert second and any(s.mean < 0.1 for s in second)
+    run = video_mod.longest_dark_run(second, dark_mean_max=0.1, dark_std_max=0.1, min_run_frac=0.15)
+    assert run is not None
+
+
 def test_video_freeze_check_fires_on_a_dark_run_and_a_decode_error_only_when_requested(
     make_dataset,
 ):
@@ -145,6 +180,39 @@ def test_video_freeze_check_fires_on_a_dark_run_and_a_decode_error_only_when_req
     assert any(f.check == "video_freeze" and f.severity == "error" for f in on[2].flags)
     assert "video_freeze" not in checks(on[3])
     assert "video_freeze" not in checks(on[4])
+
+
+def test_video_freeze_check_on_v3_narrows_to_each_episodes_own_segment(make_dataset):
+    # Two v3.0 episodes sharing one physical video file (the real layout: LeRobot v3.0
+    # concatenates several episodes' footage into one file, addressed by chunk/file index,
+    # unlike v2.x's one-file-per-episode). A *partial* dark run placed only in episode 1's
+    # segment must flag episode 1 and leave episode 0 (sharing the same file) untouched.
+    import pandas as pd
+
+    specs = clean_specs(2)
+    root = make_dataset(specs, version="v3.0")
+    camera = "observation.images.top"
+    episodes_file = next((root / "meta" / "episodes").rglob("*.parquet"))
+    df = pd.read_parquet(episodes_file)
+    spans = {0: (0.0, 2.0), 1: (2.0, 4.0)}
+    for ep, (start, end) in spans.items():
+        df.loc[df["episode_index"] == ep, f"videos/{camera}/from_timestamp"] = start
+        df.loc[df["episode_index"] == ep, f"videos/{camera}/to_timestamp"] = end
+    df.to_parquet(episodes_file)
+
+    ds = load_dataset(root)
+    chunk_index, file_index = ds.episodes[0].video_chunk_file[camera]
+    video_path = video_mod.resolve_v3_video_path(
+        ds.root, ds.video_path_template, chunk_index, file_index, camera
+    )
+    # ep0 [0, 2s): clean. ep1 [2, 4s): clean, dark (2.5-3.4s), clean -- a partial run that
+    # sits entirely in episode 1's own segment.
+    _write_video(video_path, [220] * 20 + [220] * 5 + [2] * 10 + [220] * 5, fps=10)
+
+    results = evaluate(load_dataset(root), Config(), decode_video=True)
+
+    assert "video_freeze" not in {f.check for f in results[0].flags}
+    assert "video_freeze" in {f.check for f in results[1].flags}
 
 
 def test_video_freeze_skips_an_episode_the_camera_check_already_flagged(make_dataset):
@@ -190,10 +258,12 @@ def test_decode_video_requires_av_installed(make_dataset, monkeypatch, capsys):
     assert "demoqc[video]" in capsys.readouterr().err
 
 
-def test_decode_video_warns_and_skips_on_v3(make_dataset, capsys):
+def test_decode_video_runs_on_a_local_v3_dataset_with_no_video_files(make_dataset, capsys):
+    # no video files on disk at all: every camera path lookup must miss and skip silently,
+    # rather than erroring out the way v3.0 used to before chunk/file-index resolution existed
     src = make_dataset(clean_specs(3), version="v3.0")
 
     code = main(["score", str(src), "--decode-video", "--quiet"])
 
     assert code == 0
-    assert "v3.0" in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
