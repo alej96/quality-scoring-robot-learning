@@ -131,7 +131,7 @@ export, or it will run longer than the now-trimmed data.
 | `metadata` | episode length in metadata ≠ frames in data | `meta/episodes` vs data |
 | `video_sync` | video segment duration ≠ data duration (v3.0) | `videos/*/from_timestamp`, `to_timestamp` |
 | `camera` | a camera near-black for a whole episode (disconnected, lens cap) | per-episode pixel mean/std LeRobot already writes to its metadata; no video is ever opened |
-| `video_freeze` | a camera going black, or a video file failing to decode, partway through an episode | decode sampled frames and look for a partial near-black run or a decode error; opt-in (`--decode-video`), see below |
+| `video_freeze` | a camera going black, freezing on one frame while the robot moves, or a video file failing to decode, partway through an episode | decode sampled frames and look for a partial near-black run, a near-identical run of frames during commanded motion, or a decode error; opt-in (`--decode-video`), see below |
 | `idle` | dead time at start/end (trimmable), long pauses, mostly-idle demos | action speed below 10% of the dataset's 75th-percentile speed |
 | `smoothness` | single-frame glitches, abrupt jumps, demos far jerkier than their peers | per-dimension step size vs dataset p99; log dimensionless jerk (LDLJ) robust z-score |
 | `stale_state` | `observation.state` frozen while the action moves (stale sensor reads) | bit-identical consecutive states during motion |
@@ -239,6 +239,15 @@ least 15% of the samples is flagged as `video_freeze`, and a video that can't be
 all (corrupted or truncated) is flagged as a decode error. A camera already flagged dead
 for the whole episode by the `camera` check is skipped, so the same defect isn't penalized
 twice.
+
+The same sampled frames are also diffed against each other (a small block-averaged
+thumbnail per frame) to catch a camera or recorder that stalls and keeps emitting the same
+frame without going dark -- a dropped/duplicated frame a video codec can otherwise hide
+completely from the pixel-mean/std the `camera` check relies on. This only fires while the
+robot was actually commanding motion throughout that span: a frozen frame during genuine
+idle time (the start/end of almost every demo, or a very static scene) looks identical and
+isn't a defect, so it's left alone rather than risk flagging ordinary, well-compressed
+footage.
 
 ## Development
 
