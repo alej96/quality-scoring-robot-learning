@@ -134,8 +134,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
       2026-10-27): `video_freeze` now also supports LeRobot v3.0 (resolving a camera's local
       video file via its `meta/episodes` chunk/file index, and narrowing decode to that
       episode's own `from_timestamp`/`to_timestamp` span since a v3.0 video file holds
-      several episodes back to back); see the Log entry. Still open: it detects a near-black
-      run, not a literally frozen (repeated) frame on a camera that never goes dark.
+      several episodes back to back); see the Log entry. Follow-up (resolved 2026-10-28):
+      `video_freeze` now also detects a literally frozen (repeated) frame on a camera that
+      never goes dark; see the Log entry.
 - [x] **Benchmark the community.** `scripts/benchmark.py` scores a curated list of real
       community LeRobot datasets and writes `docs/benchmarks.md` (scores, trimmable idle,
       duplicate groups, top flags). Refresh it periodically; it doubles as a regression
@@ -582,3 +583,59 @@ Work top-down through **Next up**. Each item should ship in one focused session
   integration test fails with `AttributeError` since `Episode` had no `video_chunk_file`
   yet, and the CLI no-video-files test fails because the old code still printed and exited
   via the removed v3.0 warning path).
+- 2026-10-28: Added **frozen-frame detection to `video_freeze`** (the `camera`/`video_freeze`
+  check's last open follow-up: a camera or recorder that stalls and repeats the same frame
+  without ever going dark -- a dropped/duplicated frame, not a disconnect -- previously had
+  normal-looking pixel mean/std and no partial dark run, so it was invisible to every
+  existing check). `video.FrameSample` now also carries a 32x32 block-averaged thumbnail of
+  each sampled frame; `video.longest_frozen_run` finds the longest run of consecutive
+  samples whose largest per-block difference stays below `Config.video_freeze_max_abs_diff`
+  (0.03). `check_video_freeze` only flags a frozen run when the dataset's own action data
+  shows the robot was *continuously* commanding motion throughout that span (the same
+  "clearly moving" bar `check_staleness` uses via the new `_episode_moved` helper): a frozen
+  frame during genuine idle time (the lead/trail idle almost every demo has) looks identical
+  and isn't a defect on its own, so flagging it regardless would mean flagging ordinary,
+  well-compressed footage. Dark and frozen detection are mutually exclusive per
+  camera/episode (frozen is only checked when no dark run fired) so the same incident is
+  never flagged twice.
+  Validating this on real data caught two real false-positive bugs before they shipped, both
+  found by running `--decode-video` against `masato-ka/so100_cutlery_handling_simple` (the
+  dataset this project already uses for calibration) and diffing against the same run
+  without the flag, exactly as this file asks: (1) the first version used mean squared
+  thumbnail difference on an 8x8 thumbnail, which flagged 4 of the first 5 episodes --
+  a camera positioned so the moving robot occupies only a small part of the frame makes the
+  *average* pixel change negligible over a couple of seconds even with real, confirmed motion
+  (checked directly: the `max abs diff` on the actual frames was 0.97-1.0, while the mean was
+  as low as 7e-7). Switched to the *maximum* per-block difference on a 32x32 thumbnail
+  (small moving regions still move at least one block noticeably; real validation found the
+  smallest real-motion max-diff at this resolution was 0.058, comfortably above the 0.03
+  threshold). (2) Even after that fix, one episode still false-positived: the frozen-run
+  window (coarse, only ~3 of the 20 sampled frames) happened to span an episode's
+  idle-to-moving transition, and checking the *max* speed anywhere in that window caught the
+  tail end just crossing into motion even though the window was almost entirely idle.
+  Switched `_episode_moved` to the *minimum* speed in the window, requiring motion for the
+  *entire* span, not just somewhere in it -- re-validated and the false positive was gone
+  with no loss of detection on the synthetic defect test. Final validation, after both
+  fixes: `masato-ka/so100_cutlery_handling_simple` (20 episodes, their actual downloaded
+  video files) and `aaronsu11/so100_lego` (10 episodes) both produced byte-for-byte identical
+  reports with and without `--decode-video` (mean scores 94.59 and 88.6 unchanged); re-ran
+  the full `lerobot/svla_so101_pickplace` (50 ep, v3.0, 2 cameras) validation from the
+  2026-10-27 Log entry and got the same byte-for-byte identical report (mean 97.13) and the
+  same 0 `video_freeze` flags on this clean reference dataset, confirming no regression to
+  the existing dark-run/decode-error detection. Runtime on that dataset rose from the
+  2026-10-27 baseline's 59s to 140s (`--decode-video` is opt-in and already the slow path;
+  `_thumbnail` is a vectorized `np.add.reduceat` block-reduce, not a per-cell Python loop,
+  to keep this overhead down). New `tests/test_video.py` cases: pure tests of
+  `longest_frozen_run` (partial run, too-short run, no run, a whole-clip run, and the
+  no-thumbnail fallback), an integration test with a real synthetic video frozen mid-episode
+  while the (synthetic) robot keeps moving throughout (flags `video_freeze` as an error), and
+  one with the same frozen frame placed during the episode's idle lead-in instead (stays
+  silent) -- proving the false-positive guard this whole investigation was about. All of the
+  pure tests and the moving-while-frozen integration test fail without this change (confirmed
+  via `git stash` on the implementation files); the idle-guard test passes either way by
+  design, since it's asserting the *absence* of a flag. Existing tests' "clean" synthetic
+  video fixtures (constant solid-colour frames, fine when only pixel mean/std mattered) had
+  to gain frame-to-frame variation (`_varying`, a 7-frame period chosen to not alias with
+  `decode_samples`' sampling stride) so they aren't themselves mistaken for a frozen feed by
+  the new detection -- real footage is never pixel-for-pixel static, so this is a fixture gap
+  this change exposed, not new unrelated noise.
