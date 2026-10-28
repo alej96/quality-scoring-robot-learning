@@ -28,6 +28,14 @@ def _samples(means: list[float], stds: list[float] | None = None) -> list[video_
     ]
 
 
+def _thumb_samples(values: list[float]) -> list[video_mod.FrameSample]:
+    """Samples whose thumbnail is a uniform ``value`` block, for `longest_frozen_run`."""
+    return [
+        video_mod.FrameSample(t=float(i), mean=v, std=0.0, thumb=np.full((2, 2), v))
+        for i, v in enumerate(values)
+    ]
+
+
 # -- longest_dark_run (pure, no av needed) -------------------------------------------------
 
 
@@ -52,6 +60,49 @@ def test_longest_dark_run_is_none_when_the_whole_clip_is_dark():
     # a camera dead for the whole episode is the (cheaper, metadata-only) `camera` check's
     # job; this one only looks for a *partial* run, so a fully-dark clip isn't its concern
     run = video_mod.longest_dark_run(_samples([0.01] * 10), 0.03, 0.02, min_run_frac=0.15)
+    assert run is None
+
+
+# -- longest_frozen_run (pure, no av needed) -----------------------------------------------
+
+
+def test_longest_frozen_run_finds_a_partial_mid_episode_run():
+    values = [0.2, 0.5, 0.8] * 3 + [0.6] * 4 + [0.2, 0.5, 0.8] * 3
+    run = video_mod.longest_frozen_run(
+        _thumb_samples(values), max_abs_diff_max=1e-6, min_run_frac=0.15
+    )
+    assert run == (9, 13)
+
+
+def test_longest_frozen_run_ignores_a_run_shorter_than_min_frac():
+    values = [0.2, 0.5, 0.8] * 3 + [0.6] * 2 + [0.2, 0.5, 0.8] * 3
+    run = video_mod.longest_frozen_run(
+        _thumb_samples(values), max_abs_diff_max=1e-6, min_run_frac=0.5
+    )
+    assert run is None
+
+
+def test_longest_frozen_run_is_none_for_varying_content():
+    values = [0.2, 0.5, 0.8] * 4
+    run = video_mod.longest_frozen_run(
+        _thumb_samples(values), max_abs_diff_max=1e-6, min_run_frac=0.15
+    )
+    assert run is None
+
+
+def test_longest_frozen_run_covers_a_whole_frozen_clip():
+    # unlike longest_dark_run, a run spanning the whole clip still counts: a frozen (but not
+    # dark) feed for an entire episode looks normal to the metadata-only `camera` check.
+    run = video_mod.longest_frozen_run(
+        _thumb_samples([0.6] * 10), max_abs_diff_max=1e-6, min_run_frac=0.15
+    )
+    assert run == (0, 10)
+
+
+def test_longest_frozen_run_is_none_without_thumbnails():
+    run = video_mod.longest_frozen_run(
+        _samples([0.5] * 10), max_abs_diff_max=1e-6, min_run_frac=0.15
+    )
     assert run is None
 
 
@@ -91,7 +142,7 @@ def test_resolve_v3_video_path_uses_a_custom_template():
 av = pytest.importorskip("av")
 
 
-def _write_video(path: Path, frame_values: list[int], fps: int = 10, size: int = 16) -> None:
+def _write_video(path: Path, frame_values: list[int], fps: int = 10, size: int = 64) -> None:
     """A tiny real .mp4 whose frames are solid colour `frame_values[i]` (0-255, grayscale)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     container = av.open(str(path), mode="w")
@@ -105,6 +156,18 @@ def _write_video(path: Path, frame_values: list[int], fps: int = 10, size: int =
     for packet in stream.encode():
         container.mux(packet)
     container.close()
+
+
+def _varying(value: int, n: int, amplitude: int = 12) -> list[int]:
+    """`n` frame values oscillating near `value` -- real footage is never pixel-for-pixel
+    static even when nothing of interest is happening (sensor noise, compression), so
+    "clean" test segments need some frame-to-frame variation or the new frozen-frame
+    detection in `longest_frozen_run` would mistake their deliberately-solid-colour
+    encoding for a literally frozen feed. A 7-frame period (rather than a 2-frame
+    oscillation) avoids aliasing with decode_samples' even sampling stride, which would
+    otherwise keep landing on the same phase and look constant across the sampled frames."""
+    offsets = [amplitude, -amplitude, amplitude // 2, 0, -amplitude // 2, amplitude, -amplitude]
+    return [max(0, min(255, value + offsets[i % len(offsets)])) for i in range(n)]
 
 
 def test_decode_samples_reads_a_real_video_and_finds_the_dark_run(tmp_path):
@@ -161,8 +224,10 @@ def test_video_freeze_check_fires_on_a_dark_run_and_a_decode_error_only_when_req
             ds.root, ds.video_path_template, ds.chunks_size, idx, camera
         )
 
-    _write_video(video_path(0), [220] * 30)  # clean: no defect
-    _write_video(video_path(1), [220] * 10 + [2] * 10 + [220] * 10)  # dark mid-episode
+    _write_video(video_path(0), _varying(220, 30))  # clean: no defect
+    _write_video(
+        video_path(1), _varying(220, 10) + [2] * 10 + _varying(220, 10)
+    )  # dark mid-episode
     video_path(2).parent.mkdir(parents=True, exist_ok=True)
     video_path(2).write_bytes(b"garbage, not a real video")  # fails to decode
     # episodes 3 and 4 have no video file on disk at all -- must be silently skipped
@@ -207,12 +272,56 @@ def test_video_freeze_check_on_v3_narrows_to_each_episodes_own_segment(make_data
     )
     # ep0 [0, 2s): clean. ep1 [2, 4s): clean, dark (2.5-3.4s), clean -- a partial run that
     # sits entirely in episode 1's own segment.
-    _write_video(video_path, [220] * 20 + [220] * 5 + [2] * 10 + [220] * 5, fps=10)
+    frames = _varying(220, 20) + _varying(220, 5) + [2] * 10 + _varying(220, 5)
+    _write_video(video_path, frames, fps=10)
 
     results = evaluate(load_dataset(root), Config(), decode_video=True)
 
     assert "video_freeze" not in {f.check for f in results[0].flags}
     assert "video_freeze" in {f.check for f in results[1].flags}
+
+
+def test_video_freeze_flags_a_frozen_frame_while_the_robot_keeps_moving(make_dataset):
+    # The episode never goes idle (no lead/trail padding), so a camera that stalls on one
+    # frame for 2s mid-episode while the robot keeps commanding motion is an unambiguous
+    # defect -- a dropped/duplicated frame, not a legitimately static scene.
+    specs = [EpisodeSpec(seconds=8.0, lead_idle_s=0.0, trail_idle_s=0.0, seed=2)]
+    root = make_dataset(specs, version="v2.1")
+    ds = load_dataset(root)
+    camera = "observation.images.top"
+    path = video_mod.resolve_v2_video_path(
+        ds.root, ds.video_path_template, ds.chunks_size, 0, camera
+    )
+    # 10 fps over the episode's 8s: [0, 2s) moving, [2, 4s) frozen, [4, 8s) moving.
+    frames = _varying(220, 20) + [150] * 20 + _varying(220, 40)
+    _write_video(path, frames, fps=10)
+
+    results = evaluate(load_dataset(root), Config(), decode_video=True)
+
+    flags = [f for f in results[0].flags if f.check == "video_freeze"]
+    assert flags, "a frame frozen while the robot keeps moving must be flagged"
+    assert flags[0].severity == "error"
+    assert "while the robot kept moving" in flags[0].message
+
+
+def test_video_freeze_does_not_flag_a_frozen_frame_during_genuine_idle_time(make_dataset):
+    # A camera that happens to encode a static scene identically frame-to-frame during the
+    # episode's own idle lead-in is indistinguishable from a fine, boring clip -- it must
+    # not be flagged, or every ordinary idle demo with efficient video compression would be.
+    specs = [EpisodeSpec(seconds=8.0, lead_idle_s=3.0, trail_idle_s=0.0, seed=1)]
+    root = make_dataset(specs, version="v2.1")
+    ds = load_dataset(root)
+    camera = "observation.images.top"
+    path = video_mod.resolve_v2_video_path(
+        ds.root, ds.video_path_template, ds.chunks_size, 0, camera
+    )
+    # 10 fps over the episode's 8s: [0, 3s) frozen (matches the idle lead-in), [3, 8s) moving.
+    frames = [220] * 30 + _varying(220, 50)
+    _write_video(path, frames, fps=10)
+
+    results = evaluate(load_dataset(root), Config(), decode_video=True)
+
+    assert "video_freeze" not in {f.check for f in results[0].flags}
 
 
 def test_video_freeze_skips_an_episode_the_camera_check_already_flagged(make_dataset):
