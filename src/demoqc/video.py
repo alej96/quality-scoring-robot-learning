@@ -33,6 +33,27 @@ class FrameSample:
     t: float
     mean: float  # pixel mean, 0-1 scale
     std: float  # pixel std, 0-1 scale
+    # small block-averaged thumbnail, for frame-to-frame diffing (longest_frozen_run);
+    # None for samples built without a real decoded frame (e.g. in tests of the pure
+    # mean/std-based longest_dark_run).
+    thumb: np.ndarray | None = None
+
+
+def _thumbnail(arr: np.ndarray, size: int = 32) -> np.ndarray:
+    """Block-averaged ``size`` x ``size`` downsample of a grayscale frame, small and cheap
+    enough to hold one per sampled frame and diff frame-to-frame.
+
+    ``size`` needs to be large enough that a small, localised change (a robot arm that
+    occupies a corner of a wide shot) still moves at least one block's average
+    noticeably -- real validation against a public dataset found that an 8x8 thumbnail
+    diluted real motion below the noise floor of a genuinely frozen frame; 32x32 keeps
+    each block small enough to still catch it without comparing full-resolution frames.
+    """
+    h, w = arr.shape
+    ys = np.linspace(0, h, size + 1).astype(int)
+    xs = np.linspace(0, w, size + 1).astype(int)
+    row_sums = np.add.reduceat(arr, ys[:-1], axis=0) / np.diff(ys)[:, None]
+    return np.add.reduceat(row_sums, xs[:-1], axis=1) / np.diff(xs)[None, :]
 
 
 def is_available() -> bool:
@@ -93,7 +114,9 @@ def decode_samples(
                     if t >= end_s:
                         break
                     arr = frame.to_ndarray(format="gray").astype(np.float64) / 255.0
-                    in_range.append(FrameSample(t, float(arr.mean()), float(arr.std())))
+                    in_range.append(
+                        FrameSample(t, float(arr.mean()), float(arr.std()), _thumbnail(arr))
+                    )
                 if len(in_range) <= max_samples:
                     return in_range
                 positions = np.linspace(0, len(in_range) - 1, max_samples)
@@ -107,7 +130,7 @@ def decode_samples(
                     continue
                 arr = frame.to_ndarray(format="gray").astype(np.float64) / 255.0
                 t = float(frame.time) if frame.time is not None else i / fps
-                out.append(FrameSample(t, float(arr.mean()), float(arr.std())))
+                out.append(FrameSample(t, float(arr.mean()), float(arr.std()), _thumbnail(arr)))
                 if len(out) >= max_samples:
                     break
             return out
@@ -139,3 +162,47 @@ def longest_dark_run(
     if best is None or (best[1] - best[0]) / len(samples) < min_run_frac:
         return None
     return best
+
+
+def longest_frozen_run(
+    samples: list[FrameSample], max_abs_diff_max: float, min_run_frac: float
+) -> tuple[int, int] | None:
+    """Index range ``[start, end)`` of the longest run of consecutive samples that are
+    pixel-for-pixel identical (largest per-block thumbnail difference <=
+    ``max_abs_diff_max``): a camera or recorder that stalled and kept emitting the same
+    frame, as opposed to the near-black feed ``longest_dark_run`` looks for. Unlike that
+    function, a run spanning the *whole* clip still counts -- a frozen (but not dark) feed
+    for an entire episode has normal-looking pixel mean/std and so isn't caught by the
+    metadata-only ``camera`` check.
+
+    Uses the *maximum* per-block difference, not the mean: real robot motion that occupies
+    only a small part of the frame (a distant or wide-angle camera) can average out to a
+    tiny *mean* thumbnail difference over a couple of seconds even though it clearly moved
+    somewhere in frame, which the mean alone can't tell apart from an actually frozen feed.
+
+    ``None`` if fewer than two samples have a thumbnail, no pair is near-identical, or the
+    longest such run doesn't cover at least ``min_run_frac`` of the samples.
+    """
+    if len(samples) < 2 or any(s.thumb is None for s in samples):
+        return None
+    same = [
+        float(np.max(np.abs(samples[i].thumb - samples[i + 1].thumb))) <= max_abs_diff_max
+        for i in range(len(samples) - 1)
+    ]
+    if not any(same):
+        return None
+    best: tuple[int, int] | None = None
+    start = None
+    for i, d in enumerate([*same, False]):
+        if d and start is None:
+            start = i
+        elif not d and start is not None:
+            if best is None or i - start > best[1] - best[0]:
+                best = (start, i)
+            start = None
+    if best is None:
+        return None
+    run = (best[0], best[1] + 1)  # best spans adjacent-pair indices; +1 sample to include both ends
+    if (run[1] - run[0]) / len(samples) < min_run_frac:
+        return None
+    return run

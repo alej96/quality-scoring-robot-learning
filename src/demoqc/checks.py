@@ -66,6 +66,7 @@ class Config:
     camera_dark_std_max: float = 0.02  # pixel std below this means almost no variation either
     video_decode_max_samples: int = 20  # frames sampled per camera when --decode-video is used
     video_dark_run_min_frac: float = 0.15  # fraction of sampled frames that must be dark to flag
+    video_freeze_max_abs_diff: float = 0.03  # largest per-block thumbnail diff (0-1) still "frozen"
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -361,6 +362,48 @@ def check_video_freeze(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episo
                     20.0,
                 )
             )
+            continue
+        # A frozen-but-not-dark feed (stalled camera/recorder repeating the last frame) looks
+        # just like a legitimately static scene -- e.g. the lead/trail idle time every episode
+        # has -- unless the robot was actually moving while it happened. Only flag that case;
+        # a frozen clip during real idle time isn't distinguishable from a fine, boring one.
+        frozen = video.longest_frozen_run(
+            samples, cfg.video_freeze_max_abs_diff, cfg.video_dark_run_min_frac
+        )
+        if frozen is not None:
+            start_t, end_t = samples[frozen[0]].t, samples[frozen[1] - 1].t
+            base = time_range[0] if time_range is not None else 0.0
+            if _episode_moved(ep, ctx, start_t - base, end_t - base):
+                out.flags.append(
+                    Flag(
+                        "video_freeze",
+                        ERROR,
+                        f"{camera}: frozen (no change) from ~{start_t:.1f}s to ~{end_t:.1f}s "
+                        "while the robot kept moving (dropped frames or a stalled feed?)",
+                        35.0,
+                    )
+                )
+
+
+def _episode_moved(ep: Episode, ctx: DatasetContext, start_s: float, end_s: float) -> bool:
+    """Whether the commanded action shows real motion for the *entire* ``[start_s, end_s)``
+    window of ``ep`` (episode-relative seconds) -- the same "clearly moving" bar
+    ``check_staleness`` uses, so a frozen camera during genuine idle time (common and
+    harmless) isn't confused with one that stalled while the robot kept going (a real,
+    missed-frame defect). Requires the *minimum* speed in the window, not just its max:
+    a frozen-frame window is coarse (only a handful of sampled frames, seconds apart), and
+    real validation found one spanning an episode's idle-to-moving transition -- almost
+    entirely idle, but with the tail end just over the "moving" bar -- flagged by a max-based
+    check even though the camera wasn't frozen while the robot was actually moving.
+    """
+    if ep.action is None or ctx.action_scale is None or ep.length < 3:
+        return False
+    speed = _speed(ep.action, ctx.action_scale, ctx.fps)
+    lo = max(0, int(start_s * ctx.fps))
+    hi = min(len(speed), int(end_s * ctx.fps) + 1)
+    if hi <= lo:
+        return False
+    return bool(np.min(speed[lo:hi]) > max(ctx.idle_speed, 1e-9) * 5)
 
 
 def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
