@@ -44,7 +44,12 @@ def _trimmed_action(ep: Episode, result: EpisodeResult) -> np.ndarray | None:
         return None
     start, end = result.trim if result.trim else (0, ep.length)
     seg = ep.action[start:end]
-    return seg if len(seg) >= 2 else None
+    if len(seg) < 2 or not np.isfinite(seg).all():
+        # a corrupted (NaN/Inf) episode is already flagged by check_integrity; comparing
+        # its trajectory would propagate NaN into np.interp (see _resample) and corrupt
+        # that one row of the pairwise distance matrix rather than just excluding it
+        return None
+    return seg
 
 
 def _resample(traj: np.ndarray, n: int) -> np.ndarray:

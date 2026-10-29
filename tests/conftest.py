@@ -30,6 +30,9 @@ class EpisodeSpec:
     state_decorrelated: bool = False  # state is unrelated motion, not a delayed copy of action
     gripper_chatter_at: tuple[int, int] | None = None  # [start, end) frames of rapid toggling
     camera_dead: bool = False  # the episode's camera stats are near-black (disconnected?)
+    nan_action_at: list[int] = field(default_factory=list)  # frames with NaN in action[dim 0]
+    nan_state_at: list[int] = field(default_factory=list)  # frames with NaN in state[dim 0]
+    nan_gripper_at: list[int] = field(default_factory=list)  # frames with NaN in action[gripper]
     seed: int = 0
 
 
@@ -68,6 +71,12 @@ def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     if spec.stale_state_from:
         s, e = spec.stale_state_from
         state[s:e] = state[s - 1]
+    for i in spec.nan_action_at:
+        action[i, 0] = np.nan
+    for i in spec.nan_state_at:
+        state[i, 0] = np.nan
+    for i in spec.nan_gripper_at:
+        action[i, GRIPPER_DIM] = np.nan
 
     n = len(action)
     timestamps = np.arange(n) / FPS
