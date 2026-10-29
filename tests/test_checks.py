@@ -207,3 +207,42 @@ def test_gripper_chatter(make_dataset):
     assert results[3].metrics["gripper_toggles_per_window"] >= 4
     assert "gripper_chatter" in _checks(results[3])
     assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
+
+
+def test_integrity_flags_nonfinite_action(make_dataset):
+    # a sensor glitch or corrupted write leaves a NaN in one frame's action
+    specs = clean_specs()
+    specs[5] = EpisodeSpec(nan_action_at=[50], seed=5)
+    results = _results(make_dataset, specs)
+
+    flags = [f for f in results[5].flags if f.check == "integrity"]
+    assert len(flags) == 1
+    assert flags[0].severity == "error"
+    assert "action" in flags[0].message
+    assert all("integrity" not in _checks(r) for i, r in enumerate(results) if i != 5)
+
+
+def test_integrity_flags_nonfinite_state(make_dataset):
+    specs = clean_specs()
+    specs[2] = EpisodeSpec(nan_state_at=[30, 31], seed=2)
+    results = _results(make_dataset, specs)
+
+    flags = [f for f in results[2].flags if f.check == "integrity"]
+    assert len(flags) == 1
+    assert "observation.state" in flags[0].message
+    assert all("integrity" not in _checks(r) for i, r in enumerate(results) if i != 2)
+
+
+def test_nan_in_one_episode_does_not_disable_checks_on_others(make_dataset):
+    # DatasetContext.build used to compute action_scale with plain np.percentile/.std,
+    # which propagate NaN across an entire column: a single bad frame in one episode's
+    # gripper dim silently set action_scale[gripper] to NaN for the *whole dataset*,
+    # disabling gripper_chatter (which requires a finite scale) on every episode, not
+    # just the corrupted one.
+    specs = clean_specs()
+    specs[0] = EpisodeSpec(nan_gripper_at=[50], seed=0)
+    specs[3] = EpisodeSpec(gripper_chatter_at=(100, 115), seed=3)
+    results = _results(make_dataset, specs)
+
+    assert "integrity" in _checks(results[0])
+    assert "gripper_chatter" in _checks(results[3])

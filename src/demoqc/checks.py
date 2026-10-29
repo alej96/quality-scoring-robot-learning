@@ -178,9 +178,14 @@ class DatasetContext:
         if not actions:
             return cls(ds.fps, None, None, 0.0, gripper_dims, sync_dims, **video_ctx)
         allA = np.concatenate(actions)
-        q75, q25 = np.percentile(allA, [75, 25], axis=0)
+        # nan-aware: a single non-finite value (sensor glitch, corrupted write) in one
+        # episode must not poison the scale for every other episode in the dataset. A
+        # plain np.percentile/.std propagates NaN across the *whole* column it appears in,
+        # which would silently disable idle/smoothness/gripper_chatter on that dimension
+        # dataset-wide instead of only on the one corrupted episode (see check_integrity).
+        q75, q25 = np.nanpercentile(allA, [75, 25], axis=0)
         scale = (q75 - q25) / 1.349
-        std = allA.std(axis=0)
+        std = np.nanstd(allA, axis=0)
         scale = np.where(scale > 1e-9, scale, std)
         scale = np.where(scale > 1e-9, scale, np.nan)  # constant dims are ignored
         steps = np.concatenate([np.abs(np.diff(a, axis=0)) / scale for a in actions])
@@ -268,6 +273,25 @@ def check_metadata(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeRe
                 f"metadata says {ep.meta_length} frames, data has {ep.length}",
                 20,
             )
+        )
+
+
+def check_integrity(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
+    """Non-finite (NaN/Inf) value(s) in ``action`` or ``observation.state``: a corrupted
+    write or sensor glitch. Every other check's thresholds come from robust statistics
+    computed across the whole dataset (``DatasetContext.build``); without this check, a
+    single bad frame in one episode is invisible on its own (``nanmean``/``nanpercentile``
+    elsewhere just quietly drop it), yet the episode itself is unusable for training as-is."""
+    bad = []
+    for name, arr in (("action", ep.action), ("observation.state", ep.state)):
+        if arr is None or arr.size == 0:
+            continue
+        n_bad = int((~np.isfinite(arr)).any(axis=1).sum())
+        if n_bad:
+            bad.append(f"{name} ({n_bad} frame(s))")
+    if bad:
+        out.flags.append(
+            Flag("integrity", ERROR, "non-finite (NaN/Inf) value(s) in " + ", ".join(bad), 60.0)
         )
 
 
@@ -735,6 +759,7 @@ def _active_s(r: EpisodeResult) -> float:
 EPISODE_CHECKS = [
     ("timing", check_timing),
     ("metadata", check_metadata),
+    ("integrity", check_integrity),
     ("video_sync", check_video_sync),
     ("camera", check_camera),
     ("video_freeze", check_video_freeze),
