@@ -129,6 +129,7 @@ export, or it will run longer than the now-trimmed data.
 |---|---|---|
 | `timing` | dropped frames, non-monotonic or missing timestamps | timestamp gaps vs `1/fps`, `frame_index` continuity |
 | `metadata` | episode length in metadata ≠ frames in data | `meta/episodes` vs data |
+| `integrity` | corrupted write or sensor glitch: NaN/Inf in `action` or `observation.state` | non-finite values per episode |
 | `video_sync` | video segment duration ≠ data duration (v3.0) | `videos/*/from_timestamp`, `to_timestamp` |
 | `camera` | a camera near-black for a whole episode (disconnected, lens cap) | per-episode pixel mean/std LeRobot already writes to its metadata; no video is ever opened |
 | `video_freeze` | a camera going black, freezing on one frame while the robot moves, or a video file failing to decode, partway through an episode | decode sampled frames and look for a partial near-black run, a near-identical run of frames during commanded motion, or a decode error; opt-in (`--decode-video`), see below |
@@ -176,8 +177,8 @@ is intentionally similar), pass `--disable-check NAME` to `demoqc score` once pe
 demoqc score user/dataset --disable-check gripper_chatter --disable-check sync
 ```
 
-Valid names are `timing`, `metadata`, `video_sync`, `camera`, `video_freeze`, `idle`,
-`smoothness`, `stale_state`, `sync`, `gripper_chatter`, `length` and `duplicate`; an
+Valid names are `timing`, `metadata`, `integrity`, `video_sync`, `camera`, `video_freeze`,
+`idle`, `smoothness`, `stale_state`, `sync`, `gripper_chatter`, `length` and `duplicate`; an
 unknown name is rejected up front.
 Disabling a check removes both its flags and its metrics from the report, and (for
 `duplicate`) skips `duplicate_groups` and the duplicate-detection pass entirely.
