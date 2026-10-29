@@ -155,6 +155,36 @@ Work top-down through **Next up**. Each item should ship in one focused session
       datasets (e.g. filtering `list_datasets(filter="LeRobot", sort="downloads")` by
       dataset size or episode count rather than a hand-picked list) is still open.
 
+- [x] **Data-integrity check (NaN/Inf in `action`/`observation.state`).** Found while
+      reviewing `checks.py` for the daily session: `DatasetContext.build` computed the
+      dataset-wide `action_scale` (and `step_p99`) with plain `np.percentile`/`.std`, which
+      propagate `NaN` across an *entire column* when even one value in it is non-finite.
+      A single corrupted frame in one episode's `action` (a sensor glitch or a partial,
+      corrupted write) therefore silently set that whole dimension's scale to `NaN` for
+      *every* episode in the dataset, not just the bad one -- disabling `idle`,
+      `smoothness` (spike/jump detection on that dim) and, worst, `gripper_chatter`
+      (which requires a finite scale and only ever watches one or two gripper dims, so one
+      bad frame anywhere in the dataset's gripper column could blind that check dataset-wide)
+      with no visible symptom pointing at the actual cause. Fixed `DatasetContext.build` to
+      use `np.nanpercentile`/`np.nanstd`, and added the `integrity` check, which flags the
+      actual corrupted episode (ERROR, "non-finite (NaN/Inf) value(s) in action/
+      observation.state") so the defect is visible on its own instead of only as collateral
+      damage elsewhere. Also made `dedupe._trimmed_action` skip a non-finite trajectory
+      instead of feeding `NaN` into `np.interp` and corrupting that episode's row of the
+      near-duplicate distance matrix. New tests in `tests/test_checks.py`: `integrity` fires
+      on an injected NaN in `action` and separately in `observation.state` (and stays silent
+      on every other episode), plus a regression test that reproduces the exact scenario
+      above (one episode with a NaN in its gripper dim, another with a real
+      `gripper_chatter` defect) and confirms `gripper_chatter` still fires on the second
+      episode; all three fail without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py`). Validated on real data: `lerobot/svla_so101_pickplace` (50 ep,
+      mean 97.1), `aaronsu11/so100_lego` (100 ep, mean 92.2) and `shylee/so100_cube` (200 ep,
+      mean 99.2) all reproduced their existing validated scores and flag counts exactly, with
+      zero `integrity` flags on any of them -- `nanpercentile`/`nanstd` are mathematically
+      identical to `percentile`/`.std` when there's nothing non-finite to ignore, so this is
+      a no-op on real, clean data and only changes behavior when a dataset is actually
+      corrupted.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -639,3 +669,22 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `decode_samples`' sampling stride) so they aren't themselves mistaken for a frozen feed by
   the new detection -- real footage is never pixel-for-pixel static, so this is a fixture gap
   this change exposed, not new unrelated noise.
+- 2026-10-29: Added the **`integrity` check** and fixed a real silent-corruption bug found
+  while reviewing `checks.py` (the "Data-integrity check" item above). `DatasetContext.build`
+  used plain `np.percentile`/`.std` to compute the dataset-wide `action_scale`; both
+  propagate `NaN` across an entire column when even one value in it is non-finite, so a
+  single corrupted frame in one episode's `action` (sensor glitch, truncated write) silently
+  set that whole dimension's scale to `NaN` for *every other* episode too, not just the bad
+  one -- quietly disabling `idle`/`smoothness` on that dimension and, worst, `gripper_chatter`
+  (needs a finite scale, watches only one or two dims) dataset-wide, with nothing in the
+  report pointing at why. Switched to `np.nanpercentile`/`np.nanstd` and added `integrity`
+  (flags the actual corrupted episode: ERROR, non-finite value count per stream) so the real
+  defect is visible on its own rather than only as unexplained collateral damage elsewhere;
+  also made `dedupe._trimmed_action` skip a non-finite trajectory instead of feeding `NaN`
+  into `np.interp`. New `tests/test_checks.py` cases (`integrity` on an injected NaN in
+  `action`, separately in `observation.state`, plus a regression test reproducing the exact
+  cross-episode `gripper_chatter` blinding above) all fail without this change (confirmed via
+  `git stash` on `src/demoqc/checks.py`). Validated on real data: `lerobot/svla_so101_pickplace`
+  (50 ep), `aaronsu11/so100_lego` (100 ep) and `shylee/so100_cube` (200 ep) all reproduced
+  their existing validated mean scores and flag counts exactly (97.1 / 92.2 / 99.2) with zero
+  `integrity` flags, confirming this is a no-op on real, clean data.
