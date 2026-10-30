@@ -33,6 +33,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
       undercounted the actual memory use by ~2-3 orders of magnitude -- see the Log entry.
       DTW and a chunked/approximate search for datasets beyond what the (n, n) distance
       matrix itself can hold are still open.
+      Follow-up (resolved 2026-10-30): the second half -- the (n, n) distance matrix itself
+      no longer fitting in memory at a large enough episode count -- is fixed; see the Log
+      entry. DTW (for duplicates recorded at different speeds beyond what resampling
+      absorbs) is still open.
 - [x] **Export a cleaned dataset (slice 1): `demoqc export --keep-from report.json`.**
       Write a filtered LeRobot v3.0 dataset (tabular data and meta only): drop rejected
       episodes, re-index episodes and frames, recompute `meta/info.json` totals and
@@ -688,3 +692,31 @@ Work top-down through **Next up**. Each item should ship in one focused session
   (50 ep), `aaronsu11/so100_lego` (100 ep) and `shylee/so100_cube` (200 ep) all reproduced
   their existing validated mean scores and flag counts exactly (97.1 / 92.2 / 99.2) with zero
   `integrity` flags, confirming this is a no-op on real, clean data.
+- 2026-10-30: Bounded `find_duplicates`' peak memory to a small constant instead of O(n^2) in
+  episode count (the `duplicate` check's last open follow-up from 2026-10-25: that fix removed
+  the O(n^2*D) broadcast intermediate but still built the full (n, n) distance matrix itself,
+  which becomes the actual ceiling at a large enough episode count -- exactly the datasets this
+  tool's own `--episodes`/`--max-episodes` support exists for). `HF_TOKEN` is still unset in
+  this environment (confirmed via `HfApi().whoami()` raising `LocalTokenNotFoundError`, same as
+  every prior run), so `push-report` stays blocked for the same reason as every earlier Log
+  entry. `src/demoqc/dedupe.py` now has `_nearest_neighbor_distances`/`_pairs_within`, which
+  compute the same Gram-matrix identity `_pairwise_mean_sq_l2` uses but one row block at a time
+  (`_block_rows_for` sizes the block so each block's (block_rows, n) slab stays under a fixed
+  element cap, so memory no longer grows with n at all); `find_duplicates` now calls these
+  instead of building the full matrix, and only runs the O(n^2) `_pairwise_mean_sq_l2` on a
+  single duplicate group's own (always small) rows, to get that group's max pairwise distance.
+  This also replaces the old nested *Python* double loop (`for i: for j in range(i+1, n)`) that
+  scanned the full matrix for pairs under threshold with a per-row-block vectorized scan, so
+  it's faster as well as smaller, not just a memory/speed tradeoff. New tests in
+  `tests/test_dedupe.py`: `_nearest_neighbor_distances`/`_pairs_within` exactly match a
+  brute-force scan of the full `_pairwise_mean_sq_l2` matrix across block sizes smaller than,
+  around, and far above `n*n` (so the blocking never changes the result, including at block
+  boundaries); a `tracemalloc` test with a forced tiny block cap confirms peak memory for a
+  2000-episode matrix stays under 4 MB against the 32 MB the full (n, n) matrix alone would
+  need. All fail without this change (confirmed via `git stash` on just `src/demoqc/dedupe.py`
+  -- `ImportError` on the new names). Validated on all 4 real datasets in the existing
+  validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`): ran `demoqc score --json` before and after this
+  change (via `git stash` on just `dedupe.py`) and diffed the two JSON reports for all four --
+  byte-for-byte identical, including `duplicate_groups` (empty on all 4, as in every earlier
+  validation run), confirming the blocking changed no output, only how it's computed.
