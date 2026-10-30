@@ -4,7 +4,13 @@ import numpy as np
 
 from demoqc.checks import Config, DatasetContext, evaluate
 from demoqc.dataset import load_dataset
-from demoqc.dedupe import _pairwise_mean_sq_l2, find_duplicates, flag_duplicates
+from demoqc.dedupe import (
+    _nearest_neighbor_distances,
+    _pairs_within,
+    _pairwise_mean_sq_l2,
+    find_duplicates,
+    flag_duplicates,
+)
 from tests.conftest import EpisodeSpec, clean_specs
 
 
@@ -90,3 +96,51 @@ def test_pairwise_mean_sq_l2_does_not_materialize_an_n_by_n_by_d_tensor():
         tracemalloc.stop()
 
     assert peak < 20 * 1024 * 1024  # a naive broadcast would need ~206 MB here
+
+
+def test_nearest_neighbor_distances_matches_full_matrix_min():
+    # _nearest_neighbor_distances must agree with taking dist.min(axis=1) (self excluded)
+    # on the full _pairwise_mean_sq_l2 matrix, whatever block size it's forced to use.
+    rng = np.random.default_rng(1)
+    mat = rng.normal(size=(37, 11))
+    full = _pairwise_mean_sq_l2(mat)
+    np.fill_diagonal(full, np.inf)
+    expected = full.min(axis=1)
+
+    for max_block_elems in (5, 50, 1_000_000):  # smaller than, around, and far above n*n
+        got = _nearest_neighbor_distances(mat, max_block_elems=max_block_elems)
+        np.testing.assert_allclose(got, expected, atol=1e-8)
+
+
+def test_pairs_within_matches_full_matrix_threshold_scan():
+    rng = np.random.default_rng(2)
+    mat = rng.normal(size=(37, 11))
+    full = _pairwise_mean_sq_l2(mat)
+    threshold = float(np.median(full[np.triu_indices(len(mat), k=1)]))
+    expected = {
+        (i, j) for i in range(len(mat)) for j in range(i + 1, len(mat)) if full[i, j] <= threshold
+    }
+
+    for max_block_elems in (5, 50, 1_000_000):
+        got = set(_pairs_within(mat, threshold, max_block_elems=max_block_elems))
+        assert got == expected
+
+
+def test_nearest_neighbor_distances_bounds_memory_below_full_n_by_n_matrix():
+    # At n=2000 the full (n, n) distance matrix this replaced is 2000*2000*8 bytes = 32 MB;
+    # a dataset large enough for this to matter (the scenario the roadmap's "chunked search
+    # for datasets beyond what the (n, n) distance matrix itself can hold" follow-up is
+    # about) makes that the actual memory ceiling, not the O(n*D) intermediate the
+    # 2026-10-25 fix addressed. A tiny block cap here stands in for that scenario without
+    # actually needing a huge n in the test.
+    rng = np.random.default_rng(3)
+    mat = rng.normal(size=(2000, 5))
+
+    tracemalloc.start()
+    try:
+        _nearest_neighbor_distances(mat, max_block_elems=20_000)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 4 * 1024 * 1024  # the full (n, n) matrix alone would be 32 MB

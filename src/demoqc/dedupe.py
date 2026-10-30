@@ -69,12 +69,76 @@ def _pairwise_mean_sq_l2(mat: np.ndarray) -> np.ndarray:
     this check can handle in memory -- not the (n, n) distance matrix itself. Uses
     ``||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b``, computed with one BLAS matrix multiply, so
     peak memory is O(n^2 + n*D) instead of O(n^2*D).
+
+    Only used on a single duplicate group's rows (always small): the full-dataset search
+    in ``find_duplicates`` uses the row-blocked helpers below instead, which never hold the
+    whole (n, n) matrix either.
     """
     sq_norms = np.sum(mat * mat, axis=1)
     gram = mat @ mat.T
     sq_dist = sq_norms[:, None] + sq_norms[None, :] - 2.0 * gram
     np.maximum(sq_dist, 0.0, out=sq_dist)  # clip tiny negative values from float error
     return np.sqrt(sq_dist / mat.shape[1])
+
+
+# Each row block computes a (block_rows, n) distance slab; capping its element count bounds
+# peak memory to a small constant instead of growing with n^2. 2_000_000 float64 elements is
+# 16 MB, negligible next to everything else `score`/`dedupe` already holds in memory.
+_DEDUPE_MAX_BLOCK_ELEMS = 2_000_000
+
+
+def _block_rows_for(n: int, max_block_elems: int) -> int:
+    return max(1, min(n, max_block_elems // max(n, 1)))
+
+
+def _row_block_distances(mat: np.ndarray, sq_norms: np.ndarray, start: int, end: int) -> np.ndarray:
+    """Distances from rows ``[start, end)`` of ``mat`` to every row of ``mat``, via the same
+    Gram-matrix identity ``_pairwise_mean_sq_l2`` uses, without ever forming the full (n, n)
+    matrix -- only this (end - start, n) slab."""
+    gram = mat[start:end] @ mat.T
+    sq_dist = sq_norms[start:end, None] + sq_norms[None, :] - 2.0 * gram
+    np.maximum(sq_dist, 0.0, out=sq_dist)
+    return np.sqrt(sq_dist / mat.shape[1])
+
+
+def _nearest_neighbor_distances(
+    mat: np.ndarray, max_block_elems: int = _DEDUPE_MAX_BLOCK_ELEMS
+) -> np.ndarray:
+    """Per-row nearest-neighbour distance (excluding self), one row block at a time so peak
+    memory is O(block_rows * n) instead of ``_pairwise_mean_sq_l2``'s O(n^2) -- the dedupe
+    check's own follow-up: at a dataset size large enough for this tool's ``--episodes``
+    support to matter, even the (n, n) *result* (not just the O(n^2*D) intermediate the
+    2026-10-25 fix removed) no longer fits in memory."""
+    n = len(mat)
+    sq_norms = np.sum(mat * mat, axis=1)
+    block_rows = _block_rows_for(n, max_block_elems)
+    nn = np.empty(n)
+    for start in range(0, n, block_rows):
+        end = min(start + block_rows, n)
+        dist = _row_block_distances(mat, sq_norms, start, end)
+        local = np.arange(end - start)
+        dist[local, start + local] = np.inf  # exclude self
+        nn[start:end] = dist.min(axis=1)
+    return nn
+
+
+def _pairs_within(
+    mat: np.ndarray, threshold: float, max_block_elems: int = _DEDUPE_MAX_BLOCK_ELEMS
+) -> list[tuple[int, int]]:
+    """``(i, j)`` row-index pairs with ``i < j`` and distance ``<= threshold``, same memory
+    bound as ``_nearest_neighbor_distances``. Duplicate pairs are rare, so this is a small
+    list even for a huge ``mat``."""
+    n = len(mat)
+    sq_norms = np.sum(mat * mat, axis=1)
+    block_rows = _block_rows_for(n, max_block_elems)
+    pairs: list[tuple[int, int]] = []
+    for start in range(0, n, block_rows):
+        end = min(start + block_rows, n)
+        dist = _row_block_distances(mat, sq_norms, start, end)
+        for local_i, i in enumerate(range(start, end)):
+            hits = np.flatnonzero(dist[local_i, i + 1 :] <= threshold)
+            pairs.extend((i, int(j) + i + 1) for j in hits)
+    return pairs
 
 
 class _UnionFind:
@@ -131,9 +195,7 @@ def find_duplicates(
         return groups
 
     mat = np.stack(vectors)
-    dist = _pairwise_mean_sq_l2(mat)
-    np.fill_diagonal(dist, np.inf)
-    nn = dist.min(axis=1)
+    nn = _nearest_neighbor_distances(mat)
     median = float(np.median(nn))
     mad = float(np.median(np.abs(nn - median))) * 1.4826
     if mad < 1e-9:
@@ -141,18 +203,17 @@ def find_duplicates(
     threshold = max(0.0, median - cfg.dedupe_z * mad)
 
     uf = _UnionFind(indices)
-    n = len(indices)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if dist[i, j] <= threshold:
-                uf.union(indices[i], indices[j])
+    for i, j in _pairs_within(mat, threshold):
+        uf.union(indices[i], indices[j])
 
     pos = {idx: i for i, idx in enumerate(indices)}
     for members in uf.groups().values():
         if len(members) < 2:
             continue
         rows = [pos[m] for m in members]
-        sub = dist[np.ix_(rows, rows)]
+        # a duplicate group is always small, so the O(n^2) _pairwise_mean_sq_l2 here is on
+        # the group's own rows only, never on the full (potentially huge) `mat`.
+        sub = _pairwise_mean_sq_l2(mat[rows])
         max_d = float(sub[np.triu_indices(len(rows), k=1)].max())
         groups.append(DuplicateGroup(sorted(members), "near", round(max_d, 4)))
 
