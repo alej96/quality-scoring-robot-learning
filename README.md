@@ -28,6 +28,10 @@ demoqc score user/dataset --fail-under 85   # non-zero exit for CI gates
 demoqc score user/dataset --md report.md    # Markdown summary for a dataset card or PR
 demoqc dedupe user/dataset --json dupes.json  # exact and near-duplicate episodes
 
+# score user/dataset and open a Hub PR on it with the report (needs a write token)
+demoqc push-report user/dataset
+demoqc push-report user/dataset --dry-run -o ./preview  # write the files locally instead
+
 # write a cleaned copy (LeRobot v3.0) without the episodes below --min-score
 demoqc score user/dataset --json report.json --min-score 80
 demoqc export user/dataset --keep-from report.json -o ./clean_dataset
@@ -148,6 +152,27 @@ trimmable idle) cost little because they can be fixed automatically.
 except the lowest-indexed (kept) one. `demoqc dedupe <source>` runs duplicate detection on
 its own and prints the groups (`--json` writes them out).
 
+## Pushing a report to the Hub
+
+`demoqc push-report <repo_id>` scores a Hub dataset and opens a pull request on its own
+repo (`create_pr=True`, so nothing lands on the default branch without the owner's review)
+adding `demoqc/report.json` and `demoqc/report.md` to it, so a dataset owner gets actionable
+quality feedback without installing or running `demoqc` themselves. The PR description
+includes a shields.io score badge (green ≥90, yellow ≥70, red below) linking to the uploaded
+`report.md`, ready to paste into the repo's `README.md`:
+
+```bash
+demoqc push-report user/dataset                 # score at defaults and open the PR
+demoqc push-report user/dataset --min-score 80 --token hf_...
+demoqc push-report user/dataset --dry-run -o ./preview  # write demoqc/report.{json,md} locally
+```
+
+It takes the same `--config`, `--disable-check`, `--episodes`/`--max-episodes` and
+`--min-score` options as `demoqc score`. Opening the PR needs a token with write access to
+`repo_id` (`HF_TOKEN`, a cached `huggingface-cli login`, or `--token`); `--dry-run` writes
+the same two files to `--output` instead, to preview the report (or run in an environment
+with no write access) without touching the Hub at all.
+
 ## Configurable thresholds
 
 Every threshold and penalty is a field of `demoqc.checks.Config`
@@ -185,7 +210,7 @@ Disabling a check removes both its flags and its metrics from the report, and (f
 
 ## Scoring a subset of episodes
 
-`demoqc score`, `demoqc dedupe` and `demoqc export` take `--episodes SPEC` (e.g. `0-99` or
+`demoqc score`, `demoqc dedupe`, `demoqc export` and `demoqc push-report` take `--episodes SPEC` (e.g. `0-99` or
 `5,10,20-30`, comma-separated indices and/or ranges) and `--max-episodes N` to load only some
 of a dataset's episodes, for trying the tool on a huge dataset (DROID-scale and up) without
 loading all of it:
