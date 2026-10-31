@@ -18,6 +18,7 @@ from demoqc.export import (
     trim_from_report,
     trim_from_report_dict,
 )
+from demoqc.push import push_report
 from demoqc.report import build_report, format_markdown, format_summary, write_csv, write_json
 
 
@@ -192,6 +193,57 @@ def _parser() -> argparse.ArgumentParser:
         help="symlink (instead of copy) the source's video files into the export, saving disk "
         "space; local sources only, and the export then depends on the source staying in place",
     )
+
+    push = sub.add_parser(
+        "push-report",
+        help="score a dataset and upload the report to its Hub repo as a pull request",
+        description="Score a Hub dataset and open a pull request on its own repo "
+        "(create_pr=True, so nothing lands on the default branch unreviewed) adding "
+        "demoqc/report.json and demoqc/report.md, plus a dataset-card badge snippet in the "
+        "PR description. Needs a token with write access to the repo (HF_TOKEN, a cached "
+        "`huggingface-cli login`, or --token).",
+    )
+    push.add_argument("source", metavar="repo_id", help="Hub dataset repo id, e.g. user/dataset")
+    push.add_argument("--revision", help="Hub branch, tag or commit to score and base the PR on")
+    _add_episode_args(push)
+    push.add_argument(
+        "--config",
+        type=Path,
+        metavar="FILE.toml",
+        help="TOML file overriding Config thresholds/penalties (see README's config table)",
+    )
+    push.add_argument(
+        "--min-score",
+        type=float,
+        default=70.0,
+        help="episodes below this go on the reject list in the uploaded report (default: 70)",
+    )
+    push.add_argument(
+        "--disable-check",
+        action="append",
+        choices=CHECK_NAMES,
+        metavar="NAME",
+        help="skip a check entirely (repeatable), same as `demoqc score --disable-check`",
+    )
+    push.add_argument(
+        "--top", type=int, default=10, help="lowest-scoring episodes in the uploaded summary"
+    )
+    push.add_argument(
+        "--token", help="Hub write token; defaults to HF_TOKEN or a cached `huggingface-cli login`"
+    )
+    push.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write demoqc/report.json and demoqc/report.md under --output instead of opening "
+        "a Hub pull request; useful to preview the report without write access",
+    )
+    push.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("."),
+        help="directory to write the report files to with --dry-run (default: current directory)",
+    )
     return p
 
 
@@ -203,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         return _dedupe(args)
     if args.command == "export":
         return _export(args)
+    if args.command == "push-report":
+        return _push_report(args)
     return 2
 
 
@@ -364,6 +418,46 @@ def _export(args: argparse.Namespace) -> int:
             f"videos symlinked to {result.out / 'videos'} "
             "(the export now depends on the source directory staying where it is)"
         )
+    return 0
+
+
+def _push_report(args: argparse.Namespace) -> int:
+    ds = _load(args)
+    if ds is None:
+        return 2
+    if ds.repo_id is None:
+        print(
+            "demoqc: push-report needs a Hub repo id, not a local dataset directory "
+            "(there is nowhere to open a pull request)",
+            file=sys.stderr,
+        )
+        return 2
+    cfg = _config(args)
+    if cfg is None:
+        return 2
+    disabled = frozenset(args.disable_check or [])
+    results = evaluate(ds, cfg, disabled)
+    duplicate_groups = []
+    if "duplicate" not in disabled:
+        ctx = DatasetContext.build(ds, cfg)
+        duplicate_groups = find_duplicates(ds, results, ctx, cfg)
+        flag_duplicates(results, duplicate_groups)
+    report = build_report(ds, results, min_score=args.min_score, duplicate_groups=duplicate_groups)
+    if args.dry_run:
+        out_dir = args.output / "demoqc"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        write_json(report, out_dir / "report.json")
+        (out_dir / "report.md").write_text(format_markdown(report, top=args.top) + "\n")
+        print(f"wrote {out_dir / 'report.json'} and {out_dir / 'report.md'} (--dry-run)")
+        return 0
+    try:
+        pr_url = push_report(
+            ds.repo_id, report, token=args.token, revision=args.revision, top=args.top
+        )
+    except Exception as exc:  # huggingface_hub raises a variety of HTTP/auth error types
+        print(f"demoqc: failed to push report to {ds.repo_id}: {exc}", file=sys.stderr)
+        return 2
+    print(f"opened pull request: {pr_url}")
     return 0
 
 
