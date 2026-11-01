@@ -37,6 +37,7 @@ def build_report(
             "fps": ds.fps,
             "episodes": len(ds.episodes),
             "frames": ds.total_frames,
+            "warnings": list(ds.warnings),
         },
         "summary": {
             "mean_score": round(float(scores.mean()), 2),
