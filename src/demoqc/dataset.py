@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +61,7 @@ class Dataset:
     camera_names: list[str] = field(default_factory=list)  # video-dtype feature names
     video_path_template: str | None = None  # info.json's "video_path", v2.x layout
     chunks_size: int = 1000  # info.json's "chunks_size", for v2.x episode_chunk math
+    warnings: list[str] = field(default_factory=list)  # data problems that aren't a load error
 
     @property
     def total_frames(self) -> int:
@@ -100,8 +102,8 @@ def load_dataset(
         for name, feat in info.get("features", {}).items()
         if isinstance(feat, dict) and feat.get("dtype") == "video"
     )
-    episode_meta = _read_episode_meta(path, camera_names)
-    want = _resolve_episodes(episode_meta, episodes, max_episodes)
+    episode_meta, duplicate_episodes = _read_episode_meta(path, camera_names)
+    want = _resolve_episodes(episode_meta, episodes, max_episodes, duplicate_episodes)
 
     if repo_id is not None and narrowing:
         names = _needed_data_filenames(path, info, want) if want is not None else None
@@ -112,6 +114,23 @@ def load_dataset(
 
     frames = _read_frames(path, want, info)
     tasks = _read_tasks(path)
+
+    warnings: list[str] = []
+    if duplicate_episodes:
+        # The dataset's own metadata assigns this episode_index to more than one recording
+        # (e.g. two upload/recording sessions that each started numbering from where an
+        # earlier, since-edited version of the dataset left off). Grouping frames by
+        # episode_index alone -- the whole point of being format-agnostic across v2.x/v3.0
+        # layouts -- would silently concatenate two unrelated recordings into one nonsense
+        # "episode" (wrong length, non-monotonic timestamps, bogus flags on every check).
+        # There's no way to tell which recording is the real one, so both are dropped
+        # rather than guessing.
+        frames = frames[~frames["episode_index"].isin(duplicate_episodes)]
+        warnings.append(
+            f"{len(duplicate_episodes)} episode index(es) appear more than once in this "
+            f"dataset's own metadata, so their frames were excluded (there's no way to tell "
+            f"which recording is the real one): {duplicate_episodes}"
+        )
 
     episodes_out = []
     for ep_idx, group in frames.groupby("episode_index", sort=True):
@@ -147,11 +166,15 @@ def load_dataset(
         camera_names=camera_names,
         video_path_template=info.get("video_path"),
         chunks_size=int(info.get("chunks_size", 1000)),
+        warnings=warnings,
     )
 
 
 def _resolve_episodes(
-    episode_meta: dict[int, dict], episodes: Iterable[int] | None, max_episodes: int | None
+    episode_meta: dict[int, dict],
+    episodes: Iterable[int] | None,
+    max_episodes: int | None,
+    duplicate_episodes: list[int] = (),
 ) -> frozenset[int] | None:
     """The concrete set of episode indices to load, or ``None`` for "all of them"."""
     if episodes is None and max_episodes is None:
@@ -161,6 +184,13 @@ def _resolve_episodes(
         want = sorted({int(e) for e in episodes})
         unknown = sorted(set(want) - set(existing))
         if unknown:
+            dup_hit = sorted(set(unknown) & set(duplicate_episodes))
+            if dup_hit:
+                raise ValueError(
+                    f"episode(s) {dup_hit} appear more than once in this dataset's own "
+                    "metadata (two unrelated recordings share the same episode_index) and "
+                    "were excluded; fix the source dataset before requesting them"
+                )
             raise ValueError(f"episode(s) not in the dataset: {unknown}")
     else:
         want = existing
@@ -278,13 +308,24 @@ def _image_stat_scalar(value: object) -> float | None:
     return float(arr.mean())
 
 
-def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, dict]:
+def _read_episode_meta(
+    root: Path, camera_names: list[str] = ()
+) -> tuple[dict[int, dict], list[int]]:
     """Per-episode metadata: task, declared length, (v3.0) video time spans, and each
-    camera's whole-episode pixel mean/std from LeRobot's own per-episode video stats."""
+    camera's whole-episode pixel mean/std from LeRobot's own per-episode video stats.
+
+    Also returns any episode indices that appear more than once across the dataset's own
+    metadata files (e.g. two recording/upload sessions that each numbered episodes from
+    the same starting point) -- these are excluded from ``meta`` since there's no way to
+    tell which occurrence is the real one.
+    """
     meta: dict[int, dict] = {}
     v3_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
     if v3_files:
         df = pd.concat([pd.read_parquet(f) for f in v3_files], ignore_index=True)
+        counts = df["episode_index"].value_counts()
+        duplicate_indices = sorted(int(i) for i in counts[counts > 1].index)
+        dup_set = set(duplicate_indices)
         cameras = sorted(
             {
                 c.split("/")[1]
@@ -298,6 +339,9 @@ def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, di
             if f"stats/{cam}/mean" in df.columns and f"stats/{cam}/std" in df.columns
         ]
         for row in df.to_dict("records"):
+            ep_idx = int(row["episode_index"])
+            if ep_idx in dup_set:
+                continue
             spans = {
                 cam: (
                     float(row[f"videos/{cam}/from_timestamp"]),
@@ -320,28 +364,33 @@ def _read_episode_meta(root: Path, camera_names: list[str] = ()) -> dict[int, di
                 std = _image_stat_scalar(row.get(f"stats/{cam}/std"))
                 if mean is not None and std is not None:
                     camera_stats[cam] = (mean, std)
-            meta[int(row["episode_index"])] = {
+            meta[ep_idx] = {
                 "length": int(row["length"]) if "length" in row else None,
                 "task": _first_task(row.get("tasks")),
                 "video_spans": spans,
                 "camera_stats": camera_stats,
                 "video_chunk_file": chunk_file,
             }
-        return meta
+        return meta, duplicate_indices
 
     episode_stats = _read_v2_episode_stats(root, camera_names)
     jsonl = root / "meta" / "episodes.jsonl"
+    duplicate_indices: list[int] = []
     if jsonl.exists():
-        for line in jsonl.read_text().splitlines():
-            if line.strip():
-                row = json.loads(line)
-                ep_idx = int(row["episode_index"])
-                meta[ep_idx] = {
-                    "length": row.get("length"),
-                    "task": _first_task(row.get("tasks")),
-                    "camera_stats": episode_stats.get(ep_idx, {}),
-                }
-    return meta
+        rows = [json.loads(line) for line in jsonl.read_text().splitlines() if line.strip()]
+        counts = Counter(int(row["episode_index"]) for row in rows)
+        duplicate_indices = sorted(idx for idx, n in counts.items() if n > 1)
+        dup_set = set(duplicate_indices)
+        for row in rows:
+            ep_idx = int(row["episode_index"])
+            if ep_idx in dup_set:
+                continue
+            meta[ep_idx] = {
+                "length": row.get("length"),
+                "task": _first_task(row.get("tasks")),
+                "camera_stats": episode_stats.get(ep_idx, {}),
+            }
+    return meta, duplicate_indices
 
 
 def _read_v2_episode_stats(

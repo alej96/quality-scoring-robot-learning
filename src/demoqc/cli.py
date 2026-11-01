@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _load(args: argparse.Namespace):
     try:
-        return load_dataset(
+        ds = load_dataset(
             args.source,
             revision=args.revision,
             episodes=getattr(args, "episodes", None),
@@ -271,6 +271,9 @@ def _load(args: argparse.Namespace):
     except (FileNotFoundError, ValueError) as exc:
         print(f"demoqc: {exc}", file=sys.stderr)
         return None
+    for w in ds.warnings:
+        print(f"demoqc: warning: {w}", file=sys.stderr)
+    return ds
 
 
 def _config(args: argparse.Namespace) -> Config | None:
