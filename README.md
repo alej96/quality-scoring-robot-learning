@@ -127,6 +127,21 @@ the whole original episode -- so `demoqc export` prints an additional warning: t
 must be cut to the same `trim` frame range (on top of being renamed) before training on the
 export, or it will run longer than the now-trimmed data.
 
+## Duplicate episode indices in the source metadata
+
+A real community dataset can end up with the same `episode_index` assigned to two
+unrelated recordings -- usually a second recording/upload session that renumbered from 0
+instead of continuing from where an earlier version of the dataset left off. Grouping
+frames by `episode_index` (how this loader stays agnostic to each format's file layout)
+would otherwise silently concatenate the two recordings into one nonsense "episode": wrong
+length, a pile of non-increasing timestamp steps, and a cascade of bogus flags on every
+other check. `demoqc` detects this in the dataset's own metadata (`meta/episodes/*.parquet`
+on v3.0, `meta/episodes.jsonl` on v2.x) up front, drops every episode index that appears
+more than once (there's no way to tell which recording is the real one) instead of merging
+or guessing, and prints a warning naming the affected indices so the rest of the dataset
+still scores cleanly. Explicitly requesting one of those indices via `--episodes` raises a
+clear error instead of the generic "not in the dataset" one.
+
 ## What it checks
 
 | Check | Detects | How |

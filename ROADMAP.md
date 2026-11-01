@@ -9,6 +9,21 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Detect duplicate `episode_index` across a dataset's own metadata files.** Found
+      by running `demoqc score` against a real community dataset (benchmark expansion):
+      a second recording/upload session had renumbered episodes from 0 instead of
+      continuing the existing numbering, so some `episode_index` values appeared in two
+      different metadata chunk files. The loader grouped frames by `episode_index` alone
+      (its whole mechanism for staying agnostic to v2.x/v3.0 file layouts) and silently
+      concatenated the two unrelated recordings into one nonsense "episode" per affected
+      index, which then failed almost every other check for confusing, misleading reasons.
+      Shipped: `dataset.load_dataset` now detects any `episode_index` that appears more
+      than once in `meta/episodes/*.parquet` (v3.0) or `meta/episodes.jsonl` (v2.x), drops
+      every episode under those indices (no way to tell which recording is real) instead of
+      merging or guessing, and surfaces a `Dataset.warnings` entry (printed by the CLI,
+      and in the JSON report's `dataset.warnings`) naming the affected indices. Explicitly
+      requesting one of those indices via `--episodes` now raises a specific error instead
+      of the generic "not in the dataset" one. See the Log entry for the real-data numbers.
 - [x] **Action/state sync check.** Estimate per-episode lag between `action` and
       `observation.state` (cross-correlate per-dim velocities over ±0.5 s; only dims present
       in both with matching names or shapes). Flag episodes whose lag deviates from the
@@ -754,3 +769,41 @@ Work top-down through **Next up**. Each item should ship in one focused session
   change), and `demoqc push-report lerobot/svla_so101_pickplace --dry-run` ran against the
   real, reachable Hub and reproduced the dataset's existing validated mean score (97.1) in the
   written report files. See the ROADMAP item above for the full validation notes.
+- 2026-11-01: Fixed a real bug found while trying `demoqc score` against real Hub datasets
+  beyond the existing validation set (the roadmap's "query the Hub for real most-downloaded
+  small/medium teleoperation datasets" follow-up, done manually via `list_datasets(filter=
+  "LeRobot", sort="downloads")` this run rather than as a shipped feature). Scoring
+  `kmg0620/so101_bomb_pick_place_v1` (150 episodes, v3.0) gave a nonsensical result: 22
+  episodes scored exactly 0.0 with `timing` ("hundreds of non-increasing timestamp steps"),
+  `metadata` (declared length far below the data's actual length) and `video_sync` errors,
+  plus bogus `length`/`smoothness`/`sync` flags riding along -- on a dataset whose other 128
+  episodes were clean. Traced it to the dataset's own `meta/episodes/chunk-000/*.parquet`
+  files: episode indices 81-102 each appear in *two* different meta chunk files with two
+  different `length`/`data/file_index` values (confirmed by concatenating all 12 meta files
+  and sorting by `episode_index` -- a second recording/upload session had renumbered from 0
+  instead of continuing from 150's actual end). `load_dataset` groups frames by
+  `episode_index` precisely so it doesn't care which physical file a frame came from, so for
+  each affected index it silently summed two unrelated recordings' frames into one "episode"
+  (e.g. episode 81: 564 + 380 = 944 frames, confirmed by reading both data chunk files'
+  `episode_index`/`frame_index` columns directly) -- hence the "944 frames" that didn't match
+  any sane `length` and the hundreds of non-increasing timestamp steps where the second
+  recording's `frame_index`/`timestamp` restarted from 0 partway through. Fixed by detecting
+  any `episode_index` that appears more than once across a dataset's own metadata (both the
+  v3.0 `meta/episodes/*.parquet` path and the v2.x `meta/episodes.jsonl` path) and excluding
+  it -- there's no principled way to tell which of the two recordings is the real one, so
+  guessing or merging are both wrong; the fix surfaces a clear `Dataset.warnings` entry
+  instead. New tests in `tests/test_dataset.py`
+  (`test_duplicate_episode_index_v3_is_excluded_not_merged`, the v2.x equivalent, and a test
+  that explicitly requesting one of the affected indices via `--episodes` raises a specific
+  error) construct this exact scenario synthetically (two meta files and two data files both
+  claiming `episode_index=1`) and all three fail without this change (confirmed via
+  `git stash` on just `src/demoqc/dataset.py`). Validated on the real dataset: before the fix,
+  `demoqc score kmg0620/so101_bomb_pick_place_v1` reported 150 episodes, mean score 83.5, 22
+  episodes at 0.0; after, it reports 128 episodes (the 22 ambiguous ones correctly excluded
+  with a printed warning naming them), mean score 97.9, and the *real* remaining defects on
+  this dataset become visible instead of being drowned out: 7 genuine `video_sync` errors
+  (video span far longer than the episode's own data duration) and a couple of real
+  smoothness/length outliers. Also re-ran the full existing validation set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`) and got the same
+  mean scores as every prior Log entry (97.1, 92.9) with zero new warnings, confirming this is
+  a no-op on datasets that don't have the defect.
