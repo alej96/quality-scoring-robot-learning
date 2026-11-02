@@ -33,12 +33,17 @@ class EpisodeSpec:
     nan_action_at: list[int] = field(default_factory=list)  # frames with NaN in action[dim 0]
     nan_state_at: list[int] = field(default_factory=list)  # frames with NaN in state[dim 0]
     nan_gripper_at: list[int] = field(default_factory=list)  # frames with NaN in action[gripper]
+    frozen_action: bool = False  # action (and state) are bit-identical for the whole episode
     seed: int = 0
 
 
 def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Returns (timestamps, action, state) for one episode."""
     rng = np.random.default_rng(spec.seed)
+    if spec.frozen_action:
+        n = int(spec.seconds * FPS)
+        action = np.tile(rng.uniform(-50.0, 50.0, DIMS), (n, 1))
+        return np.arange(n) / FPS, action, action.copy()
     lead = int(spec.lead_idle_s * FPS)
     trail = int(spec.trail_idle_s * FPS)
     n_move = int(spec.seconds * FPS) - lead - trail
