@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 from demoqc.checks import evaluate
@@ -31,6 +33,29 @@ def test_idle_trim(make_dataset):
     start, end = r.trim
     assert start == pytest.approx(int(1.75 * FPS), abs=10)
     assert end == pytest.approx(int((10 - 1.25) * FPS), abs=10)
+
+
+def test_frozen_action_whole_dataset_flags_no_motion(make_dataset):
+    # Found on a real Hub dataset (omkarmayekar555/robot-learning-tutorial-data): every
+    # action dim was bit-identical for the whole episode (a broken teleop/recorder
+    # session). DatasetContext.build's action_scale collapses to NaN for every dim when
+    # nothing in the dataset ever varies, which made _speed() return NaN (a RuntimeWarning
+    # on its own) for every frame; "NaN < idle_speed" is always False, so check_idle's
+    # absolute "no motion detected" fallback silently never fired -- a completely dead
+    # recording scored as if it were fully active, with no flag pointing at the real
+    # defect (confirmed against the real dataset: mean score 90.0, only an unrelated weak
+    # `sync` flag, nothing about the action never moving).
+    # same seed for every episode: the dataset-wide action scale (DatasetContext.build)
+    # is computed from *all* episodes' frames pooled together, so it only collapses to
+    # NaN in every dim -- the exact real-dataset failure mode -- when nothing varies
+    # across episodes either, not just within one.
+    specs = [EpisodeSpec(seconds=5.0, frozen_action=True, seed=0) for _ in range(5)]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        results = _results(make_dataset, specs)
+    for r in results:
+        assert "idle" in _checks(r)
+        assert any("no motion detected" in f.message for f in r.flags), r.flags
 
 
 def test_dropped_frames(make_dataset):

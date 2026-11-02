@@ -191,7 +191,14 @@ class DatasetContext:
         steps = np.concatenate([np.abs(np.diff(a, axis=0)) / scale for a in actions])
         speeds = np.concatenate([_speed(a, scale, ds.fps) for a in actions])
         p75 = float(np.nanpercentile(speeds, 75)) if np.isfinite(speeds).any() else 0.0
-        step_p99 = np.nanpercentile(steps, 99, axis=0)
+        # a dim with scale already NaN'd out above (constant dataset-wide) makes its whole
+        # `steps` column NaN too; only run nanpercentile on the live columns so that doesn't
+        # raise numpy's "All-NaN slice encountered" on a dataset where some/all dims never
+        # vary at all (e.g. a single-episode dataset with a frozen action stream).
+        live = np.isfinite(scale)
+        step_p99 = np.full(scale.shape, np.nan)
+        if live.any():
+            step_p99[live] = np.nanpercentile(steps[:, live], 99, axis=0)
         # dims that almost never change (e.g. a binary gripper) have no step scale;
         # leave them out of spike detection rather than flag every toggle
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
@@ -207,9 +214,22 @@ class DatasetContext:
 
 
 def _speed(action: np.ndarray, scale: np.ndarray, fps: float) -> np.ndarray:
-    """RMS speed across (scaled) action dims, one value per transition."""
+    """RMS speed across (scaled) action dims, one value per transition.
+
+    Dims with ``scale`` set to NaN (constant across the whole dataset, excluded from
+    spike/idle thresholds by ``DatasetContext.build``) are dropped per frame. A frame
+    where *every* dim is excluded this way -- every action dim is constant dataset-wide,
+    i.e. nothing in the dataset ever moves -- used to come out as ``nanmean`` of an
+    all-NaN row: a ``RuntimeWarning`` and a ``NaN`` speed. That NaN then compared False to
+    every idle threshold, so ``check_idle``'s absolute "no motion detected" fallback
+    silently never fired on a dataset that's completely dead. "Every tracked dim held
+    still" is a real zero speed, not an unknown one, so return 0 for that frame instead.
+    """
     v = np.diff(action, axis=0) / scale * fps
-    return np.sqrt(np.nanmean(v**2, axis=1))
+    valid = np.isfinite(v)
+    sq = np.where(valid, v * v, 0.0)
+    counts = np.maximum(valid.sum(axis=1), 1)
+    return np.sqrt(sq.sum(axis=1) / counts)
 
 
 def _robust_z(x: float, population: np.ndarray) -> float:
@@ -437,7 +457,11 @@ def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
     win = max(1, int(round(cfg.idle_smoothing_s * ctx.fps)))
     if win > 1 and len(speed) >= win:
         speed = np.convolve(speed, np.ones(win) / win, mode="same")
-    idle = speed < ctx.idle_speed
+    # floored like check_staleness/_episode_moved: idle_speed is 0.1 * the dataset's own
+    # p75 speed, which is exactly 0 when the dataset has (almost) no real motion anywhere
+    # -- "speed < 0" can then never be true, so a completely dead episode would otherwise
+    # never trip the "no motion detected" fallback below.
+    idle = speed < max(ctx.idle_speed, 1e-9)
     fps = ctx.fps
     moving = np.flatnonzero(~idle)
     if len(moving) == 0:
