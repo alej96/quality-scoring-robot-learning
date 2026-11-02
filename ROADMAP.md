@@ -9,6 +9,47 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_idle` missing a dataset-wide frozen action stream.** Found by running
+      `demoqc score` against a real Hub dataset beyond the existing validation set
+      (`omkarmayekar555/robot-learning-tutorial-data`, found via `list_datasets(filter=
+      "LeRobot", sort="downloads")`): every action dim was bit-identical for the episode's
+      entire 1776 frames (a broken teleop/recorder session, not real motion), yet
+      `demoqc score` gave it 90.0 with no flag at all pointing at the actual defect -- only
+      an unrelated weak `sync` warning -- plus a `RuntimeWarning: Mean of empty slice` and
+      `All-NaN slice encountered` printed to stderr. Root cause: `DatasetContext.build`'s
+      `action_scale` collapses to NaN for every dim when nothing in the dataset ever varies
+      (by design, so a genuinely constant dim like an unused sensor doesn't get flagged for
+      spike detection); `_speed()` then hit `np.nanmean` on an all-NaN row, which is both a
+      `RuntimeWarning` and a `NaN` speed, and `NaN < idle_speed` is always `False` --
+      `check_idle`'s absolute "no motion detected" fallback (meant for exactly this case)
+      silently never fired. A second, independent issue in the same function: `idle_speed`
+      itself is `0.1 * the dataset's own p75 speed`, which is exactly `0.0` when the dataset
+      has (almost) no real motion anywhere, so even a correctly-computed `speed == 0.0`
+      frame failed `speed < idle_speed` (`0 < 0` is `False`) -- `check_staleness` and
+      `_episode_moved` already guarded this exact case with `max(ctx.idle_speed, 1e-9)`,
+      but `check_idle` itself, the one place that most needed it, didn't. Fixed `_speed()`
+      to treat a frame where every tracked dim is excluded as a real zero speed instead of
+      an unknown (NaN) one, added the same `max(idle_speed, 1e-9)` floor to `check_idle`,
+      and made `DatasetContext.build` skip `nanpercentile` on `step_p99` dims that are
+      already all-NaN (same root cause, a separate warning site) instead of calling it and
+      immediately discarding a warning-raising NaN result. New
+      `tests/test_checks.py::test_frozen_action_whole_dataset_flags_no_motion` builds a
+      5-episode synthetic dataset where every episode shares the exact same frozen action
+      (reproducing the real "nothing varies dataset-wide" condition, not just within one
+      episode) with `warnings.simplefilter("error", RuntimeWarning)` around the whole
+      `evaluate()` call, and fails with the pre-fix code exactly as the real dataset did
+      (`idle` missing, only `sync` in the flags) -- confirmed via `git stash` on just
+      `src/demoqc/checks.py`. Validated on the real dataset: `demoqc score
+      omkarmayekar555/robot-learning-tutorial-data` now scores it 30.0 with `[error] idle:
+      no motion detected in the whole episode`, no RuntimeWarning on stderr. Re-ran the full
+      existing validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`) and got byte-identical mean scores to
+      every prior Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming this is a no-op on
+      normal data -- it only changes behavior for the degenerate all-dims-constant case.
+      Also tried `jchandru08/so100_press_red_button` (29 ep, v2.1) from the same Hub search:
+      7 episodes correctly flag a real `metadata` length mismatch (declared length off by
+      1-3 frames from the data, both directions) -- the existing `metadata` check already
+      handles this correctly, no bug found there.
 - [x] **Detect duplicate `episode_index` across a dataset's own metadata files.** Found
       by running `demoqc score` against a real community dataset (benchmark expansion):
       a second recording/upload session had renumbered episodes from 0 instead of
@@ -807,3 +848,20 @@ Work top-down through **Next up**. Each item should ship in one focused session
   (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`) and got the same
   mean scores as every prior Log entry (97.1, 92.9) with zero new warnings, confirming this is
   a no-op on datasets that don't have the defect.
+- 2026-11-02: Fixed `check_idle` silently missing a dataset-wide frozen action stream (see
+  the "Next up" item above for the full root-cause and validation details). Found by
+  scoring a real Hub dataset beyond the existing validation set
+  (`omkarmayekar555/robot-learning-tutorial-data`, 1 episode, every action dim bit-identical
+  for the whole episode): previously scored 90.0 with no flag mentioning the actual defect
+  and a `RuntimeWarning` on stderr; now scores 30.0 with `[error] idle: no motion detected
+  in the whole episode` and no warning. `_speed()` now returns 0 instead of NaN for a frame
+  where every action dim is excluded from the dataset's scale (constant dataset-wide);
+  `check_idle` now floors `idle_speed` at `1e-9` like `check_staleness`/`_episode_moved`
+  already did; `DatasetContext.build` skips `nanpercentile` on `step_p99` dims that are
+  already all-NaN instead of calling it and discarding a warning-raising NaN. New
+  `tests/test_checks.py::test_frozen_action_whole_dataset_flags_no_motion` fails on the
+  pre-fix code exactly as the real dataset did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). Re-validated the full existing dataset set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every prior
+  Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming no regression on normal data.
