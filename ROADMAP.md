@@ -9,6 +9,50 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Flatten grouped `names` in `meta/info.json` (ALOHA-format datasets).** Found by
+      running `demoqc score` against real Hub datasets beyond the existing validation set
+      (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`): `gripper_chatter`
+      never fired on either (despite real `left_gripper`/`right_gripper` dims), and `sync`
+      fired a "weak correlation" warning on roughly half of every ALOHA dataset's episodes
+      (7/15 on `cups_open`, 6/15 on `battery`) with no obvious reason -- the episodes looked
+      fine by eye. Root cause: ALOHA-format datasets store `meta/info.json`'s per-feature
+      `names` as a dict grouping all dims under one motor-group key
+      (`{"motors": ["left_waist", ..., "right_gripper"]}`) instead of a flat list of
+      per-dim strings, which `demoqc`'s loader read as-is. `DatasetContext.gripper_dims`'
+      `"gripper" in name.lower()` search over `enumerate(ds.action_names or [])` then
+      iterated the dict's *keys* ("motors"), never finding "gripper" at all -- silently
+      disabling gripper-chatter detection dataset-wide, no error, no warning, nothing in
+      the report pointing at why. `_match_sync_dims` (feature-name dim matching for the
+      `sync` check) hit the same shape mismatch from the other side: given a dict it still
+      entered its name-matching branch, but `enumerate()`/`in` on a 1-key dict treated that
+      single key as if it were dim 0, "matching" only one real dim out of 14 and silently
+      dropping the other 13 -- so `sync` was comparing one single joint's velocity (whichever
+      the dict's iteration order put first) instead of both arms, both correlating poorly on
+      its own and blind to a real defect on any of the other 13 dims. Fixed by flattening
+      `names` once, in `dataset.py`, right where `meta/info.json` is read: a dict's values
+      (lists) are concatenated in their stored order into the flat per-dim list both
+      `gripper_dims` and `_match_sync_dims` already expected; a flat list (every other
+      dataset in the existing validation set) passes through unchanged. New tests:
+      `tests/test_dataset.py::test_grouped_feature_names_are_flattened` (the loader output
+      directly) and `tests/test_checks.py::test_gripper_chatter_detected_with_grouped_feature_names`/
+      `test_sync_matches_all_dims_with_grouped_feature_names` (the two silently-broken
+      checks, the latter asserting `DatasetContext.build`'s matched dim indices directly
+      since a single-dim sync match can coincidentally still pass a correlation-threshold
+      heuristic); `tests/conftest.py`'s `write_dataset` gained a `grouped_names` flag that
+      writes the real `{"motors": [...]}` shape. All three fail without this change
+      (confirmed via `git stash` on just `src/demoqc/dataset.py`). Validated on the real
+      datasets that found the bug: `lerobot/aloha_static_cups_open` (15 ep) went from mean
+      score 95.3 (7 spurious `sync` warnings, r=0.11-0.35) to 100.0 (0 flags, peak corr now
+      implicitly computed over all 14 dims); `lerobot/aloha_static_battery` (15 ep) went
+      from mean 90.7 (6 spurious `sync` warnings alongside 13 real `smoothness` ones) to
+      94.7 (`sync_peak_corr` now a consistent 0.70-0.78 across every episode, all 6 spurious
+      warnings gone, the 13 real `smoothness` flags unchanged) -- in both cases the fix only
+      removed warnings that didn't correspond to anything wrong in the data, it introduced
+      no new flags. Re-ran the full existing flat-`names` validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every
+      prior Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming this is a no-op when `names`
+      is already flat.
 - [x] **Fix `check_idle` missing a dataset-wide frozen action stream.** Found by running
       `demoqc score` against a real Hub dataset beyond the existing validation set
       (`omkarmayekar555/robot-learning-tutorial-data`, found via `list_datasets(filter=
@@ -865,3 +909,19 @@ Work top-down through **Next up**. Each item should ship in one focused session
   (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
   `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every prior
   Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming no regression on normal data.
+- 2026-11-03: Fixed `gripper_chatter` and `sync` silently breaking on ALOHA-format datasets
+  (see the "Next up" item above for the full root-cause and validation details). Found by
+  scoring real Hub datasets beyond the existing validation set
+  (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`), whose
+  `meta/info.json` groups per-dim feature names under a single motor key
+  (`{"motors": [...]}`) instead of a flat list -- `demoqc`'s loader read that shape as-is,
+  so `gripper_dims`' name search silently found nothing (no `gripper_chatter` detection at
+  all on either dataset) and `_match_sync_dims` silently matched only 1 of 14 real dims
+  (`sync` comparing a single joint instead of both arms). `dataset.py` now flattens a
+  dict-shaped `names` into the flat per-dim list both checks already expected; a flat list
+  passes through unchanged. `cups_open` went from mean 95.3 (7 spurious `sync` warnings)
+  to 100.0; `battery` went from 90.7 (6 spurious `sync` warnings alongside 13 real
+  `smoothness` ones) to 94.7 (spurious warnings gone, real ones unchanged). Re-validated
+  the full flat-`names` set (`lerobot/svla_so101_pickplace`,
+  `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`, `shylee/so100_cube`):
+  byte-identical mean scores to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2).
