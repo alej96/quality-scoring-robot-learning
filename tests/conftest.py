@@ -129,13 +129,16 @@ def write_dataset(
     data_files: int = 1,
     state_perm: list[int] | None = None,
     extra_action_dim: bool = False,
+    grouped_names: bool = False,
 ) -> Path:
     """``data_files`` > 1 spreads the episodes over that many v3.0 data files.
 
     ``state_perm`` reorders observation.state's columns (and feature names) relative to
     action's, e.g. ``[1, 0, 2, 3, 4, 5]`` swaps the first two. ``extra_action_dim`` appends
     a constant action-only column (an unmatched extra sensor with no observation.state
-    counterpart) named ``force_sensor``.
+    counterpart) named ``force_sensor``. ``grouped_names`` writes ``names`` as
+    ``{"motors": [...]}`` instead of a flat list, matching real ALOHA-format datasets
+    on the Hub (e.g. ``lerobot/aloha_static_cups_open``).
     """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
@@ -204,12 +207,18 @@ def write_dataset(
         state_names = [FEATURE_NAMES[i] for i in state_perm]
     else:
         state_names = FEATURE_NAMES
+    if grouped_names:
+        action_names_out: object = {"motors": action_names}
+        state_names_out: object = {"motors": state_names}
+    else:
+        action_names_out = action_names
+        state_names_out = state_names
     info["features"] = {
-        "action": {"dtype": "float32", "shape": [len(action_names)], "names": action_names},
+        "action": {"dtype": "float32", "shape": [len(action_names)], "names": action_names_out},
         "observation.state": {
             "dtype": "float32",
             "shape": [len(state_names)],
-            "names": state_names,
+            "names": state_names_out,
         },
         "observation.images.top": {"dtype": "video", "shape": [480, 640, 3], "names": None},
         "timestamp": {"dtype": "float32", **scalar},
@@ -282,9 +291,16 @@ def make_dataset(tmp_path):
         data_files: int = 1,
         state_perm: list[int] | None = None,
         extra_action_dim: bool = False,
+        grouped_names: bool = False,
     ) -> Path:
         return write_dataset(
-            tmp_path / f"ds-{version}", specs, version, data_files, state_perm, extra_action_dim
+            tmp_path / f"ds-{version}",
+            specs,
+            version,
+            data_files,
+            state_perm,
+            extra_action_dim,
+            grouped_names,
         )
 
     return _make
