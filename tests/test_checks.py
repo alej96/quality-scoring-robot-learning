@@ -234,6 +234,39 @@ def test_gripper_chatter(make_dataset):
     assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
 
 
+def test_gripper_chatter_detected_with_grouped_feature_names(make_dataset):
+    # Real ALOHA-format datasets store action/observation.state "names" as a dict grouping
+    # all dims under one motor-group key, not a flat list (see
+    # test_dataset.test_grouped_feature_names_are_flattened for the full root cause). Before
+    # flattening it, DatasetContext.gripper_dims searched the dict's *keys* ("motors") for
+    # "gripper", found nothing, and gripper_chatter silently never fired on any such
+    # dataset -- exactly the real-world teleoperated grippers it exists to catch.
+    specs = clean_specs()
+    specs[3] = EpisodeSpec(gripper_chatter_at=(100, 115), seed=3)
+    path = make_dataset(specs, grouped_names=True)
+    results = evaluate(load_dataset(path))
+
+    assert results[3].metrics["gripper_toggles_per_window"] >= 4
+    assert "gripper_chatter" in _checks(results[3])
+    assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
+
+
+def test_sync_matches_all_dims_with_grouped_feature_names(make_dataset):
+    # Same root cause as the gripper_chatter case above: with "names" as an unflattened
+    # dict ({"motors": [...]}), _match_sync_dims read it via enumerate()/`in`, which only
+    # sees the dict's one key ("motors") as if it were a single dim 0 -- pairing away all
+    # other real dims instead of matching all 6 by name. Assert directly on the matched
+    # dim indices (the actual root cause) rather than through the correlation heuristic,
+    # since a single-dim match can coincidentally still look "synced enough" to pass the
+    # heuristic-level test above.
+    from demoqc.checks import Config, DatasetContext
+
+    path = make_dataset(clean_specs(2), grouped_names=True)
+    ctx = DatasetContext.build(load_dataset(path), Config())
+
+    assert ctx.sync_dims == (list(range(6)), list(range(6)))
+
+
 def test_integrity_flags_nonfinite_action(make_dataset):
     # a sensor glitch or corrupted write leaves a NaN in one frame's action
     specs = clean_specs()

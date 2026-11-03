@@ -24,6 +24,32 @@ HUB_PATTERNS = ["meta/*", "meta/**", "data/*", "data/**"]
 _FRAME_COLUMNS = ["episode_index", "frame_index", "timestamp", "action", "observation.state"]
 
 
+def _flatten_feature_names(names: object) -> list[str] | None:
+    """Normalize a ``meta/info.json`` feature's ``names`` into a flat, per-dim list.
+
+    LeRobot writes this field as a flat list of strings for most robots (e.g. SO-100/101:
+    ``["shoulder_pan.pos", ..., "gripper.pos"]``), but as a dict grouping dims under a
+    motor-group key for others, notably ALOHA (``{"motors": ["left_waist", ...,
+    "right_gripper"]}``). Reading the dict case as-is (e.g. ``enumerate(names)`` or ``name
+    in names``) silently iterates its *keys* instead of its per-dim values -- "gripper" in
+    "motors" is ``False``, so ``gripper_chatter``'s name-based gripper lookup finds nothing,
+    and ``_match_sync_dims`` ends up "matching" the single key as if it were dim 0, pairing
+    away everything else -- so every grouped-feature dataset silently lost both gripper
+    detection and all but one sync dim with no visible symptom. Flattening dict values (in
+    their stored order) in here, once, fixes both call sites.
+    """
+    if isinstance(names, dict):
+        flat: list[str] = []
+        for group in names.values():
+            if not isinstance(group, list):
+                return None  # unrecognised shape; don't guess
+            flat.extend(group)
+        return flat
+    if isinstance(names, list):
+        return names
+    return None
+
+
 @dataclass
 class Episode:
     index: int
@@ -161,8 +187,12 @@ def load_dataset(
         robot_type=info.get("robot_type"),
         episodes=episodes_out,
         repo_id=repo_id,
-        action_names=info.get("features", {}).get("action", {}).get("names"),
-        state_names=info.get("features", {}).get("observation.state", {}).get("names"),
+        action_names=_flatten_feature_names(
+            info.get("features", {}).get("action", {}).get("names")
+        ),
+        state_names=_flatten_feature_names(
+            info.get("features", {}).get("observation.state", {}).get("names")
+        ),
         camera_names=camera_names,
         video_path_template=info.get("video_path"),
         chunks_size=int(info.get("chunks_size", 1000)),

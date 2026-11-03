@@ -25,6 +25,22 @@ def test_loads_both_layouts(make_dataset, version):
         assert np.all(np.diff(ep.frame_index) == 1)
 
 
+def test_grouped_feature_names_are_flattened(make_dataset):
+    # Found scoring real ALOHA-format Hub datasets (e.g. lerobot/aloha_static_cups_open):
+    # their meta/info.json stores action/observation.state "names" as a dict grouping all
+    # dims under a single motor-group key ({"motors": ["left_waist", ..., "right_gripper"]})
+    # instead of a flat list. Reading that dict as-is made `gripper_dims` search its *keys*
+    # ("motors") for "gripper" (never found) and `_match_sync_dims` pair the single key as
+    # if it were dim 0 (pairing away all 13 other dims) -- both completely silent, no error,
+    # just a disabled check and a wrong one. ds.action_names/state_names must come out as
+    # the flat per-dim list either way.
+    ds = load_dataset(make_dataset(clean_specs(2), grouped_names=True))
+    from tests.conftest import FEATURE_NAMES
+
+    assert ds.action_names == FEATURE_NAMES
+    assert ds.state_names == FEATURE_NAMES
+
+
 def test_v3_video_spans(make_dataset):
     ds = load_dataset(make_dataset(clean_specs(2)))
     start, end = ds.episodes[0].video_spans["observation.images.top"]
