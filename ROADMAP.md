@@ -9,6 +9,41 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_idle` silently skipping 1- and 2-frame episodes.** Found by running
+      `demoqc score` against a real Hub dataset beyond the existing validation set
+      (`lerobot/svla_so100_stacking`): episode 20 (exactly 1 frame) scored 90.0 with only
+      an unrelated "unusually short" `length` warning, while episodes 37, 39 and 55 --
+      slightly longer (14, 434 and 141 frames) but with the exact same bit-identical,
+      zero-motion action -- correctly scored 20.0-30.0 with `idle: no motion detected in
+      the whole episode` (ERROR, penalty 60). Root cause: `check_idle` had
+      `if ep.action is None or ctx.action_scale is None or ep.length < 3: return` as its
+      very first line -- the `ep.length < 3` guard exists because the smoothed lead/trail
+      idle profile further down needs a couple of real transitions to be meaningful, but
+      it also skipped the function's own absolute "no motion detected" fallback, which
+      needs no such minimum. The shortest, most obviously broken episodes in a dataset
+      (an aborted recording cut off almost immediately) were therefore the *only* ones
+      this check stayed completely silent on, while a merely-short-but-not-that-short
+      zero-motion episode was correctly flagged. Fixed by narrowing the early return to
+      just the action/scale guard, and handling `ep.length < 3` as its own branch that
+      still calls `_speed()` (safe at any length: `np.diff` on a 1-row array yields a
+      0-row result) and flags the same `idle` ERROR whenever there's no speed data at all
+      or every available speed sample is below `idle_speed`, before returning (too short
+      to say anything about a lead/trail trim either way). New
+      `tests/test_checks.py::test_very_short_frozen_episode_flags_no_motion` builds a
+      5-episode synthetic dataset (varied normal motion) with one 1-frame and one
+      2-frame frozen-action episode and asserts both get the `idle: no motion detected`
+      flag while the other three don't; fails without this change (confirmed via
+      `git stash` on just `src/demoqc/checks.py` -- the 1-frame case asserts `AssertionError`
+      with only a `length` flag present, reproducing the real dataset exactly). Validated
+      on the real dataset: `demoqc score lerobot/svla_so100_stacking` now scores episode 20
+      at 40.0 with the `idle` error, consistent with its three siblings that have the
+      identical defect (previously the only one of the four scoring as if nothing were
+      wrong). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`) and got byte-identical mean scores to
+      every prior Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming this is a no-op on
+      every episode with 3+ frames -- it only changes behavior for the 1- and 2-frame
+      degenerate case.
 - [x] **Flatten grouped `names` in `meta/info.json` (ALOHA-format datasets).** Found by
       running `demoqc score` against real Hub datasets beyond the existing validation set
       (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`): `gripper_chatter`
@@ -925,3 +960,19 @@ Work top-down through **Next up**. Each item should ship in one focused session
   the full flat-`names` set (`lerobot/svla_so101_pickplace`,
   `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`, `shylee/so100_cube`):
   byte-identical mean scores to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2).
+- 2026-11-04: Fixed `check_idle` silently skipping 1- and 2-frame episodes (see the "Next
+  up" item above for the full root-cause and validation details). Found by scoring a real
+  Hub dataset beyond the existing validation set (`lerobot/svla_so100_stacking`): a
+  1-frame episode (presumably an aborted recording) scored 90.0 with only an unrelated
+  `length` warning, while three sibling episodes with the exact same bit-identical,
+  zero-motion action but a few more frames correctly scored 20.0-30.0 with
+  `idle: no motion detected`. `check_idle`'s `ep.length < 3` early return skipped its own
+  absolute no-motion fallback along with the lead/trail profile it was meant to guard, so
+  the shortest, most obviously broken episodes were the only ones left unflagged. New
+  `tests/test_checks.py::test_very_short_frozen_episode_flags_no_motion` fails on the
+  pre-fix code exactly as the real dataset did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). Re-validated the full existing dataset set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every prior
+  Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming no regression on episodes with 3+
+  frames.
