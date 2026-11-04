@@ -58,6 +58,27 @@ def test_frozen_action_whole_dataset_flags_no_motion(make_dataset):
         assert any("no motion detected" in f.message for f in r.flags), r.flags
 
 
+def test_very_short_frozen_episode_flags_no_motion(make_dataset):
+    # Found on a real Hub dataset (lerobot/svla_so100_stacking): a 1-frame episode
+    # (presumably an aborted recording cut off before any motion happened) scored 90.0
+    # with only an unrelated "unusually short" `length` warning, while other episodes in
+    # the same dataset with the exact same bit-identical (zero-motion) action but a few
+    # more frames correctly scored 20.0 with `idle: no motion detected`. check_idle's old
+    # unconditional `ep.length < 3: return` guard -- needed because the smoothed
+    # lead/trail idle profile needs at least a couple of real transitions -- also skipped
+    # its own absolute no-motion fallback, so the *shortest*, most obviously broken
+    # episodes were the only ones it stayed silent on.
+    specs = clean_specs()
+    specs[1] = EpisodeSpec(seconds=1.5 / FPS, frozen_action=True, seed=1)  # 1 frame
+    specs[3] = EpisodeSpec(seconds=2.5 / FPS, frozen_action=True, seed=3)  # 2 frames
+    results = _results(make_dataset, specs)
+
+    for i in (1, 3):
+        assert "idle" in _checks(results[i]), (i, results[i].flags)
+        assert any("no motion detected" in f.message for f in results[i].flags)
+    assert all("idle" not in _checks(r) for i, r in enumerate(results) if i not in (1, 3))
+
+
 def test_dropped_frames(make_dataset):
     specs = clean_specs()
     specs[5] = EpisodeSpec(drop_frames=list(range(100, 106)), seed=5)

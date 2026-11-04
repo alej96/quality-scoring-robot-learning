@@ -451,7 +451,22 @@ def _episode_moved(ep: Episode, ctx: DatasetContext, start_s: float, end_s: floa
 
 
 def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
-    if ep.action is None or ctx.action_scale is None or ep.length < 3:
+    if ep.action is None or ctx.action_scale is None:
+        return
+    if ep.length < 3:
+        # Too short to compute the smoothed idle/lead/trail profile below (needs at least
+        # a couple of real transitions), but a 1- or 2-frame episode is the most degenerate
+        # "no motion" case there is -- an aborted recording that barely started -- and the
+        # absolute no-motion fallback further down still applies to it. Returning here
+        # unconditionally (the old behaviour) silently skipped it instead: a real so100_stacking
+        # episode with a single frame scored 90.0 with no `idle` flag at all, while a 14-frame
+        # episode with the exact same bit-identical (zero-motion) action correctly scored 20.0
+        # with an `idle: no motion detected` error -- the shortest, most broken recordings were
+        # the only ones this check stayed silent on.
+        speed = _speed(ep.action, ctx.action_scale, ctx.fps)
+        if len(speed) == 0 or bool(np.all(speed < max(ctx.idle_speed, 1e-9))):
+            out.metrics.update(idle_fraction=1.0, lead_idle_s=ep.length / ctx.fps, trail_idle_s=0.0)
+            out.flags.append(Flag("idle", ERROR, "no motion detected in the whole episode", 60))
         return
     speed = _speed(ep.action, ctx.action_scale, ctx.fps)
     win = max(1, int(round(cfg.idle_smoothing_s * ctx.fps)))
