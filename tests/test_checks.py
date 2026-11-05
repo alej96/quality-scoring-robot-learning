@@ -1,9 +1,11 @@
 import warnings
+from pathlib import Path
 
+import numpy as np
 import pytest
 
-from demoqc.checks import evaluate
-from demoqc.dataset import load_dataset
+from demoqc.checks import Config, _angular_action_dims, evaluate
+from demoqc.dataset import Dataset, Episode, load_dataset
 from tests.conftest import FPS, EpisodeSpec, clean_specs
 
 
@@ -97,6 +99,78 @@ def test_single_frame_spike(make_dataset):
     assert results[2].metrics["spikes"] == 1
     assert "smoothness" in _checks(results[2])
     assert all(r.metrics["spikes"] == 0 for i, r in enumerate(results) if i != 2)
+
+
+def _angular_dataset() -> Dataset:
+    """A synthetic dataset with one action dim that's a radian angle wrapped to
+    [-pi, pi] (like ``eef_rot_euler_z_rad``), plus a normal, unrelated joint dim.
+
+    Built by hand (not via ``make_dataset``/``write_dataset``) because the shared
+    ``make_episode`` fixture generates every dim at the same large, non-angular scale;
+    testing the wrap fix needs one dim whose values are genuinely confined to [-pi, pi]
+    across the whole dataset.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+
+    def episode(idx: int, angle_step: float, jump_at: int | None = None) -> Episode:
+        angle = np.mod(angle_step * t + np.pi, 2 * np.pi) - np.pi
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * idx
+        action = np.stack([angle, joint], axis=1)
+        if jump_at is not None:
+            action[jump_at:, 1] += 40.0  # a real, unrelated abrupt jump, not wrapping
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    # bounded well short of +-pi: never wraps, same as any ordinary joint
+    bounded = [episode(i, angle_step=0.02) for i in range(6)]
+    wrap_ep = episode(6, angle_step=0.15)  # sweeps > 2 full turns -> several wrap crossings
+    jump_ep = episode(7, angle_step=0.02, jump_at=45)  # a real defect, unrelated to wrapping
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*bounded, wrap_ep, jump_ep],
+    )
+
+
+def test_smoothness_ignores_wrapped_angle_crossings():
+    # Found on a real Hub dataset (RoboCOIN/Agilex_Cobot_Magic_heat_burger): its
+    # eef_rot_euler_x/z_rad action dims are Euler angles wrapped to [-pi, pi], and every
+    # episode's wrist rotation crosses that +-pi boundary at least once during otherwise
+    # perfectly smooth motion. check_smoothness's plain np.diff saw each crossing as a
+    # ~2*pi single-frame action -- tens of times the dataset's own step_p99 for that dim
+    # -- so "abrupt action jump" fired on nearly every episode of a dataset with nothing
+    # actually jerky in it (27/819 episodes in a sampled subset, mean score dragged down
+    # to the 60s-70s on several of them).
+    results = {r.episode_index: r for r in evaluate(_angular_dataset())}
+
+    wrap_result = results[6]
+    assert wrap_result.metrics["spikes"] == 0
+    assert wrap_result.metrics["jumps"] == 0
+    assert not [f for f in wrap_result.flags if f.check == "smoothness"], wrap_result.flags
+
+    # the fix must not blind the check to a real, unrelated jump on a non-angular dim
+    jump_result = results[7]
+    assert jump_result.metrics["jumps"] > 0
+    assert "smoothness" in _checks(jump_result)
+
+
+def test_angular_action_dims_requires_reaching_both_wrap_boundaries():
+    # dim 0 reaches close to both +pi and -pi (a real wrapped angle); dim 1 stays well
+    # within the bound without ever approaching it (an ordinary joint that merely happens
+    # to sit under pi); dim 2 exceeds the bound outright (clearly not a wrapped angle).
+    allA = np.array(
+        [
+            [-3.14, 1.5, 4.0],
+            [0.0, -1.5, -4.0],
+            [3.14, 1.0, 0.0],
+        ]
+    )
+    mask = _angular_action_dims(allA, Config())
+    np.testing.assert_array_equal(mask, [True, False, False])
 
 
 def test_stale_state(make_dataset):
