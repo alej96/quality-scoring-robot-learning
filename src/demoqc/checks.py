@@ -67,6 +67,8 @@ class Config:
     video_decode_max_samples: int = 20  # frames sampled per camera when --decode-video is used
     video_dark_run_min_frac: float = 0.15  # fraction of sampled frames that must be dark to flag
     video_freeze_max_abs_diff: float = 0.03  # largest per-block thumbnail diff (0-1) still "frozen"
+    angular_wrap_tol: float = 0.05  # float slack past +-pi an "angular" dim's values may still hit
+    angular_wrap_reach: float = 0.3  # how close to +-pi a dim must get to count as wrapping
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -151,6 +153,7 @@ class DatasetContext:
     idle_speed: float  # speed threshold, scaled units / s
     gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
     sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
+    angular_dims: np.ndarray | None = None  # action dims that wrap as a radian angle in [-pi, pi]
     # --decode-video support (check_video_freeze); video_root is only set for a local
     # dataset (v2.x or v3.0), since videos are never downloaded from the Hub (see
     # video.resolve_v2_video_path/resolve_v3_video_path).
@@ -188,7 +191,8 @@ class DatasetContext:
         std = np.nanstd(allA, axis=0)
         scale = np.where(scale > 1e-9, scale, std)
         scale = np.where(scale > 1e-9, scale, np.nan)  # constant dims are ignored
-        steps = np.concatenate([np.abs(np.diff(a, axis=0)) / scale for a in actions])
+        angular_dims = _angular_action_dims(allA, cfg)
+        steps = np.concatenate([np.abs(_angular_diff(a, angular_dims)) / scale for a in actions])
         speeds = np.concatenate([_speed(a, scale, ds.fps) for a in actions])
         p75 = float(np.nanpercentile(speeds, 75)) if np.isfinite(speeds).any() else 0.0
         # a dim with scale already NaN'd out above (constant dataset-wide) makes its whole
@@ -209,8 +213,46 @@ class DatasetContext:
             idle_speed=cfg.idle_fraction_of_p75 * p75,
             gripper_dims=gripper_dims,
             sync_dims=sync_dims,
+            angular_dims=angular_dims,
             **video_ctx,
         )
+
+
+def _angular_action_dims(allA: np.ndarray, cfg: Config) -> np.ndarray:
+    """Which action dims are a radian angle wrapped to [-pi, pi] (e.g. ``eef_rot_euler_z``).
+
+    Detected from the data, not the feature name: a dim counts as wrapping only if every
+    value for it, across the whole dataset, stays within ``+-(pi + angular_wrap_tol)`` *and*
+    it actually reaches within ``angular_wrap_reach`` of both +pi and -pi -- i.e. it uses the
+    full wrap range, not just a joint whose physical limits happen to sit under pi. A
+    position (metres) or a joint with a narrower range never satisfies both at once, so this
+    only ever matches a genuine wrapped angle.
+    """
+    lo = np.nanmin(allA, axis=0)
+    hi = np.nanmax(allA, axis=0)
+    bounded = (hi <= np.pi + cfg.angular_wrap_tol) & (lo >= -np.pi - cfg.angular_wrap_tol)
+    reach = cfg.angular_wrap_reach
+    reaches_both_ends = (hi >= np.pi - reach) & (lo <= -np.pi + reach)
+    return bounded & reaches_both_ends
+
+
+def _angular_diff(action: np.ndarray, angular: np.ndarray | None) -> np.ndarray:
+    """``np.diff(action, axis=0)``, with wrapping angle dims taken as their shortest step.
+
+    A wrapped angle (values confined to [-pi, pi]) jumps by ~2*pi on an ordinary frame that
+    crosses the wrap boundary during otherwise continuous rotation -- indistinguishable from
+    real motion to a plain diff. Found on a real dataset
+    (RoboCOIN/Agilex_Cobot_Magic_heat_burger): its ``eef_rot_euler_x/z_rad`` dims wrap during
+    normal wrist motion, and the plain diff below used to flag that crossing as a
+    single-frame "abrupt action jump" on nearly every episode. Taking the equivalent diff in
+    (-pi, pi] instead removes exactly that artifact and nothing else -- it's a no-op for any
+    dim whose steps never approach +-pi.
+    """
+    d = np.diff(action, axis=0)
+    if angular is not None and angular.any():
+        d = d.copy()
+        d[:, angular] = (d[:, angular] + np.pi) % (2 * np.pi) - np.pi
+    return d
 
 
 def _speed(action: np.ndarray, scale: np.ndarray, fps: float) -> np.ndarray:
@@ -525,7 +567,7 @@ def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
 def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
     if ep.action is None or ctx.action_scale is None or ep.length < 3:
         return
-    step = np.diff(ep.action, axis=0) / ctx.action_scale
+    step = _angular_diff(ep.action, ctx.angular_dims) / ctx.action_scale
     limit = cfg.spike_factor * ctx.step_p99
     big = np.abs(step) > limit
     # a glitch is a large step immediately reversed by a large step on the same dim
