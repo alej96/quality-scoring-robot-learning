@@ -9,6 +9,57 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` flagging normal wrapped-angle rotation as a jump/spike.**
+      Found by running `demoqc score` against a real Hub dataset beyond the existing
+      validation set (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, a dual-arm teleop
+      dataset found via `list_datasets(filter="LeRobot", sort="downloads")`): nearly
+      every episode (27/20 sampled, mean score 71.0, 6/20 below 70) carried multiple
+      `smoothness` "abrupt action jump"/"single-frame action spike" flags, on a dataset
+      whose other checks (`idle`, `metadata`, `timing`) looked clean. Per-dim inspection
+      of the raw action (`action.shape == [26]`, names like `left_eef_rot_euler_x_rad`)
+      found the actual cause: two of its 26 dims are Euler angles wrapped to `[-pi, pi]`
+      (confirmed: `min`/`max` across episodes sit at -3.14/3.142, essentially exactly
+      `+-pi`), and the robot's wrist rotates through the wrap boundary during perfectly
+      smooth, continuous motion -- every other dim (joints in radians with a narrower
+      range, positions in metres, a 0-1 gripper) never comes close to `+-pi` and has a
+      per-frame step two to three orders of magnitude smaller (p99 0.03-0.18 rad vs. a
+      ~6.28-rad wrap jump). `check_smoothness`'s plain `np.diff` has no notion of the
+      dim being circular, so a wrap crossing -- functionally identical to a tiny real
+      rotation -- read as a single-frame step tens of times the dataset's own
+      `step_p99` for that dim, well past `spike_factor`'s 6x threshold. Fixed by adding
+      `checks._angular_action_dims` (`DatasetContext.build`): a dim counts as a wrapped
+      angle only if every value for it, across the whole dataset, stays within
+      `+-(pi + angular_wrap_tol)` *and* it actually reaches within `angular_wrap_reach`
+      of both `+pi` and `-pi` -- derived from the data, not the feature name, so a joint
+      or position that merely happens to sit under `pi` (every dim in the existing
+      validation set) never qualifies, and the two conditions together only ever match
+      a dim that genuinely uses the full wrap range. `checks._angular_diff` then takes
+      the equivalent diff in `(-pi, pi]` for those dims only, in both
+      `DatasetContext.build`'s `step_p99` baseline and `check_smoothness` itself, so the
+      wrap crossing is seen as the small real rotation it is -- a no-op for every other
+      dim and every dataset without this representation. New
+      `tests/test_checks.py::test_smoothness_ignores_wrapped_angle_crossings` builds a
+      small synthetic dataset by hand (one angle dim that wraps across several episodes,
+      one ordinary joint dim, one episode with a real, unrelated jump on the joint dim)
+      and asserts the wrap episode gets zero smoothness flags while the real-jump episode
+      still gets one; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- the wrap episode gets 2 spurious jumps). A second new test,
+      `test_angular_action_dims_requires_reaching_both_wrap_boundaries`, locks in the
+      detection's three-way boundary logic directly. Validated on the real dataset:
+      `demoqc score RoboCOIN/Agilex_Cobot_Magic_heat_burger --max-episodes 20` went from
+      mean 71.0 (median 72.3, 6/20 below 70, `smoothness` x27) to mean 88.9 (median 92.1,
+      1/20 below 70, `smoothness` x9) -- confirmed via `DatasetContext.build` that only the
+      four actual `*_rot_euler_x/z_rad` dims (left and right arm) are detected as angular,
+      not the 22 other action dims; the remaining 9 `smoothness` flags are on different
+      episodes/dims (real jerkiness, not wrapping) and unaffected by this change. Also ran
+      `lerobot/aloha_static_cups_open` (50 ep) and `lerobot/aloha_static_battery` (49 ep,
+      joint-space action, no wrapped dims) to confirm a no-op on datasets without this
+      representation: byte-identical mean scores (100.0, 93.3) and flag counts
+      (`smoothness` x46 on `battery`, unchanged) before and after. Re-ran the full existing
+      validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every
+      prior Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming no regression -- none of
+      their action dims are bounded anywhere near `+-pi`.
 - [x] **Fix `check_idle` silently skipping 1- and 2-frame episodes.** Found by running
       `demoqc score` against a real Hub dataset beyond the existing validation set
       (`lerobot/svla_so100_stacking`): episode 20 (exactly 1 frame) scored 90.0 with only
@@ -976,3 +1027,22 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `aaronsu11/so100_lego`, `shylee/so100_cube`): byte-identical mean scores to every prior
   Log entry (97.1 / 92.9 / 92.2 / 99.2), confirming no regression on episodes with 3+
   frames.
+- 2026-11-05: Fixed `check_smoothness` flagging a wrapped-angle rotation (an Euler angle
+  crossing the `+-pi` boundary) as an abrupt action jump (see the "Next up" item above for
+  the full root-cause and validation details). Found by scoring a real Hub dataset beyond
+  the existing validation set (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, a dual-arm teleop
+  dataset): nearly every episode carried spurious `smoothness` flags from its
+  `eef_rot_euler_x/z_rad` action dims wrapping during otherwise smooth wrist motion.
+  `checks.DatasetContext.build` now detects, from the data alone, which action dims are a
+  radian angle wrapped to `[-pi, pi]` (bounded within it *and* reaching close to both ends),
+  and both the `step_p99` baseline and `check_smoothness` itself diff those dims on the
+  circle instead of linearly. New
+  `tests/test_checks.py::test_smoothness_ignores_wrapped_angle_crossings` fails on the
+  pre-fix code exactly as the real dataset did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). `demoqc score RoboCOIN/Agilex_Cobot_Magic_heat_burger
+  --max-episodes 20` went from mean 71.0 (6/20 below 70) to mean 88.9 (1/20 below 70), with
+  only the four actual wrapping dims detected as angular. Re-validated the full existing
+  dataset set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`) plus two ALOHA joint-space datasets with no
+  wrapped dims (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`):
+  byte-identical mean scores and flag counts on all six, confirming no regression.
