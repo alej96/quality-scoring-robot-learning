@@ -8,6 +8,7 @@ LeRobot datasets (``lerobot/svla_so101_pickplace``, ``lerobot/pusht``).
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -69,6 +70,8 @@ class Config:
     video_freeze_max_abs_diff: float = 0.03  # largest per-block thumbnail diff (0-1) still "frozen"
     angular_wrap_tol: float = 0.05  # float slack past +-pi an "angular" dim's values may still hit
     angular_wrap_reach: float = 0.3  # how close to +-pi a dim must get to count as wrapping
+    angular_pair_cancel_frac: float = 0.25  # gimbal-lock: x/z step cancels if their combined
+    # step is below this fraction of each axis's own step
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -154,6 +157,8 @@ class DatasetContext:
     gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
     sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
     angular_dims: np.ndarray | None = None  # action dims that wrap as a radian angle in [-pi, pi]
+    angular_pairs: list[tuple[int, int]] = field(default_factory=list)  # x/z axis dim pairs of
+    # the same Euler-angle rotation triple, which can trade off at a gimbal-lock singularity
     # --decode-video support (check_video_freeze); video_root is only set for a local
     # dataset (v2.x or v3.0), since videos are never downloaded from the Hub (see
     # video.resolve_v2_video_path/resolve_v3_video_path).
@@ -192,6 +197,7 @@ class DatasetContext:
         scale = np.where(scale > 1e-9, scale, std)
         scale = np.where(scale > 1e-9, scale, np.nan)  # constant dims are ignored
         angular_dims = _angular_action_dims(allA, cfg)
+        angular_pairs = _angular_pair_axes(ds.action_names, angular_dims)
         steps = np.concatenate([np.abs(_angular_diff(a, angular_dims)) / scale for a in actions])
         speeds = np.concatenate([_speed(a, scale, ds.fps) for a in actions])
         p75 = float(np.nanpercentile(speeds, 75)) if np.isfinite(speeds).any() else 0.0
@@ -214,6 +220,7 @@ class DatasetContext:
             gripper_dims=gripper_dims,
             sync_dims=sync_dims,
             angular_dims=angular_dims,
+            angular_pairs=angular_pairs,
             **video_ctx,
         )
 
@@ -251,8 +258,65 @@ def _angular_diff(action: np.ndarray, angular: np.ndarray | None) -> np.ndarray:
     d = np.diff(action, axis=0)
     if angular is not None and angular.any():
         d = d.copy()
-        d[:, angular] = (d[:, angular] + np.pi) % (2 * np.pi) - np.pi
+        d[:, angular] = _wrap_pi(d[:, angular])
     return d
+
+
+def _wrap_pi(x: np.ndarray) -> np.ndarray:
+    """Wrap radian value(s) to the shortest equivalent in ``(-pi, pi]``."""
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
+_AXIS_SUFFIX = re.compile(r"^(.+)_([a-zA-Z])_rad$")
+
+
+def _angular_pair_axes(
+    action_names: list[str] | None, angular_dims: np.ndarray | None
+) -> list[tuple[int, int]]:
+    """Pairs of wrapped-angle dims that are the x/z axes of the same Euler-angle rotation
+    triple (same feature-name prefix, e.g. ``eef_rot_euler_x_rad``/``eef_rot_euler_z_rad``).
+
+    Found on a real dataset (``RoboCOIN/Agilex_Cobot_Magic_place_towel_flat``): when the
+    middle (``_y_rad``, pitch) axis nears its own +-pi/2 gimbal-lock singularity, a tiny real
+    rotation can swing the x and z axes' individual values by a large, precisely correlated
+    amount even though the end effector barely moved -- each axis read in isolation looks
+    like an abrupt jump. The exact combination that stays (near) constant through this --
+    ``x - z`` or ``x + z``, depending on sign convention -- is checked directly in
+    ``check_smoothness`` rather than relying on locating the pitch axis itself, so this needs
+    no assumption about which Euler convention or axis order produced the data.
+    """
+    if action_names is None or angular_dims is None:
+        return []
+    groups: dict[str, dict[str, int]] = {}
+    for i in np.nonzero(angular_dims)[0]:
+        name = action_names[i] if i < len(action_names) else None
+        m = _AXIS_SUFFIX.match(name) if name else None
+        if m:
+            groups.setdefault(m.group(1), {})[m.group(2).lower()] = int(i)
+    return [(g["x"], g["z"]) for g in groups.values() if "x" in g and "z" in g]
+
+
+def _suppress_gimbal_lock_pairs(
+    action: np.ndarray, big: np.ndarray, pairs: list[tuple[int, int]], cancel_frac: float
+) -> None:
+    """Clear a spike/jump flag shared by a paired rotation-axis dim when it's a gimbal-lock
+    representation artifact rather than real motion (see ``_angular_pair_axes``), by testing
+    whether ``a - b`` or ``a + b`` barely moved while each axis's own step is large. Mutates
+    ``big`` in place.
+    """
+    for a, b in pairs:
+        flagged = big[:, a] | big[:, b]
+        if not flagged.any():
+            continue
+        da = _wrap_pi(np.diff(action[:, a]))
+        db = _wrap_pi(np.diff(action[:, b]))
+        combo_minus = np.abs(_wrap_pi(np.diff(action[:, a] - action[:, b])))
+        combo_plus = np.abs(_wrap_pi(np.diff(action[:, a] + action[:, b])))
+        best_combo = np.minimum(combo_minus, combo_plus)
+        dominant = np.maximum(np.abs(da), np.abs(db))
+        cancels = flagged & (best_combo < cancel_frac * dominant)
+        big[cancels, a] = False
+        big[cancels, b] = False
 
 
 def _speed(action: np.ndarray, scale: np.ndarray, fps: float) -> np.ndarray:
@@ -570,6 +634,8 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
     step = _angular_diff(ep.action, ctx.angular_dims) / ctx.action_scale
     limit = cfg.spike_factor * ctx.step_p99
     big = np.abs(step) > limit
+    if ctx.angular_pairs:
+        _suppress_gimbal_lock_pairs(ep.action, big, ctx.angular_pairs, cfg.angular_pair_cancel_frac)
     # a glitch is a large step immediately reversed by a large step on the same dim
     reversal = big[:-1] & big[1:] & (np.sign(step[:-1]) != np.sign(step[1:]))
     spikes = int(reversal.any(axis=1).sum())

@@ -173,6 +173,80 @@ def test_angular_action_dims_requires_reaching_both_wrap_boundaries():
     np.testing.assert_array_equal(mask, [True, False, False])
 
 
+def _gimbal_lock_dataset() -> Dataset:
+    """A synthetic dataset with two Euler-angle action dims (``..._x_rad``/``..._z_rad``,
+    both wrapped to [-pi, pi]) that pair up under ``_angular_pair_axes``, plus a normal
+    joint dim.
+
+    Built by hand for the same reason as ``_angular_dataset``: it needs dims genuinely
+    confined to [-pi, pi] and, here, a frame where both axes jump by the *same* amount
+    (the gimbal-lock signature -- ``x - z`` barely moves even though each axis's own step
+    is huge) versus a frame where only one axis jumps (a real, unrelated defect).
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    names = ["arm_rot_euler_x_rad", "arm_rot_euler_z_rad", "joint"]
+
+    def episode(idx: int, x: np.ndarray, z: np.ndarray) -> Episode:
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * idx
+        action = np.stack([x, z, joint], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    def wrap(angle_step: float, phase: float) -> np.ndarray:
+        return np.mod(angle_step * t + phase + np.pi, 2 * np.pi) - np.pi
+
+    # bounded well short of +-pi: ordinary slow motion, used to build a normal step_p99
+    # baseline (x and z independent, not correlated)
+    clean = [episode(i, wrap(0.02, 0.1 * i), wrap(0.017, -0.1 * i)) for i in range(6)]
+    # each axis independently sweeps several full turns so the dataset-wide range reaches
+    # both +pi and -pi for both dims (qualifying them as angular, like _angular_dataset)
+    wrap_provider = episode(6, wrap(0.15, 0.0), wrap(0.13, 1.0))
+
+    gimbal_x = np.full(n, 0.3)
+    gimbal_z = np.full(n, -0.2)
+    gimbal_x[45:] += 1.2  # both axes jump by the *same* amount at the same frame: a real
+    gimbal_z[45:] += 1.2  # rotation would leave (x - z) almost unchanged, this doesn't
+    gimbal_ep = episode(7, gimbal_x, gimbal_z)
+
+    jump_x = np.full(n, 0.3)
+    jump_z = np.full(n, -0.2)
+    jump_x[45:] += 1.2  # only one axis jumps: a real, unrelated defect
+    jump_ep = episode(8, jump_x, jump_z)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, wrap_provider, gimbal_ep, jump_ep],
+        action_names=names,
+    )
+
+
+def test_smoothness_ignores_gimbal_lock_pair_cancellation():
+    # Found on a real Hub dataset (RoboCOIN/Agilex_Cobot_Magic_place_towel_flat): its
+    # eef_rot_euler_x/z_rad dims (already known to wrap, see the wrap-crossing fix above)
+    # also swing by a large, precisely correlated amount whenever the episode's pitch axis
+    # passes near its own gimbal-lock singularity, even though the end effector barely
+    # moved -- check_smoothness's per-dim wrap-aware diff still saw each axis's own huge
+    # swing as an "abrupt action jump", just as before the wrap fix, on nearly every
+    # episode of two real datasets (RoboCOIN/Agilex_Cobot_Magic_heat_burger and
+    # _place_towel_flat).
+    results = {r.episode_index: r for r in evaluate(_gimbal_lock_dataset())}
+
+    gimbal_result = results[7]
+    assert gimbal_result.metrics["spikes"] == 0
+    assert gimbal_result.metrics["jumps"] == 0
+    assert not [f for f in gimbal_result.flags if f.check == "smoothness"], gimbal_result.flags
+
+    # the fix must not blind the check to a real jump on just one of the paired dims
+    jump_result = results[8]
+    assert jump_result.metrics["jumps"] > 0
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)
