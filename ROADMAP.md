@@ -9,6 +9,62 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` flagging an Euler-angle gimbal-lock flip as a jump.** Found
+      by running `demoqc score` against real Hub datasets beyond the existing validation
+      set, in the same family as (and one episode of) the dataset the wrapped-angle fix
+      above was found on: `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat` (mean score 90.8,
+      3 episodes carrying a `smoothness` "abrupt action jump" flag) and
+      `RoboCOIN/Agilex_Cobot_Magic_heat_burger` itself, whose 1 residual `smoothness`
+      episode this run's own Log entry below had assumed was "real jerkiness, not
+      wrapping" -- it wasn't quite right either (see below). Both episodes'
+      `left/right_eef_rot_euler_x/z_rad` dims -- already known to wrap, and already
+      excluded from the wrap-crossing false positive by the fix above -- still swung by a
+      huge, precisely correlated amount on the exact frame flagged: e.g.
+      `right_eef_rot_euler_x_rad` jumped -0.97 rad while `right_eef_rot_euler_z_rad` jumped
+      -0.93 rad in the very same single frame, with their *difference* (`x - z`) staying
+      almost exactly constant (-0.584 before, -0.628 after -- a 0.044 rad drift versus each
+      axis's own ~0.95 rad swing). That's the textbook signature of an Euler-angle
+      gimbal-lock singularity (here, the un-exported pitch/`_y_rad` axis passing near its
+      own +-pi/2): the end effector's real orientation barely changed, but the particular
+      pair of axes that becomes degenerate at that singularity (`x - z`, or `x + z`
+      depending on sign convention) swaps a huge, matched amount between them to represent
+      the same orientation. `check_smoothness`'s existing per-dim wrap-aware diff has no
+      notion of a *pair* of dims trading off against each other, so it read each axis's own
+      swing as an independent "abrupt action jump", exactly like the already-fixed
+      wrap-boundary case but for a different root cause. Fixed by adding
+      `checks._angular_pair_axes` (`DatasetContext.build`): pairs of already-detected
+      wrapped-angle dims that share a feature-name prefix differing only in the axis letter
+      before `_rad` (e.g. `eef_rot_euler_x_rad`/`eef_rot_euler_z_rad`) are grouped as a
+      "coupled rotation pair". `checks._suppress_gimbal_lock_pairs`, called from
+      `check_smoothness` right after the existing spike/jump detection, then clears a
+      flagged frame on *both* dims of a pair whenever the wrapped difference of `x - z` (or
+      `x + z`, whichever is smaller -- checking both makes this robust to the convention's
+      sign without needing to know it) is below `angular_pair_cancel_frac` (0.25, new in
+      `Config`) of each axis's own raw step; a frame where only one paired axis jumps, or
+      both jump by unrelated amounts, never satisfies this and stays flagged. This needs no
+      assumption about Euler convention or axis order and no attempt to locate the pitch
+      axis itself -- it's a direct test on the two dims that actually jump. New
+      `tests/test_checks.py::test_smoothness_ignores_gimbal_lock_pair_cancellation` builds a
+      small synthetic dataset by hand (paired `_x_rad`/`_z_rad` dims that both wrap
+      dataset-wide, one episode where both jump by the *same* amount at the same frame, one
+      where only one of them jumps) and asserts the matched-jump episode gets zero
+      smoothness flags while the lone-jump episode still gets one; fails without this
+      change (confirmed via `git stash` on just `src/demoqc/checks.py` -- the matched-jump
+      episode asserts `1 == 0` on `jumps`, reproducing the real datasets exactly). Validated
+      on the real datasets: `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat` (15 ep) went from
+      mean 90.8 (3 `smoothness` flags) to 93.1 (0 `smoothness` flags, only the pre-existing
+      `idle` ones remain); `RoboCOIN/Agilex_Cobot_Magic_heat_burger` (20 ep, the wrapped-angle
+      fix's own validation dataset) went from mean 88.9 (1/20 below 70, `smoothness` x9) to
+      94.1 (0/20 below 70, `smoothness` x1) -- confirmed the one remaining flag is a genuine,
+      unrelated jump on ordinary joint dims (`left_arm_joint_3/5/6_rad`, far outside this
+      fix's scope), not another instance of this artifact. Also re-ran
+      `lerobot/aloha_static_cups_open`/`_battery` (joint-space, no Euler-angle dims) and got
+      byte-identical scores and flag counts to the existing validated numbers, confirming
+      this is a no-op on datasets without a coupled rotation pair. Re-ran the full existing
+      validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`): byte-identical
+      mean scores and flag counts to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2 / 95.2),
+      confirming no regression -- none of their action dims are Euler angles.
 - [x] **Fix `check_smoothness` flagging normal wrapped-angle rotation as a jump/spike.**
       Found by running `demoqc score` against a real Hub dataset beyond the existing
       validation set (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, a dual-arm teleop
@@ -1046,3 +1102,20 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `aaronsu11/so100_lego`, `shylee/so100_cube`) plus two ALOHA joint-space datasets with no
   wrapped dims (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`):
   byte-identical mean scores and flag counts on all six, confirming no regression.
+- 2026-11-06: Fixed `check_smoothness` flagging an Euler-angle gimbal-lock flip (a paired
+  `_x_rad`/`_z_rad` axis swap near the un-exported pitch axis's own +-pi/2 singularity) as
+  an abrupt action jump (see the "Next up" item above for the full root-cause and
+  validation details). Found by scoring real Hub datasets beyond the existing validation
+  set (`RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`, and a residual flag on
+  `_heat_burger` itself that yesterday's wrap fix had assumed was unrelated real
+  jerkiness): both axes jump by a large, nearly identical amount in the same frame, with
+  `x - z` barely moving even though each axis's own step is huge. New
+  `tests/test_checks.py::test_smoothness_ignores_gimbal_lock_pair_cancellation` fails on
+  the pre-fix code exactly as the real datasets did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). `place_towel_flat` (15 ep) went from mean 90.8 (3 `smoothness`
+  flags) to 93.1 (0); `heat_burger` (20 ep) went from mean 88.9 (`smoothness` x9) to 94.1
+  (`smoothness` x1, confirmed genuinely unrelated). Re-validated the full existing
+  dataset set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus both ALOHA
+  joint-space datasets: byte-identical mean scores and flag counts on all seven,
+  confirming no regression.
