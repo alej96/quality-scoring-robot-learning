@@ -247,6 +247,78 @@ def test_smoothness_ignores_gimbal_lock_pair_cancellation():
     assert "smoothness" in _checks(jump_result)
 
 
+def _sustained_ramp_dataset() -> Dataset:
+    """A synthetic dataset with one action dim that sits nearly still almost the whole
+    time (like a dexterous-hand finger joint that only moves to grasp) plus a normal,
+    unrelated joint dim.
+
+    Built by hand (not via ``make_dataset``/``write_dataset``) for the same reason as
+    ``_angular_dataset``: it needs a dim whose dataset-wide step is tiny almost everywhere,
+    with many clean episodes to dilute the handful of large steps below the 99th
+    percentile used as the check's own baseline.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    n_clean = 120
+
+    def episode(idx: int, still_dim: np.ndarray) -> Episode:
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * (idx % 10)
+        action = np.stack([joint, still_dim], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    def baseline(idx: int) -> np.ndarray:
+        return 0.2 + 0.01 * np.sin(2 * np.pi * t / 13 + idx)  # tiny dataset-wide jitter
+
+    clean = [episode(i, baseline(i)) for i in range(n_clean)]
+
+    # one smooth, monotonic, continuous ramp (a fast but perfectly smooth grasp closing),
+    # held at its new position afterwards -- never reverses, never jumps again
+    ramp = baseline(n_clean).copy()
+    ramp[40:61] = np.linspace(ramp[40], 0.9, 21)
+    ramp[61:] = 0.9
+    ramp_ep = episode(n_clean, ramp)
+
+    # two genuinely separate single-frame discontinuities, far apart in time
+    two_jumps = baseline(n_clean + 1).copy()
+    two_jumps[30:] += 0.5
+    two_jumps[70:] += 0.5
+    jump_ep = episode(n_clean + 1, two_jumps)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, ramp_ep, jump_ep],
+    )
+
+
+def test_smoothness_counts_a_sustained_ramp_as_one_jump():
+    # Found on a real Hub dataset (zekaiwang/trex_dataset, a dual-arm dexterous-hand
+    # dataset): its finger-joint targets sit still almost the whole episode, so
+    # step_p99 for those dims is tiny; a single smooth, monotonic grasp-closing motion
+    # spanning ~20 frames was reported as "20 abrupt action jump(s)" (big.any(axis=1).sum()
+    # counts every frame the ramp spans), even though none of those per-frame steps is
+    # actually discontinuous -- it's one continuous fast motion. 19/50 episodes carried
+    # this inflated flag, each capped at the check's max 20-point penalty.
+    results = {r.episode_index: r for r in evaluate(_sustained_ramp_dataset())}
+
+    ramp_result = results[120]
+    assert ramp_result.metrics["spikes"] == 0
+    assert ramp_result.metrics["jumps"] == 1
+    assert ramp_result.metrics["jumps"] < 20  # pre-fix: one flag per frame the ramp spans
+
+    # the fix must not merge two genuinely separate discontinuities into one
+    jump_result = results[121]
+    assert jump_result.metrics["jumps"] == 2
+
+    # every clean episode (dim at dataset-wide baseline jitter only) stays silent
+    for i in range(120):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)

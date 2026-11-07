@@ -636,11 +636,24 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
     big = np.abs(step) > limit
     if ctx.angular_pairs:
         _suppress_gimbal_lock_pairs(ep.action, big, ctx.angular_pairs, cfg.angular_pair_cancel_frac)
+    any_big = big.any(axis=1)
     # a glitch is a large step immediately reversed by a large step on the same dim
     reversal = big[:-1] & big[1:] & (np.sign(step[:-1]) != np.sign(step[1:]))
-    spikes = int(reversal.any(axis=1).sum())
-    # each spike accounts for two big steps; whatever remains is a one-way jump
-    jumps = max(0, int(big.any(axis=1).sum()) - 2 * spikes)
+    frame_reversal = reversal.any(axis=1)
+    spikes = int(frame_reversal.sum())
+    # each spike's up/down pair of frames is consumed by that spike, not also counted as
+    # a jump. Of what's left, a *sustained run* of consecutive big frames in the same
+    # direction (e.g. a multi-fingered hand closing quickly: many frames in a row with a
+    # step far above this dim's usual near-zero idle step, but each one continuing smoothly
+    # from the last) is one continuous fast motion, not one "abrupt jump" per frame it
+    # spans -- found on a real dataset (zekaiwang/trex_dataset) whose dexterous-hand finger
+    # targets sit still almost the whole episode, so step_p99 for those dims is tiny, and a
+    # single smooth, monotonic grasp closing over ~20 frames was reported as "20 abrupt
+    # action jumps" even though none of those steps is actually discontinuous.
+    consumed = np.zeros_like(any_big)
+    consumed[:-1] |= frame_reversal
+    consumed[1:] |= frame_reversal
+    jumps = len(_runs(any_big & ~consumed))
     out.metrics.update(spikes=spikes, jumps=jumps)
     if spikes:
         out.flags.append(
