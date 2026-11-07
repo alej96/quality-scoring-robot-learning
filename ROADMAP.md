@@ -9,6 +9,54 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` counting every frame of one sustained, smooth motion as a
+      separate "abrupt action jump".** Found by running `demoqc score` against a real Hub
+      dataset beyond the existing validation set (`zekaiwang/trex_dataset`, a dual-arm
+      dexterous-hand (22-DOF-per-hand) manipulation dataset found via
+      `list_datasets(filter="LeRobot", sort="downloads")`): 19/50 episodes carried a
+      `smoothness` "abrupt action jump" flag (mean score 94.3), several reporting 10-32
+      "jumps" each and hitting the check's max 20-point penalty, on a dataset whose other
+      checks (`idle`, `metadata`, `timing`) looked clean. Per-episode inspection of the
+      flagged action dims (e.g. `left_hand_target_q_21`) found the actual cause: a finger
+      joint sits still for almost the whole episode (it only moves to grasp), so its
+      dataset-wide `step_p99` baseline is tiny; printing the raw values around the flagged
+      frames showed a perfectly smooth, monotonic, single-direction ramp (0.18 -> 0.69 over
+      ~20 frames, no reversal, no discontinuity) -- a fast but genuinely smooth grasp-
+      closing motion, not jerkiness. `check_smoothness` counted `big.any(axis=1).sum()`
+      (the number of *frames* where any dim's step exceeds `spike_factor * step_p99`) as
+      the number of "abrupt action jumps", with no notion that many *consecutive* big
+      frames on the same dim, all stepping the same direction, are one continuous motion,
+      not N separate discontinuities -- exactly the "demos far jerkier than their peers"
+      detector overcounting a single fast-but-smooth event because the dim's "normal" step
+      is tiny the rest of the time. Fixed by counting contiguous *runs* of leftover big
+      frames (after excluding the two frames each already-detected spike consumes) via the
+      existing `_runs` helper, instead of counting every big frame in the run separately;
+      an isolated single-frame jump (one-frame run) is unaffected, two well-separated
+      jumps still count as two, and a single sustained ramp now counts as the one event it
+      is. New `tests/test_checks.py::test_smoothness_counts_a_sustained_ramp_as_one_jump`
+      builds a 122-episode synthetic dataset by hand (120 clean episodes establishing a
+      tiny dataset-wide step baseline for a "finger" dim, one smooth 21-frame ramp episode,
+      one episode with two genuinely separate single-frame jumps) and asserts the ramp
+      episode gets exactly 1 jump (not 20) while the two-jump episode still gets 2 and
+      every clean episode stays silent; fails without this change (confirmed via
+      `git stash` on just `src/demoqc/checks.py` -- the ramp episode asserts `20 == 1`,
+      reproducing the real dataset's per-frame overcounting exactly). Validated on the real
+      dataset: `demoqc score zekaiwang/trex_dataset --max-episodes 50` went from mean 94.3
+      (`smoothness` jump counts up to 32 per episode) to mean 95.2 (same 19 episodes still
+      flagged -- this fix doesn't claim the remaining, smaller jump counts are false
+      positives, only that a single continuous motion shouldn't be counted once per frame
+      it spans -- but with accurate, much smaller counts, e.g. episode 12's 32 "jumps"
+      -> 8 real contiguous runs). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and both ALOHA
+      joint-space datasets (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`)
+      and got byte-for-byte identical mean scores and flag counts to every prior Log entry
+      on all but `aloha_static_battery`: there, the flag *count* stayed at 46 (same 46
+      frames/episodes implicated) but mean score rose from 93.3 to 95.0 on the full
+      49-episode dataset, since several of its real jump events also span multiple
+      consecutive frames and were previously over-penalized by the same per-frame
+      overcounting this fix corrects -- a strictly more accurate severity, not a different
+      diagnosis.
 - [x] **Fix `check_smoothness` flagging an Euler-angle gimbal-lock flip as a jump.** Found
       by running `demoqc score` against real Hub datasets beyond the existing validation
       set, in the same family as (and one episode of) the dataset the wrapped-angle fix
@@ -1119,3 +1167,21 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus both ALOHA
   joint-space datasets: byte-identical mean scores and flag counts on all seven,
   confirming no regression.
+- 2026-11-07: Fixed `check_smoothness` counting every frame of one sustained, smooth
+  motion as a separate "abrupt action jump" (see the "Next up" item above for the full
+  root-cause and validation details). Found by scoring a real Hub dataset beyond the
+  existing validation set (`zekaiwang/trex_dataset`, a dual-arm dexterous-hand
+  manipulation dataset): a finger joint sits still almost the whole episode, so its
+  dataset-wide step baseline is tiny, and a single smooth, monotonic, 20-frame grasp-
+  closing ramp was reported as "20 abrupt action jump(s)" even though none of those steps
+  is actually discontinuous. `check_smoothness` now counts contiguous *runs* of leftover
+  big-step frames (via the existing `_runs` helper) instead of every frame in the run
+  separately. New `tests/test_checks.py::test_smoothness_counts_a_sustained_ramp_as_one_jump`
+  fails on the pre-fix code exactly as the real dataset did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). `demoqc score zekaiwang/trex_dataset --max-episodes 50` went
+  from mean 94.3 to 95.2 with the same 19 episodes flagged but far more accurate jump
+  counts (e.g. 32 -> 8 on episode 12). Re-validated the full existing dataset set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus both ALOHA
+  datasets: byte-identical on all but `aloha_static_battery`, whose mean rose from 93.3 to
+  95.0 with the same 46 flags (more accurate severity, not a different diagnosis).
