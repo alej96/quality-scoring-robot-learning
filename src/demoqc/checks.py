@@ -72,6 +72,9 @@ class Config:
     angular_wrap_reach: float = 0.3  # how close to +-pi a dim must get to count as wrapping
     angular_pair_cancel_frac: float = 0.25  # gimbal-lock: x/z step cancels if their combined
     # step is below this fraction of each axis's own step
+    smoothness_dim_outlier_z: float = 4.0  # exclude a dim from spike/jump detection if
+    # log(step_p99) is this many robust MADs from the dataset's other action dims' own
+    # median -- a joint/axis the task barely ever moves, so step_p99 reflects only noise
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -212,6 +215,7 @@ class DatasetContext:
         # dims that almost never change (e.g. a binary gripper) have no step scale;
         # leave them out of spike detection rather than flag every toggle
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
+        step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
         return cls(
             fps=ds.fps,
             action_scale=scale,
@@ -223,6 +227,46 @@ class DatasetContext:
             angular_pairs=angular_pairs,
             **video_ctx,
         )
+
+
+def _exclude_noise_dominated_dims(step_p99: np.ndarray, z_thresh: float) -> np.ndarray:
+    """Exclude (set to NaN) action dims whose ``step_p99`` is a wild outlier among this
+    dataset's *other* dims, in log space (dims span orders of magnitude multiplicatively).
+
+    Found on a real dataset (``RoboCOIN/AI2_Alphabot_2_insert_water_pipe``): its torso
+    joints sit still for virtually the entire task (dataset-wide range under 0.08 rad,
+    vs. 0.17+ for every arm/eef/gripper dim), so their ``step_p99`` reflects nothing but
+    sensor/controller noise around a fixed setpoint -- and that noise, scattered as many
+    separate single-frame blips across almost every episode (not one sustained ramp, so
+    the existing run-counting fix doesn't help), was flagged as a dataset-wide pile of
+    "abrupt action jump(s)": 19/20 episodes carried a `smoothness` flag, several hitting
+    the check's max penalty, on a dataset whose other checks looked clean. A genuinely
+    driven dim's ``step_p99`` (99th-pct per-frame step, already normalised by the dim's own
+    scale) clusters tightly with every other genuinely driven dim regardless of its
+    physical units, since it reflects control/teleop dynamics (how many frames a typical
+    motion takes), not the unit itself -- so comparing a dim's ``step_p99`` to the
+    *dataset's own other dims'* median, via a robust z-score, needs no per-unit tuning and
+    is a no-op on a dataset where every dim is actually used (confirmed on
+    ``zekaiwang/trex_dataset``, a 58-action-dim dexterous-hand dataset whose dims
+    naturally spread over a much wider range of ``step_p99`` than a simple arm: every
+    genuinely moved finger dim there stays within z=+-3, while two already-known
+    barely-used finger dims (range 0.02-0.03 rad, an order of magnitude below every other
+    finger's 0.4-1.1 rad) sit at z=+5.4/+5.9 and are correctly excluded instead).
+    Skipped entirely below 5 live dims, where a robust z-score isn't meaningful.
+    """
+    valid = np.isfinite(step_p99) & (step_p99 > 0)
+    if valid.sum() < 5:
+        return step_p99
+    idx = np.flatnonzero(valid)
+    logp = np.log(step_p99[idx])
+    med = np.median(logp)
+    mad = np.median(np.abs(logp - med)) * 1.4826
+    if mad < 1e-9:
+        return step_p99
+    z = np.abs(logp - med) / mad
+    out = step_p99.copy()
+    out[idx[z > z_thresh]] = np.nan
+    return out
 
 
 def _angular_action_dims(allA: np.ndarray, cfg: Config) -> np.ndarray:

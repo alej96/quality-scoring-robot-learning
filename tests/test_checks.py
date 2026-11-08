@@ -319,6 +319,93 @@ def test_smoothness_counts_a_sustained_ramp_as_one_jump():
         assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
 
 
+def _noise_dominated_dim_dataset() -> Dataset:
+    """A synthetic dataset with five normal, actively-moving joint dims plus one dim that
+    sits almost frozen for the whole dataset (like a torso/neck joint the task never
+    really uses), with occasional sensor-noise blips.
+
+    Built by hand for the same reason as the other smoothness fixtures: it needs five
+    dims with a natural spread of ``step_p99`` (so the new dim-outlier check has a
+    meaningful population to compare against) plus a sixth dim whose own ``step_p99`` is
+    a clear outlier among them.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    n_clean = 40
+    rng = np.random.default_rng(0)
+    freqs = np.array([1.0, 1.6, 0.6, 2.2, 0.9])
+    amps = np.array([5.0, 3.0, 7.0, 2.0, 6.0])
+    phases0 = np.array([0.3, 1.1, 2.0, 2.9, 4.0])
+
+    def active_dims(idx: int) -> np.ndarray:
+        return amps * np.sin(2 * np.pi * freqs[None, :] * t[:, None] / n + phases0 + 0.01 * idx)
+
+    def noise_dim(idx: int, blip_frame: int | None = None, blip_mag: float = 0.0) -> np.ndarray:
+        d = 0.002 * np.sin(2 * np.pi * t / 37 + idx) + rng.normal(0, 0.0003, n)
+        if blip_frame is not None:
+            d = d.copy()
+            d[blip_frame:] += blip_mag  # a one-off sensor blip, held (not an immediate
+            # reversal, which check_smoothness already treats as a "spike" glitch)
+        return d
+
+    def episode(
+        idx: int,
+        noise: np.ndarray,
+        jump_dim: int | None = None,
+        jump_frame: int | None = None,
+        jump_mag: float = 0.0,
+    ) -> Episode:
+        act = active_dims(idx)
+        if jump_dim is not None:
+            act = act.copy()
+            act[jump_frame:, jump_dim] += jump_mag
+        action = np.concatenate([act, noise[:, None]], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    blip_episodes = range(0, n_clean, 7)
+    clean = []
+    for i in range(n_clean):
+        if i in blip_episodes:
+            noise = noise_dim(i, blip_frame=20 + (i % 50), blip_mag=0.05 if i % 2 == 0 else -0.05)
+        else:
+            noise = noise_dim(i)
+        clean.append(episode(i, noise))
+
+    # a genuine, unrelated jump on one of the five normal dims
+    jump_ep = episode(n_clean, noise_dim(n_clean + 900), jump_dim=1, jump_frame=45, jump_mag=10.0)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, jump_ep],
+    )
+
+
+def test_smoothness_ignores_a_noise_dominated_dim():
+    # Found on a real Hub dataset (RoboCOIN/AI2_Alphabot_2_insert_water_pipe): its torso
+    # joints sit still for virtually the whole task (dataset-wide range under 0.08 rad,
+    # vs. 0.17+ for every arm/eef/gripper dim), so step_p99 for those dims reflects
+    # nothing but sensor/controller noise around a fixed setpoint. That noise, scattered
+    # as separate single-frame blips across almost every episode (not one sustained ramp,
+    # so the run-counting fix above doesn't help), was flagged as a dataset-wide pile of
+    # "abrupt action jump(s)": 19/20 episodes carried a `smoothness` flag, on a dataset
+    # whose other checks looked clean (mean score 85.1, 1 episode below 70).
+    results = {r.episode_index: r for r in evaluate(_noise_dominated_dim_dataset())}
+
+    for i in range(40):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert results[i].metrics["spikes"] == 0, (i, results[i].metrics)
+
+    # the fix must not blind the check to a real jump on one of the normal dims
+    jump_result = results[40]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)
