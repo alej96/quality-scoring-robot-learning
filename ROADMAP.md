@@ -9,6 +9,65 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` flagging a noise-dominated dim (e.g. an unused torso/neck
+      joint) as abrupt action jumps.** Found by running `demoqc score` against a real Hub
+      dataset beyond the existing validation set
+      (`RoboCOIN/AI2_Alphabot_2_insert_water_pipe`, found via `list_datasets(filter=
+      "LeRobot", sort="downloads")`): 19/20 episodes carried a `smoothness` "abrupt action
+      jump(s)" flag (mean score 85.1, 1 episode below 70), several hitting the check's max
+      20-point penalty, on a dataset whose other checks looked clean. Per-dim inspection of
+      the flagged action dims (`torso_joint_1/2/3_rad`) found the root cause: this robot's
+      torso barely moves at all through the whole task (dataset-wide range 0.06-0.08 rad,
+      under 5 degrees, vs. 0.17+ rad/m for every genuinely driven arm/eef/gripper dim), so
+      `step_p99` for those dims reflects nothing but sensor/controller noise around a fixed
+      setpoint, not real motion -- and that noise, scattered as separate single-frame blips
+      across almost every episode (not one sustained ramp, so the existing run-counting fix
+      doesn't help: these aren't consecutive), each independently exceeded
+      `spike_factor * step_p99` and was counted as its own "jump". A genuinely driven dim's
+      `step_p99` (already normalised by the dim's own robust scale) clusters tightly with
+      every other genuinely driven dim regardless of physical units, since it reflects
+      control/teleop dynamics (how many frames a typical motion takes), not the unit
+      itself. Fixed by adding `checks._exclude_noise_dominated_dims`, called from
+      `DatasetContext.build` right after `step_p99` is computed: a dim is excluded from
+      spike/jump detection (its `step_p99` set to NaN, reusing the same mechanism that
+      already excludes a fully-constant dim) if `log(step_p99)` is more than
+      `smoothness_dim_outlier_z` (4.0, new in `Config`) robust MADs from the *median of the
+      dataset's other dims' own* `log(step_p99)` -- skipped entirely below 5 live dims,
+      where a robust z-score isn't meaningful. New
+      `tests/test_checks.py::test_smoothness_ignores_a_noise_dominated_dim` builds a
+      41-episode synthetic dataset by hand (5 normal, actively-moving joint dims with a
+      natural spread of `step_p99`, plus a 6th dim that sits almost frozen except for
+      scattered single-frame blips in 6 of 40 "clean" episodes, plus one episode with a
+      genuine jump on dim 1) and asserts every blip episode is silent while the genuine-jump
+      episode still flags; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- each blip episode asserts `1 == 0` on `jumps`, reproducing
+      the real dataset's per-episode overcounting exactly). Validated on the real dataset:
+      `demoqc score RoboCOIN/AI2_Alphabot_2_insert_water_pipe --max-episodes 20` went from
+      mean 85.1 (1/20 below 70, `smoothness` x19 episodes) to mean 94.1 (0/20 below 70,
+      `smoothness` x4 episodes) -- the 4 remaining `smoothness` episodes are a smaller,
+      related residual on `torso_joint_4_rad`/`neck_joint_1_rad`/`neck_joint_2_rad` (the
+      *high*-side mirror of this same defect: both their `scale` and `step_p99` are
+      dominated by noise around a near-zero-range dim, but their outlier z-score, 2.5-3.0,
+      falls short of the 4.0 threshold -- chosen conservatively so as not to risk excluding
+      a real, legitimately low-`step_p99` dim elsewhere, see below), tracked as a follow-up.
+      Re-ran the full existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`), both ALOHA joint-space datasets
+      (`lerobot/aloha_static_cups_open`, `lerobot/aloha_static_battery`), both Agilex
+      datasets from the gimbal-lock fix's own validation
+      (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, `_place_towel_flat`, via `git stash`
+      before/after for an exact apples-to-apples diff since the full-dataset episode counts
+      differ from their original Log entries) and the sustained-ramp fix's own
+      `zekaiwang/trex_dataset` (a 58-action-dim dexterous-hand dataset, the real test of
+      this fix's safety: its dims naturally spread over a much wider `step_p99` range than
+      a simple arm) and got byte-for-byte identical mean scores and flag counts to every
+      prior Log entry on all seven -- confirming this is a no-op whenever a dataset's dims
+      are all genuinely driven, including a dataset with 58 dims of naturally varied
+      motion scale.
+      Follow-up: `torso_joint_4_rad`/`neck_joint_1/2_rad` on the same real dataset are the
+      same defect with a less extreme outlier z-score (2.5-3.0); lowering the threshold to
+      catch them loses the safety margin against `trex_dataset`'s real dims (max z=2.94)
+      and needs either a smarter combined signal or more real-dataset evidence first.
 - [x] **Fix `check_smoothness` counting every frame of one sustained, smooth motion as a
       separate "abrupt action jump".** Found by running `demoqc score` against a real Hub
       dataset beyond the existing validation set (`zekaiwang/trex_dataset`, a dual-arm
@@ -1185,3 +1244,24 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus both ALOHA
   datasets: byte-identical on all but `aloha_static_battery`, whose mean rose from 93.3 to
   95.0 with the same 46 flags (more accurate severity, not a different diagnosis).
+- 2026-11-08: Fixed `check_smoothness` flagging a noise-dominated dim (an unused torso/
+  neck joint moved by nothing but its own sensor noise) as abrupt action jumps (see the
+  "Next up" item above for the full root-cause and validation details). Found by scoring
+  a real Hub dataset beyond the existing validation set
+  (`RoboCOIN/AI2_Alphabot_2_insert_water_pipe`): its torso barely moves through the whole
+  task, so `step_p99` for those dims reflects only sensor noise, and that noise -- scattered
+  as separate single-frame blips across almost every episode, not one sustained ramp -- was
+  flagged as a dataset-wide pile of "abrupt action jump(s)" (19/20 episodes, mean 85.1, 1
+  below 70). A dim is now excluded from spike/jump detection if its `step_p99` is a robust
+  log-space outlier (z > `smoothness_dim_outlier_z`, 4.0) among the dataset's *other* dims.
+  New `tests/test_checks.py::test_smoothness_ignores_a_noise_dominated_dim` fails on the
+  pre-fix code exactly as the real dataset did (confirmed via `git stash` on
+  `src/demoqc/checks.py`). `demoqc score RoboCOIN/AI2_Alphabot_2_insert_water_pipe
+  --max-episodes 20` went from mean 85.1 (1/20 below 70, `smoothness` x19 episodes) to mean
+  94.1 (0/20 below 70, `smoothness` x4 episodes, a smaller related residual tracked as a
+  follow-up). Re-validated the full existing dataset set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`), both ALOHA
+  datasets, both Agilex datasets (`heat_burger`, `place_towel_flat`, via `git stash`
+  before/after) and `zekaiwang/trex_dataset` (58 action dims, the real safety test for a
+  cross-dim outlier check): byte-identical mean scores and flag counts on all seven.
