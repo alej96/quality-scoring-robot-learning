@@ -9,6 +9,45 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix the "jerkier than peers" (`ldlj_z`) smoothness flag firing on an
+      insignificant LDLJ gap when the peer group's spread happens to be tiny.** Found by
+      running `demoqc score` against a real Hub dataset beyond the existing validation set
+      (`EPITECH-LILLE/eval_training`, found via `list_datasets(filter="LeRobot", sort=
+      "downloads")`): episode 37, scored with `--max-episodes 20`, carried a `smoothness`
+      "much jerkier than peers (smoothness z=-3.6)" flag; the same episode, re-scored
+      against the dataset's full 40 episodes instead, got z=-0.68 (not flagged) for an
+      almost identical raw LDLJ value (-19.68 vs -19.65). The z-score, not the episode,
+      had changed: most of this dataset's episodes are a close variation on the same
+      motion, so `_robust_z`'s MAD reflects only that tight majority's own tiny spread
+      (0.185 with 20 peers) even with a handful of episodes sitting notably smoother on
+      the other side, inflating a moderate, probably-insignificant ~0.6-nat LDLJ gap from
+      the median into an extreme, peer-group-dependent z-score -- the exact MAD-instability
+      pattern `check_relative`'s own `length` check was already guarded against
+      ("require a material relative difference, not just a large z on a tiny spread"),
+      just not extended to `ldlj_z`. Fixed by requiring the LDLJ gap from the median to
+      also exceed a new `Config.min_ldlj_diff` (1.0 nat, ~2.7x the underlying dimensionless
+      jerk integral) before flagging -- a fixed gap in nats is a fixed *relative* change
+      in the always-positive jerk integral regardless of the dataset's own absolute LDLJ
+      range, so, unlike `length`'s check, this needed no dataset-relative floor. New
+      `tests/test_checks.py::test_smoothness_jerkier_than_peers_needs_a_material_ldlj_gap`
+      builds a 22-episode synthetic dataset by hand (a tight cluster of near-identical
+      motions, a few notably smoother ones, one moderately jerkier episode that trips the
+      raw z-score threshold with only a ~0.7-nat gap, one genuinely/drastically jerkier
+      episode) and asserts the moderate episode stays silent while the drastic one is
+      still flagged; fails without this change (confirmed via `git stash` on
+      `src/demoqc/checks.py` -- the moderate episode asserts a `smoothness` flag is absent
+      and gets one instead). Validated on the real dataset: `demoqc score
+      EPITECH-LILLE/eval_training --max-episodes 20` went from mean 94.1 (1/20 flagged,
+      the inconsistent z=-3.6 flag) to mean 99.3 (0 `smoothness` flags), now agreeing with
+      the `--max-episodes 40` run's own 0 `smoothness` flags (previously 85.6 vs 98.5
+      depending only on how many episodes happened to be loaded). Re-ran the full existing
+      validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got
+      byte-identical mean scores and flag counts to every prior Log entry (97.1 / 92.9 /
+      92.2 / 99.2 / 95.2), including `shylee/so100_cube`'s and `jccj/so100_block_in_cup`'s
+      own existing `ldlj_z` true positives (LDLJ gaps 1.4-2.7 nats, well clear of the new
+      1.0-nat floor) -- confirming this only removes flags whose own gap is too small to
+      be material, not the real ones.
 - [x] **Fix `check_smoothness` flagging a noise-dominated dim (e.g. an unused torso/neck
       joint) as abrupt action jumps.** Found by running `demoqc score` against a real Hub
       dataset beyond the existing validation set
@@ -1265,3 +1304,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
   datasets, both Agilex datasets (`heat_burger`, `place_towel_flat`, via `git stash`
   before/after) and `zekaiwang/trex_dataset` (58 action dims, the real safety test for a
   cross-dim outlier check): byte-identical mean scores and flag counts on all seven.
+- 2026-11-09: Fixed the `ldlj_z` "jerkier than peers" smoothness flag firing on a moderate,
+  probably-insignificant LDLJ gap purely because the peer group's own MAD happened to be
+  tiny -- `check_relative` now also requires the gap from the median to exceed
+  `Config.min_ldlj_diff` (1.0 nat) before flagging, the same "material difference, not
+  just a large z on a tiny spread" guard the `length` check already had. Found on
+  `EPITECH-LILLE/eval_training`: see the "Next up" entry above for the full root-cause and
+  before/after numbers.
