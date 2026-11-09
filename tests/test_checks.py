@@ -406,6 +406,69 @@ def test_smoothness_ignores_a_noise_dominated_dim():
     assert "smoothness" in _checks(jump_result)
 
 
+def _jerkier_than_peers_dataset() -> Dataset:
+    """A single-dim dataset where most episodes are a close variation on the same
+    smooth reach motion (a tight cluster, by construction), a handful are notably
+    smoother still (pulling the cluster's own spread, not its median), one episode is
+    only moderately jerkier, and one is genuinely, drastically jerkier.
+    """
+    n = 240  # 8s at FPS
+    t = np.linspace(0, 1, n)
+    reach = 50.0 * (1 - np.cos(2 * np.pi * t)) / 2 * np.sin(2 * np.pi * t)
+
+    def make(wiggle_amp: float, wiggle_freq: float, wiggle_phase: float) -> np.ndarray:
+        wiggle = wiggle_amp * np.sin(wiggle_freq * 2 * np.pi * t + wiggle_phase)
+        return (reach + wiggle)[:, None]
+
+    def episode(idx: int, action: np.ndarray) -> Episode:
+        frame_index = np.arange(n)
+        return Episode(
+            index=idx,
+            timestamps=frame_index / FPS,
+            frame_index=frame_index,
+            action=action,
+            state=action.copy(),
+        )
+
+    episodes = [episode(i, make(0.3 + 0.02 * i, 5.0, 0.1 * i)) for i in range(14)]
+    episodes += [episode(14 + i, make(0.02 + 0.002 * i, 5.0, 0.2 * i)) for i in range(6)]
+    episodes.append(episode(20, make(1.1, 5.0, 0.0)))  # moderately jerkier only
+    episodes.append(episode(21, make(0.3, 20.0, 0.0)))  # genuinely, drastically jerkier
+
+    return Dataset(
+        root=Path("."), fps=FPS, codebase_version="v3.0", robot_type=None, episodes=episodes
+    )
+
+
+def test_smoothness_jerkier_than_peers_needs_a_material_ldlj_gap():
+    # Found by running `demoqc score` against a real Hub dataset beyond the existing
+    # validation set (EPITECH-LILLE/eval_training): episode 37, scored against a
+    # 20-episode peer group, carried a "much jerkier than peers (smoothness z=-3.6)"
+    # flag -- but the same episode, re-scored against the dataset's full 40 episodes
+    # instead, got z=-0.68 (not flagged) for an almost identical raw LDLJ value. The
+    # z-score had changed, not the episode: most of this dataset's episodes are a close
+    # variation on the same motion, so the robust MAD reflects only that tight
+    # majority's own tiny spread, even with a few notably smoother episodes pulling the
+    # population in the other direction -- a moderate, probably-insignificant LDLJ gap
+    # from the median (here, ~0.7 nats) gets inflated into an extreme z-score purely by
+    # which episodes happen to be in the peer group.
+    results = {r.episode_index: r for r in evaluate(_jerkier_than_peers_dataset())}
+
+    for i in range(20):
+        assert "smoothness" not in _checks(results[i]), (i, results[i].flags)
+
+    # episode 20 trips the raw z-score threshold (reproducing the pre-fix false
+    # positive exactly) but its LDLJ gap from the median is too small to be material
+    borderline = results[20]
+    assert borderline.metrics["ldlj_z"] < Config().jerk_z
+    assert "smoothness" not in _checks(borderline), borderline.flags
+
+    # a genuinely, drastically jerkier episode must still be caught
+    jerky = results[21]
+    assert jerky.metrics["ldlj_z"] < Config().jerk_z
+    assert any("jerkier than peers" in f.message for f in jerky.flags)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)

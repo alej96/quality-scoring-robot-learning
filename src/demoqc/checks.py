@@ -52,6 +52,9 @@ class Config:
     outlier_z: float = 3.5
     min_relative_length_diff: float = 0.25
     jerk_z: float = -3.0
+    min_ldlj_diff: float = 1.0  # jerkier-than-peers also needs an LDLJ gap from the median
+    # of at least this many nats (~2.7x the underlying jerk integral) -- guards against a
+    # z-score inflated by a tiny MAD when most episodes share a near-identical motion
     sync_max_lag_s: float = 0.5  # search window for action/state cross-correlation
     sync_min_peak_corr: float = 0.4  # below this, the lag estimate is unreliable
     sync_lag_outlier_frames: float = 2.0  # flag if an episode's lag differs from the median by more
@@ -915,13 +918,29 @@ def check_relative(
     ldlj = np.array([r.metrics.get("ldlj", np.nan) for r in results])
     valid = ldlj[np.isfinite(ldlj)]
     if len(valid) >= 5:
+        # LDLJ is a log, so a fixed gap in nats is a fixed *relative* change in the
+        # underlying (always-positive) dimensionless jerk integral, regardless of this
+        # dataset's own absolute LDLJ range -- unlike the length check above, there's no
+        # natural "percent of the median" floor for a quantity that can be negative. A
+        # task whose episodes are all a close variation on the same motion (most real
+        # datasets) makes the *majority* cluster tightly, so the population MAD reflects
+        # only that majority's tiny spread even when a handful of episodes sit well above
+        # it (e.g. a few notably smoother demos) -- found on a real Hub dataset
+        # (EPITECH-LILLE/eval_training): one episode (z=-3.6 on a 20-episode peer group)
+        # had an LDLJ gap of only ~0.6 nats from the median, and the same episode, scored
+        # against the full 40-episode dataset instead, had z=-0.68 (not flagged) for an
+        # almost identical raw LDLJ -- the z-score, not the episode, had changed. Real
+        # jerkier-than-peers episodes already in the validated benchmark set (e.g.
+        # shylee/so100_cube, jccj/so100_block_in_cup) all have gaps of 1.4+ nats, well
+        # clear of this floor.
+        median_ldlj = float(np.median(valid))
         for r in results:
             value = r.metrics.get("ldlj")
             if value is None or not np.isfinite(value):
                 continue
             z = _robust_z(value, valid)
             r.metrics["ldlj_z"] = z
-            if z < cfg.jerk_z:
+            if z < cfg.jerk_z and median_ldlj - value > cfg.min_ldlj_diff:
                 r.flags.append(
                     Flag(
                         "smoothness",
