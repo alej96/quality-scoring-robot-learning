@@ -9,6 +9,62 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` flagging an ordinary gripper grasp/release as an abrupt
+      action jump.** Found by running `demoqc score` against a real Hub dataset beyond
+      the existing validation set (`allenai/MolmoAct2-BimanualYAM-Dataset`, a bimanual
+      YAM-arm manipulation dataset found via `list_datasets(filter="LeRobot", sort=
+      "downloads")`): 13/20 episodes carried a `smoothness` "abrupt action jump(s)" flag
+      (mean score 88.2), on a dataset whose other checks looked clean. Per-dim inspection
+      of every flagged frame found the cause: every single one, with no exception, was on
+      `left_gripper.pos` or `right_gripper.pos` (confirmed by printing the flagged
+      dim/frame/raw-action directly) -- never on any of the 12 arm joint dims. A gripper
+      sits at a steady open or closed setpoint for almost the whole episode and snaps
+      across its full `0..1` range in 1-4 frames during a single, deliberate grasp or
+      release; because that transition is brief and rare relative to an episode's total
+      length (a couple of frames out of 1500-2100), the dataset-wide 99th-percentile step
+      for the gripper dim reflects only its idle-frame jitter, not the transition --
+      so *any* percentile-based "this step is an outlier" threshold ends up flagging every
+      ordinary grasp, the exact opposite of a joint dim (continuously driven, so its own
+      `step_p99` already reflects normal fast motion and a real outlier still stands out).
+      This is a different root cause from the already-fixed noise-dominated-dim case
+      (an unused torso/neck joint moved by nothing but sensor noise): the gripper dim here
+      isn't a `step_p99` outlier among the dataset's other dims at all (its scale and
+      `step_p99` sit in the same order of magnitude as every joint's), so
+      `_exclude_noise_dominated_dims` doesn't catch it -- the problem is specific to how a
+      near-binary actuator's *rare, large, deliberate* transitions interact with a
+      percentile baseline, not an unusually small or noisy scale. Fixed by adding
+      `checks._exclude_gripper_dims`, called from `DatasetContext.build` right after the
+      existing noise-dominated-dim exclusion: every dim in `ctx.gripper_dims` (already
+      detected by feature name, the same list `check_gripper_chatter` uses) has its
+      `step_p99` set to NaN, excluding it from spike/jump detection via the same mechanism
+      that already excludes a constant or noise-dominated dim; `check_gripper_chatter`
+      itself is unaffected (it uses hysteresis-debounced toggle counting, not `step_p99`,
+      and already owns detecting genuinely bad gripper behaviour like rapid toggling).
+      New `tests/test_checks.py::test_smoothness_ignores_gripper_snap` builds a
+      38-episode synthetic dataset by hand (36 "clean" episodes each with a normal
+      single-frame full-range gripper snap plus five continuously-moving joint dims, one
+      more episode with the same ordinary snap, and one episode with a genuine, unrelated
+      jump on a joint dim) and asserts every snap-only episode stays silent while the
+      genuine-jump episode is still flagged; fails without this change (confirmed via
+      `git stash` on just `src/demoqc/checks.py` -- every "clean" episode asserts
+      `1 == 0` on `jumps`, reproducing the real dataset's per-episode false positive
+      exactly). Validated on the real dataset: `demoqc score
+      allenai/MolmoAct2-BimanualYAM-Dataset --max-episodes 20` went from mean 88.2
+      (13/20 episodes, `smoothness` x13) to mean 92.9 (0 `smoothness` flags, only the
+      pre-existing `idle` ones remain). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got
+      byte-identical mean scores and flag counts to every prior Log entry (97.1 / 92.9 /
+      92.2 / 99.2 / 95.2) -- none of their gripper dims ever cross the spike threshold, so
+      this is a no-op there. Also re-ran every dataset from the smoothness-fix series that
+      has a gripper dim (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, `_place_towel_flat`,
+      `lerobot/aloha_static_cups_open`, `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`) plus
+      the two without one (`lerobot/aloha_static_battery`, `zekaiwang/trex_dataset`): all
+      six reproduced their existing validated mean scores exactly (94.1 / 93.1 / 100.0 /
+      94.1 / 95.0 / 95.2); `heat_burger` had exactly one gripper-dim jump frame riding
+      alongside several real Euler-angle jump frames in the same episode, and losing it
+      didn't move that episode's score or flag count at all, confirming this only removes
+      flags that were never real to begin with.
 - [x] **Fix the "jerkier than peers" (`ldlj_z`) smoothness flag firing on an
       insignificant LDLJ gap when the peer group's spread happens to be tiny.** Found by
       running `demoqc score` against a real Hub dataset beyond the existing validation set
@@ -1311,3 +1367,26 @@ Work top-down through **Next up**. Each item should ship in one focused session
   just a large z on a tiny spread" guard the `length` check already had. Found on
   `EPITECH-LILLE/eval_training`: see the "Next up" entry above for the full root-cause and
   before/after numbers.
+- 2026-11-10: Fixed `check_smoothness` flagging an ordinary gripper grasp/release as an
+  abrupt action jump (see the "Next up" item above for the full root-cause and validation
+  details). Found by scoring a real Hub dataset beyond the existing validation set
+  (`allenai/MolmoAct2-BimanualYAM-Dataset`): every one of 13/20 episodes' spurious
+  `smoothness` flags was on a gripper dim, never a joint. A gripper's rare, deliberate,
+  full-range snap is invisible to the dataset-wide 99th-percentile step baseline (it's
+  brief and rare relative to the episode), so any percentile-based outlier threshold flags
+  every ordinary grasp. `DatasetContext.build` now excludes `ctx.gripper_dims` from
+  spike/jump detection entirely (`checks._exclude_gripper_dims`), the same NaN-the-
+  `step_p99` mechanism already used for constant and noise-dominated dims;
+  `check_gripper_chatter` (hysteresis-based, not `step_p99`-based) is unaffected and still
+  owns detecting real gripper misbehaviour. New
+  `tests/test_checks.py::test_smoothness_ignores_gripper_snap` fails on the pre-fix code
+  exactly as the real dataset did (confirmed via `git stash` on `src/demoqc/checks.py`).
+  `demoqc score allenai/MolmoAct2-BimanualYAM-Dataset --max-episodes 20` went from mean
+  88.2 (13/20 episodes, `smoothness` x13) to mean 92.9 (0 `smoothness` flags). Re-validated
+  the full existing dataset set (`lerobot/svla_so101_pickplace`,
+  `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`, `shylee/so100_cube`,
+  `jccj/so100_block_in_cup`) plus every gripper-bearing dataset from the smoothness-fix
+  series (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, `_place_towel_flat`,
+  `lerobot/aloha_static_cups_open`, `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`) and the
+  two without a gripper dim (`lerobot/aloha_static_battery`, `zekaiwang/trex_dataset`):
+  byte-identical mean scores on all nine, confirming no regression.
