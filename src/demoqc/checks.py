@@ -219,6 +219,7 @@ class DatasetContext:
         # leave them out of spike detection rather than flag every toggle
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
         step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
+        step_p99 = _exclude_gripper_dims(step_p99, gripper_dims)
         return cls(
             fps=ds.fps,
             action_scale=scale,
@@ -269,6 +270,32 @@ def _exclude_noise_dominated_dims(step_p99: np.ndarray, z_thresh: float) -> np.n
     z = np.abs(logp - med) / mad
     out = step_p99.copy()
     out[idx[z > z_thresh]] = np.nan
+    return out
+
+
+def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.ndarray:
+    """Exclude (set to NaN) gripper action dims from spike/jump detection.
+
+    Found on a real Hub dataset beyond the existing validation set
+    (``allenai/MolmoAct2-BimanualYAM-Dataset``): its gripper dims sit static almost the
+    whole episode (holding open or closed) and snap through their full 0..1 range in just
+    1-4 frames during a deliberate grasp or release -- normal, expected behaviour for a
+    near-binary actuator driven to a setpoint as fast as possible, not jerkiness. Because
+    these transitions are brief and rare, the dataset-wide 99th-percentile step for a
+    gripper dim reflects the (near-zero) holding frames, not the transition itself, so
+    *any* percentile-based "this step is an outlier" threshold ends up flagging every
+    ordinary grasp as an "abrupt action jump": 13/20 episodes here, none of them a real
+    defect, on a dataset whose arm joints (continuously driven, so their own `step_p99`
+    already reflects normal fast motion) carried no smoothness flags at all.
+    ``check_gripper_chatter`` already owns detecting genuinely bad gripper behaviour
+    (rapid open/close toggling) via a hysteresis-debounced counter that doesn't depend on
+    this percentile baseline, so this generic jump/spike detector adds no value for
+    gripper dims and only miscalibrates on exactly the actuator type it's least suited to.
+    """
+    if not gripper_dims:
+        return step_p99
+    out = step_p99.copy()
+    out[gripper_dims] = np.nan
     return out
 
 

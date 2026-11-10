@@ -469,6 +469,89 @@ def test_smoothness_jerkier_than_peers_needs_a_material_ldlj_gap():
     assert any("jerkier than peers" in f.message for f in jerky.flags)
 
 
+def _gripper_snap_dataset() -> Dataset:
+    """A synthetic dataset with five normal, continuously-moving joint dims plus a
+    gripper dim that sits at a steady setpoint with small encoder jitter for almost
+    every frame and snaps across its whole 0..1 range in a single frame during an
+    ordinary grasp -- rare enough, relative to each episode's length, that the
+    dataset-wide ``step_p99`` for the gripper dim reflects only the jitter, not the
+    snap (mirroring a real bang-bang actuator's duty cycle).
+    """
+    n = 150  # 5s at FPS
+    t = np.arange(n)
+    n_clean = 36
+    rng = np.random.default_rng(0)
+    freqs = np.array([1.0, 1.6, 0.6, 2.2, 0.9])
+    amps = np.array([5.0, 3.0, 7.0, 2.0, 6.0])
+    phases0 = np.array([0.3, 1.1, 2.0, 2.9, 4.0])
+
+    def active_dims(idx: int) -> np.ndarray:
+        return amps * np.sin(2 * np.pi * freqs[None, :] * t[:, None] / n + phases0 + 0.01 * idx)
+
+    def gripper_dim(idx: int, snap_frame: int) -> np.ndarray:
+        g = np.zeros(n) + rng.normal(0, 0.01, n)
+        g[snap_frame:] = 1.0 + rng.normal(0, 0.01, n - snap_frame)
+        return g
+
+    def episode(idx: int, action: np.ndarray) -> Episode:
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    clean = []
+    for i in range(n_clean):
+        act = active_dims(i)
+        grip = gripper_dim(i, snap_frame=60 + (i % 20))
+        clean.append(episode(i, np.concatenate([act, grip[:, None]], axis=1)))
+
+    # the episode under test: an ordinary grasp snap, same as every clean episode
+    snap_act = active_dims(n_clean + 500)
+    snap_grip = gripper_dim(n_clean + 500, snap_frame=75)
+    snap_ep = episode(n_clean, np.concatenate([snap_act, snap_grip[:, None]], axis=1))
+
+    # a genuine, unrelated jump on one of the five normal dims must still be caught
+    jump_act = active_dims(n_clean + 501)
+    jump_act[90:, 1] += 10.0
+    jump_grip = gripper_dim(n_clean + 501, snap_frame=75)
+    jump_ep = episode(n_clean + 1, np.concatenate([jump_act, jump_grip[:, None]], axis=1))
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, snap_ep, jump_ep],
+        action_names=["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "gripper"],
+    )
+
+
+def test_smoothness_ignores_gripper_snap():
+    # Found by running `demoqc score` against a real Hub dataset beyond the existing
+    # validation set (allenai/MolmoAct2-BimanualYAM-Dataset): 13/20 episodes carried a
+    # spurious "abrupt action jump(s)" smoothness flag, every single flagged frame on a
+    # gripper dim (confirmed by inspecting the flagged dim/frame directly), on a dataset
+    # whose arm joints -- continuously driven, so their own step_p99 already reflects
+    # normal fast motion -- carried zero smoothness flags. A gripper sits static almost
+    # the whole episode and snaps across its full range in 1-4 frames during a deliberate
+    # grasp/release, so the dataset-wide 99th-percentile step for that dim reflects only
+    # its idle-frame jitter, not the snap -- any percentile-based "this step is an
+    # outlier" threshold ends up flagging every ordinary grasp.
+    results = {r.episode_index: r for r in evaluate(_gripper_snap_dataset())}
+
+    for i in range(36):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert "smoothness" not in _checks(results[i]), (i, results[i].flags)
+
+    snap_result = results[36]
+    assert snap_result.metrics["jumps"] == 0
+    assert "smoothness" not in _checks(snap_result), snap_result.flags
+
+    # a genuine, unrelated jump on a normal joint dim must still be caught
+    jump_result = results[37]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)
