@@ -562,6 +562,25 @@ def test_stale_state(make_dataset):
     assert all("stale_state" not in _checks(r) for i, r in enumerate(results) if i != 7)
 
 
+def test_stale_state_ignores_a_dataset_wide_low_rate_baseline(make_dataset):
+    """A robot whose observation.state publishes slower than the logging fps holds state
+    for a frame or two throughout every episode -- a hardware characteristic, not a stale
+    read. Found on RoboCOIN/Galbot_G1_bag_table_trash_1: every one of 15 episodes had a
+    tight, consistent ~22% stale-state fraction (confirmed correlated across all 38
+    action/state dims, not isolated to the chassis), flagging every episode of an otherwise
+    clean dataset. A genuinely bad episode (a real localized stale burst on top of that same
+    baseline) must still be caught."""
+    specs = [
+        EpisodeSpec(seconds=8.0 + 0.3 * (i % 4), seed=i, state_hold_every=5) for i in range(12)
+    ]
+    specs.append(EpisodeSpec(seconds=8.0, seed=99, state_hold_every=5, stale_state_from=(60, 150)))
+    results = _results(make_dataset, specs)
+
+    for i in range(12):
+        assert "stale_state" not in _checks(results[i]), (i, results[i].metrics, results[i].flags)
+    assert "stale_state" in _checks(results[12])
+
+
 def test_video_and_metadata_mismatch(make_dataset):
     specs = clean_specs()
     specs[1] = EpisodeSpec(video_span_s=6.0, seed=1)

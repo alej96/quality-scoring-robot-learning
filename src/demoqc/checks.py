@@ -48,7 +48,8 @@ class Config:
     max_idle_fraction: float = 0.4
     max_pause_s: float = 3.0
     spike_factor: float = 6.0  # step > spike_factor * dataset p99 step
-    stale_state_max_fraction: float = 0.1
+    stale_state_max_fraction: float = 0.1  # flag if an episode's stale-state fraction exceeds
+    # the dataset's own baseline (DatasetContext.stale_state_baseline) by more than this
     outlier_z: float = 3.5
     min_relative_length_diff: float = 0.25
     jerk_z: float = -3.0
@@ -165,6 +166,10 @@ class DatasetContext:
     angular_dims: np.ndarray | None = None  # action dims that wrap as a radian angle in [-pi, pi]
     angular_pairs: list[tuple[int, int]] = field(default_factory=list)  # x/z axis dim pairs of
     # the same Euler-angle rotation triple, which can trade off at a gimbal-lock singularity
+    stale_state_baseline: float = 0.0  # dataset's own median per-episode stale-state fraction;
+    # some robots (e.g. a humanoid whose chassis/arm state publishes slower than the logging
+    # fps) hold observation.state for a frame or two on every episode as a hardware artifact,
+    # not a recorder bug -- see check_staleness.
     # --decode-video support (check_video_freeze); video_root is only set for a local
     # dataset (v2.x or v3.0), since videos are never downloaded from the Hub (see
     # video.resolve_v2_video_path/resolve_v3_video_path).
@@ -220,15 +225,23 @@ class DatasetContext:
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
         step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
         step_p99 = _exclude_gripper_dims(step_p99, gripper_dims)
+        idle_speed = cfg.idle_fraction_of_p75 * p75
+        stale_fracs = [
+            float(_stale_mask(e.action, e.state, scale, idle_speed, ds.fps).mean())
+            for e in ds.episodes
+            if e.action is not None and e.state is not None and len(e.action) >= 3
+        ]
+        stale_state_baseline = float(np.median(stale_fracs)) if stale_fracs else 0.0
         return cls(
             fps=ds.fps,
             action_scale=scale,
             step_p99=step_p99,
-            idle_speed=cfg.idle_fraction_of_p75 * p75,
+            idle_speed=idle_speed,
             gripper_dims=gripper_dims,
             sync_dims=sync_dims,
             angular_dims=angular_dims,
             angular_pairs=angular_pairs,
+            stale_state_baseline=stale_state_baseline,
             **video_ctx,
         )
 
@@ -763,24 +776,53 @@ def _ldlj(pos: np.ndarray, fps: float) -> float:
     return float(-np.log(duration**3 / v_peak**2 * integral + 1e-12))
 
 
+def _stale_mask(
+    action: np.ndarray, state: np.ndarray, scale: np.ndarray, idle_speed: float, fps: float
+) -> np.ndarray:
+    """Per-transition mask: ``observation.state`` repeated bit-for-bit while ``action`` moves."""
+    repeated = np.all(np.diff(state, axis=0) == 0, axis=1)
+    moving = _speed(action, scale, fps) > max(idle_speed, 1e-9) * 5
+    return repeated & moving
+
+
 def check_staleness(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
-    """Observation repeated bit-for-bit while the commanded action moves: a stale read."""
+    """Observation repeated bit-for-bit while the commanded action moves: a stale read.
+
+    Flags an episode only if its stale fraction materially *exceeds the dataset's own
+    baseline* (``ctx.stale_state_baseline``), not a fixed absolute fraction. Found on a real
+    Hub dataset (``RoboCOIN/Galbot_G1_bag_table_trash_1``, a wheeled-base humanoid): every one
+    of its 15 episodes had `observation.state` bit-identical to the previous frame on a tight,
+    consistent ~22% of moving frames (confirmed across every one of the 38 action/state dims,
+    correlated together, not just the chassis/base dims) -- the state message is evidently
+    published at a lower rate than the 30 fps logging rate and repeated to fill in-between
+    frames, a hardware/recorder characteristic of this platform, not a localized sensor glitch.
+    The old fixed `stale_state_max_fraction` (0.1) flagged every episode (mean score 77.3 on an
+    otherwise-clean dataset) for exactly the same reason the `length`/`ldlj_z` checks already
+    guard against a tiny-spread false positive, just via an absolute threshold instead of a
+    MAD this time. A dataset with no such baseline (``ctx.stale_state_baseline`` near 0, true
+    of every dataset in the existing validation set) makes this a no-op: ``excess`` reduces to
+    the old ``frac`` and the comparison is unchanged.
+    """
     if ep.state is None or ep.action is None or ctx.action_scale is None or ep.length < 3:
         return
-    repeated = np.all(np.diff(ep.state, axis=0) == 0, axis=1)
-    moving = _speed(ep.action, ctx.action_scale, ctx.fps) > max(ctx.idle_speed, 1e-9) * 5
-    stale = repeated & moving
+    stale = _stale_mask(ep.action, ep.state, ctx.action_scale, ctx.idle_speed, ctx.fps)
     frac = float(stale.mean())
     out.metrics["stale_state_fraction"] = frac
-    if frac > cfg.stale_state_max_fraction:
+    excess = frac - ctx.stale_state_baseline
+    if excess > cfg.stale_state_max_fraction:
         longest = max((e - s for s, e in _runs(stale)), default=0)
+        baseline_note = (
+            f"; dataset baseline {ctx.stale_state_baseline:.0%}"
+            if ctx.stale_state_baseline > 1e-9
+            else ""
+        )
         out.flags.append(
             Flag(
                 "stale_state",
                 WARN,
                 f"observation.state frozen on {frac:.0%} of moving frames "
-                f"(longest run {longest} frames)",
-                min(30.0, 100 * (frac - cfg.stale_state_max_fraction) + 10),
+                f"(longest run {longest} frames){baseline_note}",
+                min(30.0, 100 * (excess - cfg.stale_state_max_fraction) + 10),
             )
         )
 
