@@ -9,6 +9,57 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_staleness` flagging every episode of a dataset whose state publishes
+      slower than the logging fps.** Found by running `demoqc score` against a real Hub
+      dataset beyond the existing validation set
+      (`RoboCOIN/Galbot_G1_bag_table_trash_1`, a wheeled-base humanoid, found via
+      `list_datasets(filter="LeRobot", sort="downloads")`): all 15/15 episodes carried a
+      `stale_state` flag (mean score 77.3, 2 episodes below 70), on a dataset whose other
+      checks (`idle`, `metadata`, `timing`) looked clean. Per-episode inspection of
+      `observation.state` found the cause: every episode had a tight, consistent ~21.7-22.7%
+      fraction of frames where all 38 action/state dims were simultaneously bit-identical to
+      the previous frame while the commanded action kept moving -- confirmed not isolated to
+      the chassis/base dims (which would suggest a slow base-odometry sensor specifically):
+      every one of the 38 dims, including the actively-driven arm joints, showed a
+      substantial per-dim freeze fraction (25-98%) individually, and the *combined* ~22%
+      rate (all 38 dims frozen on the same frame) matches a state message published as one
+      atomic unit at a rate below the 30 fps logging rate, with the last reading repeated to
+      fill in-between frames -- a platform/recorder characteristic of this humanoid, not a
+      localized stale-read bug. `check_staleness` compared this fraction against a fixed
+      absolute `stale_state_max_fraction` (0.1), so the fraction being nearly identical on
+      every episode (and far above 0.1) flagged the entire dataset -- the exact MAD/threshold
+      -instability pattern the `length` and `ldlj_z` checks were already guarded against
+      ("require a material difference from a dataset-relative baseline, not just a large
+      value against a fixed cutoff"), just not extended to `stale_state`. Fixed by adding
+      `DatasetContext.stale_state_baseline` (`checks.DatasetContext.build`, via the new
+      `_stale_mask` helper shared with `check_staleness` itself): the dataset's own median
+      per-episode stale fraction, computed the same way `check_staleness` already did per
+      episode. `check_staleness` now flags only when an episode's own fraction exceeds that
+      baseline by more than `stale_state_max_fraction`, instead of comparing the raw fraction
+      to a fixed cutoff -- a no-op (baseline near 0) on every dataset in the existing
+      validation set, where `excess` reduces to the old `frac`. New
+      `tests/test_checks.py::test_stale_state_ignores_a_dataset_wide_low_rate_baseline` builds
+      a 13-episode synthetic dataset by hand (12 "clean" episodes each with a uniform
+      `state_hold_every=5` low-rate-publish pattern throughout, via a new
+      `EpisodeSpec.state_hold_every` field in `tests/conftest.py`, plus one more episode with
+      the same baseline pattern *and* an additional genuine localized stale burst layered on
+      top) and asserts every baseline-only episode stays silent while the genuinely worse
+      episode is still flagged; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- episode 0 asserts `'stale_state' not in {'stale_state'}`,
+      reproducing the real dataset's per-episode false positive exactly). Validated on the
+      real dataset: `demoqc score RoboCOIN/Galbot_G1_bag_table_trash_1 --max-episodes 15`
+      went from mean 77.3 (15/15 episodes, `stale_state` x15) to mean 97.8 (0 `stale_state`
+      flags, only the pre-existing `smoothness` ones remain, unrelated to this check). Also
+      confirmed two other real humanoid datasets from the same search
+      (`RoboCOIN/Unitree_G1edu_u3_place_bread`, `RoboCOIN/Galaxea_R1_Lite_classify_object_green_tablecloth`)
+      have a baseline of 0.0 (no inherent state-hold characteristic) and were already clean
+      before this change, so this fix is specific to the one platform that actually exhibits
+      the artifact, not a blanket loosening. Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got
+      byte-identical mean scores and flag counts to every prior Log entry (97.1 / 92.9 / 92.2
+      / 99.2 / 95.2), confirming this is a no-op whenever a dataset has no dataset-wide
+      stale-state baseline to begin with.
 - [x] **Fix `check_smoothness` flagging an ordinary gripper grasp/release as an abrupt
       action jump.** Found by running `demoqc score` against a real Hub dataset beyond
       the existing validation set (`allenai/MolmoAct2-BimanualYAM-Dataset`, a bimanual
@@ -1390,3 +1441,15 @@ Work top-down through **Next up**. Each item should ship in one focused session
   `lerobot/aloha_static_cups_open`, `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`) and the
   two without a gripper dim (`lerobot/aloha_static_battery`, `zekaiwang/trex_dataset`):
   byte-identical mean scores on all nine, confirming no regression.
+- 2026-11-11: Fixed `check_staleness` flagging every episode of a dataset whose
+  `observation.state` publishes slower than the 30 fps logging rate
+  (`RoboCOIN/Galbot_G1_bag_table_trash_1`, a wheeled-base humanoid): all 15/15 episodes had
+  a tight, consistent ~22% stale-state fraction (all 38 action/state dims simultaneously
+  bit-identical to the previous frame on the same fraction of frames) against the check's
+  fixed `stale_state_max_fraction` (0.1) -- the same tiny-spread/fixed-cutoff instability
+  the `length` and `ldlj_z` checks were already guarded against, just not extended to
+  `stale_state`. `DatasetContext.stale_state_baseline` (the dataset's own median per-episode
+  stale fraction) now has to be exceeded by a material margin before flagging, a no-op on
+  every dataset without this characteristic. `demoqc score
+  RoboCOIN/Galbot_G1_bag_table_trash_1 --max-episodes 15` went from mean 77.3 (`stale_state`
+  x15) to 97.8 (0 `stale_state` flags). See the Log entry under "Next up" for full details.
