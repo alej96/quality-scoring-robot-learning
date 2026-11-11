@@ -24,6 +24,9 @@ class EpisodeSpec:
     spikes_at: list[int] = field(default_factory=list)  # frame indices with a 1-frame glitch
     drop_frames: list[int] = field(default_factory=list)  # frames removed (timestamp gaps)
     stale_state_from: tuple[int, int] | None = None  # [start, end) frames state is frozen
+    state_hold_every: int = 0  # if > 1, state repeats the previous frame's value every Nth
+    # frame throughout the episode -- simulates a sensor/state publisher running slower than
+    # the logging fps (uniform across the episode, unlike stale_state_from's one-off burst)
     video_span_s: float | None = None  # override video duration in episode metadata
     meta_length_delta: int = 0
     state_lag_frames: int = 1  # observation.state tracks action with this many frames' delay
@@ -76,6 +79,9 @@ def make_episode(spec: EpisodeSpec) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     if spec.stale_state_from:
         s, e = spec.stale_state_from
         state[s:e] = state[s - 1]
+    if spec.state_hold_every > 1:
+        for i in range(spec.state_hold_every - 1, len(state), spec.state_hold_every):
+            state[i] = state[i - 1]
     for i in spec.nan_action_at:
         action[i, 0] = np.nan
     for i in spec.nan_state_at:
