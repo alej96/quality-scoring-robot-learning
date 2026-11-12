@@ -9,6 +9,50 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness`/`check_gripper_chatter` not recognizing a VR-teleop
+      controller's `trigger`/`squeeze` axis as the gripper-equivalent dim it is.** Found
+      by running `demoqc score` against a real Hub dataset beyond the existing validation
+      set (`BitRobot/HIW-500-LeRobot`, a Unitree G1 humanoid teleoperated via a VR
+      controller, found via `list_datasets(filter="LeRobot", sort="downloads")`): 19/20
+      episodes carried a `smoothness` "abrupt action jump(s)" flag (mean score 76.0, 2/20
+      below 70), several with 20-140 "jumps". Per-dim inspection of the flagged frames
+      found the cause: `right_trigger` (range 0..10) and `right_squeeze` (range 0..1) --
+      the controller axes mapped to the hand's open/close command -- sit at a steady
+      setpoint almost the whole episode and snap across their full range in 1-3 frames
+      during a deliberate grasp/release, exactly the already-fixed literal-`*gripper*`-dim
+      pattern (`_exclude_gripper_dims`/`check_gripper_chatter`), just under VR-controller
+      naming instead of "gripper" -- so `gripper_dims`' `"gripper" in name.lower()` match
+      never found them, and they were invisible to both the exclusion and to
+      `gripper_chatter`'s own (correct) way of catching real anxious-squeeze toggling.
+      Fixed by widening the name match to a shared `checks._GRIPPER_NAME_KEYWORDS =
+      ("gripper", "trigger", "squeeze")` tuple, used everywhere `gripper_dims` is built.
+      New `tests/test_checks.py::test_gripper_dims_matches_vr_controller_trigger_squeeze_names`
+      (asserts `DatasetContext.build(...).gripper_dims` directly) and
+      `test_smoothness_ignores_vr_controller_trigger_snap` (the full false-positive
+      reproduction, reusing the existing `_gripper_snap_dataset` fixture with its last dim
+      renamed to `"right_trigger"`) both fail without this change (confirmed via `git
+      stash` on just `src/demoqc/checks.py` -- `gripper_dims == []` and every "clean"
+      episode asserts `1 == 0` on `jumps`, reproducing the real dataset's false positives
+      exactly). Validated on the real dataset: `demoqc score BitRobot/HIW-500-LeRobot
+      --max-episodes 20` went from mean 76.0 (`smoothness` x27, 2/20 below 70) to mean 74.2
+      (`smoothness` x23, `gripper_chatter` x6, 7/20 below 70) -- the mean score itself drops,
+      but for the right reason: per-episode `jumps` counts on the affected dims fell
+      sharply (e.g. one episode's right_trigger/right_squeeze jump count went from 68 to 0),
+      confirming the spurious smoothness signal is gone, while `gripper_chatter` now
+      correctly fires on genuine rapid full-range toggling on those same dims (confirmed by
+      inspecting the raw trigger values at the flagged frames: repeated 0<->10 swings
+      within a handful of frames, not sensor jitter) that was previously completely
+      invisible to the tool -- a more accurate diagnosis, not a new false positive. Re-ran
+      the full existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and every gripper-bearing dataset from
+      the earlier gripper-snap/chatter fixes (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`,
+      `_place_towel_flat`, `lerobot/aloha_static_cups_open`,
+      `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`, `lerobot/aloha_static_battery`,
+      `zekaiwang/trex_dataset`, `allenai/MolmoAct2-BimanualYAM-Dataset`) via `git stash`
+      before/after for an exact apples-to-apples diff: byte-identical mean scores and flag
+      counts on all twelve, confirming this is a no-op whenever a dataset has no dim named
+      with any of the three keywords.
 - [x] **Fix `check_staleness` flagging every episode of a dataset whose state publishes
       slower than the logging fps.** Found by running `demoqc score` against a real Hub
       dataset beyond the existing validation set
@@ -1453,3 +1497,14 @@ Work top-down through **Next up**. Each item should ship in one focused session
   every dataset without this characteristic. `demoqc score
   RoboCOIN/Galbot_G1_bag_table_trash_1 --max-episodes 15` went from mean 77.3 (`stale_state`
   x15) to 97.8 (0 `stale_state` flags). See the Log entry under "Next up" for full details.
+- 2026-11-12: Fixed `gripper_dims` (and therefore `_exclude_gripper_dims` and
+  `check_gripper_chatter`) matching only a literal `*gripper*` feature name, missing a
+  VR-teleop controller's `trigger`/`squeeze` axis driving the same open/close actuation
+  (`BitRobot/HIW-500-LeRobot`, a Unitree G1 humanoid): 19/20 episodes carried a spurious
+  `smoothness` "abrupt action jump" flag on `right_trigger`/`right_squeeze`, the same
+  near-binary-snap false positive the literal-`gripper` case was already fixed for.
+  `checks._GRIPPER_NAME_KEYWORDS` now also matches `trigger`/`squeeze`. `demoqc score
+  BitRobot/HIW-500-LeRobot --max-episodes 20` went from mean 76.0 (`smoothness` x27) to
+  mean 74.2 (`smoothness` x23, `gripper_chatter` x6 newly visible and confirmed genuine);
+  byte-identical on the full existing validation set plus every other gripper-bearing
+  dataset from earlier Log entries. See the Log entry under "Next up" for full details.
