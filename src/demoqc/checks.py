@@ -161,7 +161,8 @@ class DatasetContext:
     action_scale: np.ndarray | None  # robust std per action dim
     step_p99: np.ndarray | None  # 99th pct |delta action| per dim, in scaled units
     idle_speed: float  # speed threshold, scaled units / s
-    gripper_dims: list[int] = field(default_factory=list)  # action dims named "*gripper*"
+    gripper_dims: list[int] = field(default_factory=list)  # action dims named per
+    # _GRIPPER_NAME_KEYWORDS ("*gripper*", or a VR-teleop controller's "*trigger*"/"*squeeze*")
     sync_dims: tuple[list[int], list[int]] | None = None  # matched (action, state) dim indices
     angular_dims: np.ndarray | None = None  # action dims that wrap as a radian angle in [-pi, pi]
     angular_pairs: list[tuple[int, int]] = field(default_factory=list)  # x/z axis dim pairs of
@@ -181,7 +182,9 @@ class DatasetContext:
     @classmethod
     def build(cls, ds: Dataset, cfg: Config, decode_video: bool = False) -> DatasetContext:
         gripper_dims = [
-            i for i, name in enumerate(ds.action_names or []) if name and "gripper" in name.lower()
+            i
+            for i, name in enumerate(ds.action_names or [])
+            if name and any(kw in name.lower() for kw in _GRIPPER_NAME_KEYWORDS)
         ]
         a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
         s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
@@ -286,6 +289,12 @@ def _exclude_noise_dominated_dims(step_p99: np.ndarray, z_thresh: float) -> np.n
     return out
 
 
+_GRIPPER_NAME_KEYWORDS = ("gripper", "trigger", "squeeze")
+# "trigger"/"squeeze" cover VR-controller teleop naming (e.g. a Quest-style controller's
+# index-trigger/grip-squeeze axis driving a humanoid hand's open/close), the same
+# near-binary actuator pattern as a literal "*gripper*" dim -- see _exclude_gripper_dims.
+
+
 def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.ndarray:
     """Exclude (set to NaN) gripper action dims from spike/jump detection.
 
@@ -304,6 +313,14 @@ def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.n
     (rapid open/close toggling) via a hysteresis-debounced counter that doesn't depend on
     this percentile baseline, so this generic jump/spike detector adds no value for
     gripper dims and only miscalibrates on exactly the actuator type it's least suited to.
+
+    The same pattern recurs on VR-controller-teleoperated humanoids under a different
+    name: found on ``BitRobot/HIW-500-LeRobot`` (a Unitree G1 teleoperated via a VR
+    controller), whose ``right_trigger``/``right_squeeze`` action dims (0..10 and 0..1
+    ranges) snap between two steady setpoints exactly like a literal gripper dim, but
+    were invisible to the "gripper" name match -- 19/20 episodes carried spurious "abrupt
+    action jump(s)" flags, almost entirely on those two dims. See
+    ``_GRIPPER_NAME_KEYWORDS``.
     """
     if not gripper_dims:
         return step_p99

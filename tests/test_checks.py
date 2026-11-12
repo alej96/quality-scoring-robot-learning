@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from demoqc.checks import Config, _angular_action_dims, evaluate
+from demoqc.checks import Config, DatasetContext, _angular_action_dims, evaluate
 from demoqc.dataset import Dataset, Episode, load_dataset
 from tests.conftest import FPS, EpisodeSpec, clean_specs
 
@@ -537,6 +537,48 @@ def test_smoothness_ignores_gripper_snap():
     # its idle-frame jitter, not the snap -- any percentile-based "this step is an
     # outlier" threshold ends up flagging every ordinary grasp.
     results = {r.episode_index: r for r in evaluate(_gripper_snap_dataset())}
+
+    for i in range(36):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert "smoothness" not in _checks(results[i]), (i, results[i].flags)
+
+    snap_result = results[36]
+    assert snap_result.metrics["jumps"] == 0
+    assert "smoothness" not in _checks(snap_result), snap_result.flags
+
+    # a genuine, unrelated jump on a normal joint dim must still be caught
+    jump_result = results[37]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
+def test_gripper_dims_matches_vr_controller_trigger_squeeze_names():
+    # Found on BitRobot/HIW-500-LeRobot (a Unitree G1 humanoid teleoperated via a VR
+    # controller): its gripper-actuation action/state dims are named "left_trigger",
+    # "left_squeeze", "right_trigger", "right_squeeze" -- a controller's index-trigger and
+    # grip-squeeze axes, not literally "gripper". gripper_dims matched only the substring
+    # "gripper", so none of these four were ever detected.
+    ds = _gripper_snap_dataset()
+    ds.action_names = [
+        "joint_0",
+        "joint_1",
+        "joint_2",
+        "joint_3",
+        "left_trigger",
+        "right_squeeze",
+    ]
+    ctx = DatasetContext.build(ds, Config())
+    assert ctx.gripper_dims == [4, 5]
+
+
+def test_smoothness_ignores_vr_controller_trigger_snap():
+    # Same real dataset as above: 19/20 episodes carried spurious "abrupt action jump(s)"
+    # smoothness flags, almost entirely on `right_trigger`/`right_squeeze` -- those dims
+    # snap between two steady setpoints during a deliberate grasp, exactly like the
+    # already-fixed literal-"gripper"-named case, just under VR-controller naming.
+    ds = _gripper_snap_dataset()
+    ds.action_names = ["joint_0", "joint_1", "joint_2", "joint_3", "joint_4", "right_trigger"]
+    results = {r.episode_index: r for r in evaluate(ds)}
 
     for i in range(36):
         assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
