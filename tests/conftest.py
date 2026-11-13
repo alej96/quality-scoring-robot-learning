@@ -136,6 +136,7 @@ def write_dataset(
     state_perm: list[int] | None = None,
     extra_action_dim: bool = False,
     grouped_names: bool = False,
+    omit_action_state: bool = False,
 ) -> Path:
     """``data_files`` > 1 spreads the episodes over that many v3.0 data files.
 
@@ -144,7 +145,10 @@ def write_dataset(
     a constant action-only column (an unmatched extra sensor with no observation.state
     counterpart) named ``force_sensor``. ``grouped_names`` writes ``names`` as
     ``{"motors": [...]}`` instead of a flat list, matching real ALOHA-format datasets
-    on the Hub (e.g. ``lerobot/aloha_static_cups_open``).
+    on the Hub (e.g. ``lerobot/aloha_static_cups_open``). ``omit_action_state`` writes no
+    ``action``/``observation.state`` columns or features at all, matching a real dataset
+    (e.g. a driving dataset) that stores this data under structured per-key names like
+    ``action.continuous``/``observation.state.vehicle`` instead of a single flat array.
     """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
@@ -159,27 +163,26 @@ def write_dataset(
             extra = np.full((len(action), 1), 1.0) + rng.normal(0, 1e-4, (len(action), 1))
             action = np.hstack([action, extra])
         n = len(ts)
-        frames.append(
-            pd.DataFrame(
-                {
-                    "action": list(action.astype(np.float32)),
-                    "observation.state": list(state.astype(np.float32)),
-                    "timestamp": ts.astype(np.float32),
-                    "frame_index": np.arange(n),
-                    "episode_index": ep,
-                    "index": np.arange(index, index + n),
-                    "task_index": 0,
-                }
-            )
-        )
+        frame_cols = {
+            "timestamp": ts.astype(np.float32),
+            "frame_index": np.arange(n),
+            "episode_index": ep,
+            "index": np.arange(index, index + n),
+            "task_index": 0,
+        }
+        if not omit_action_state:
+            frame_cols["action"] = list(action.astype(np.float32))
+            frame_cols["observation.state"] = list(state.astype(np.float32))
+        frames.append(pd.DataFrame(frame_cols))
         span = spec.video_span_s if spec.video_span_s is not None else n / FPS
         stats = {
-            "action": _stats(action),
-            "observation.state": _stats(state),
             "index": _stats(np.arange(index, index + n)),
             "episode_index": _stats(np.full(n, ep)),
             "observation.images.top": _image_stats(rng, n, dead=spec.camera_dead),
         }
+        if not omit_action_state:
+            stats["action"] = _stats(action)
+            stats["observation.state"] = _stats(state)
         episode_stats.append(stats)
         episodes.append(
             {
@@ -220,12 +223,6 @@ def write_dataset(
         action_names_out = action_names
         state_names_out = state_names
     info["features"] = {
-        "action": {"dtype": "float32", "shape": [len(action_names)], "names": action_names_out},
-        "observation.state": {
-            "dtype": "float32",
-            "shape": [len(state_names)],
-            "names": state_names_out,
-        },
         "observation.images.top": {"dtype": "video", "shape": [480, 640, 3], "names": None},
         "timestamp": {"dtype": "float32", **scalar},
         "frame_index": {"dtype": "int64", **scalar},
@@ -233,6 +230,17 @@ def write_dataset(
         "index": {"dtype": "int64", **scalar},
         "task_index": {"dtype": "int64", **scalar},
     }
+    if not omit_action_state:
+        info["features"]["action"] = {
+            "dtype": "float32",
+            "shape": [len(action_names)],
+            "names": action_names_out,
+        }
+        info["features"]["observation.state"] = {
+            "dtype": "float32",
+            "shape": [len(state_names)],
+            "names": state_names_out,
+        }
     info["total_tasks"] = 1
     info["chunks_size"] = 1000
     if version.startswith("v3"):
@@ -249,12 +257,13 @@ def write_dataset(
     (root / "meta" / "info.json").write_text(json.dumps(info))
     all_frames = pd.concat(frames)
     dataset_stats = {
-        "action": _stats(np.stack(all_frames["action"])),
-        "observation.state": _stats(np.stack(all_frames["observation.state"])),
         "index": _stats(all_frames["index"].to_numpy()),
         "episode_index": _stats(all_frames["episode_index"].to_numpy()),
         "observation.images.top": _image_stats(rng, index),
     }
+    if not omit_action_state:
+        dataset_stats["action"] = _stats(np.stack(all_frames["action"]))
+        dataset_stats["observation.state"] = _stats(np.stack(all_frames["observation.state"]))
     (root / "meta" / "stats.json").write_text(json.dumps(dataset_stats))
 
     if version.startswith("v3"):
@@ -298,6 +307,7 @@ def make_dataset(tmp_path):
         state_perm: list[int] | None = None,
         extra_action_dim: bool = False,
         grouped_names: bool = False,
+        omit_action_state: bool = False,
     ) -> Path:
         return write_dataset(
             tmp_path / f"ds-{version}",
@@ -307,6 +317,7 @@ def make_dataset(tmp_path):
             state_perm,
             extra_action_dim,
             grouped_names,
+            omit_action_state,
         )
 
     return _make

@@ -41,6 +41,24 @@ def test_grouped_feature_names_are_flattened(make_dataset):
     assert ds.state_names == FEATURE_NAMES
 
 
+def test_structured_action_state_names_load_as_missing_with_a_warning(make_dataset):
+    # Found scoring a real Hub dataset (a driving dataset) whose meta/info.json has no
+    # literal "action"/"observation.state" feature at all -- it stores this data under
+    # structured per-key names instead (e.g. "action.continuous", "observation.state.vehicle"),
+    # a representation demoqc doesn't read. Every episode must load with action/state as
+    # None (not silently substitute something else), and the dataset should say why instead
+    # of leaving every check mysteriously empty with no explanation.
+    ds = load_dataset(make_dataset(clean_specs(3), omit_action_state=True))
+
+    for ep in ds.episodes:
+        assert ep.action is None
+        assert ep.state is None
+    assert ds.warnings == [
+        "no action or observation.state feature in meta/info.json; most checks and "
+        "duplicate detection need this data and found none for any episode"
+    ]
+
+
 def test_v3_video_spans(make_dataset):
     ds = load_dataset(make_dataset(clean_specs(2)))
     start, end = ds.episodes[0].video_spans["observation.images.top"]

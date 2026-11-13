@@ -27,6 +27,24 @@ def test_clean_dataset_has_no_duplicates(make_dataset):
     assert groups == []
 
 
+def test_episodes_with_no_action_or_state_are_not_exact_duplicates(make_dataset):
+    # Found scoring a real Hub driving dataset whose action/state live under structured
+    # per-key feature names demoqc doesn't read (see test_dataset.py's
+    # test_structured_action_state_names_load_as_missing_with_a_warning): every episode's
+    # ep.action and ep.state load as None, so _content_hash(ep) -- which only hashes the
+    # arrays it finds -- produced the exact same (effectively empty) hash for every
+    # episode, flagging nearly the whole dataset as "exact duplicates" of episode 0 despite
+    # literally no content ever being compared. An episode with nothing to hash must never
+    # be grouped with another just because both have nothing.
+    ds = load_dataset(make_dataset(clean_specs(5), omit_action_state=True))
+    cfg = Config()
+    results = evaluate(ds, cfg)
+    ctx = DatasetContext.build(ds, cfg)
+    groups = find_duplicates(ds, results, ctx, cfg)
+
+    assert groups == []
+
+
 def test_exact_duplicate_detected(make_dataset):
     # a re-run upload appends a byte-identical copy of an existing episode
     specs = clean_specs()
