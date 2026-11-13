@@ -9,6 +9,53 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `demoqc dedupe`/`score` flagging nearly every episode of a dataset with no
+      `action`/`observation.state` feature as an exact duplicate.** Found by running
+      `demoqc score` against a real Hub dataset beyond the existing validation set
+      (`yaak-ai/L2D`, a car-driving dataset found via `list_datasets(filter="LeRobot",
+      sort="downloads")`): 14/15 episodes carried a `duplicate` "exact duplicate of episode
+      0" ERROR (mean score 53.3), on a dataset whose other checks were completely silent.
+      Root cause: this dataset's `meta/info.json` has no literal `action` or
+      `observation.state` feature at all -- it stores a mixed continuous/discrete action
+      and a structured per-signal state under dotted per-key names instead
+      (`action.continuous`, `action.discrete`, `observation.state.vehicle`,
+      `observation.state.waypoints`, etc., a representation `dataset.py`'s loader doesn't
+      read), so `Episode.action`/`Episode.state` loaded as `None` for every single episode
+      (confirmed directly: `load_dataset(...).episodes[i].action is None` for all `i`).
+      `dedupe._content_hash` hashes whichever of `(ep.action, ep.state)` isn't `None` and
+      skips the rest, so every episode with both `None` produced the exact same
+      (effectively empty) SHA-1 digest -- `find_duplicates` then grouped all of them as one
+      "exact duplicate" set purely because none of them had anything to compare, not
+      because any content actually matched. Fixed by excluding an episode with both
+      `action` and `state` `None` from the exact-duplicate hash grouping entirely
+      (`find_duplicates` in `src/demoqc/dedupe.py`), and by adding a `Dataset.warnings`
+      entry in `dataset.py` (`load_dataset`) when `meta/info.json` has no literal
+      `action`/`observation.state` feature, naming the problem instead of leaving every
+      check silently empty with no explanation. New
+      `tests/test_dedupe.py::test_episodes_with_no_action_or_state_are_not_exact_duplicates`
+      and `tests/test_dataset.py::test_structured_action_state_names_load_as_missing_with_a_warning`
+      (a new `omit_action_state` flag on `tests/conftest.py`'s `write_dataset` writes no
+      `action`/`observation.state` columns or features at all, reproducing the real
+      dataset's schema shape); both fail without this change (confirmed via `git stash` on
+      `src/demoqc/dedupe.py`/`dataset.py` -- the dedupe test asserts `[DuplicateGroup(...)]
+      == []` and gets a 5-episode exact group, the dataset test asserts `ds.warnings == []`
+      instead of the new message, reproducing the real dataset's false positive and silent
+      cause exactly). Validated on the real dataset: `demoqc score yaak-ai/L2D
+      --max-episodes 15` went from mean 53.3 (14/15 episodes, `duplicate` x14, no
+      explanation printed anywhere) to mean 100.0 (0 flags, plus a `demoqc: warning: no
+      action or observation.state feature in meta/info.json; ...` line so the all-clean
+      score isn't mistaken for "nothing to find" rather than "nothing was checked"). Re-ran
+      the full existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got byte-identical mean scores and
+      flag counts to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2 / 95.2), confirming
+      this is a no-op whenever a dataset actually has `action`/`observation.state` data to
+      hash.
+      Follow-up: this only stops the false duplicate flag and names the problem; actually
+      reading a dotted/structured action or state representation (concatenating
+      `action.*`/`observation.state.*` sub-features the way `names` grouped under a motor
+      key is already flattened) so checks beyond `duplicate` get real signal on a dataset
+      like this is still open.
 - [x] **Fix `check_smoothness`/`check_gripper_chatter` not recognizing a VR-teleop
       controller's `trigger`/`squeeze` axis as the gripper-equivalent dim it is.** Found
       by running `demoqc score` against a real Hub dataset beyond the existing validation
@@ -1508,3 +1555,13 @@ Work top-down through **Next up**. Each item should ship in one focused session
   mean 74.2 (`smoothness` x23, `gripper_chatter` x6 newly visible and confirmed genuine);
   byte-identical on the full existing validation set plus every other gripper-bearing
   dataset from earlier Log entries. See the Log entry under "Next up" for full details.
+- 2026-11-13: Fixed `find_duplicates` flagging nearly every episode of a dataset with no
+  literal `action`/`observation.state` feature as an exact duplicate of episode 0
+  (`yaak-ai/L2D`, a car-driving dataset storing its data under structured per-key names
+  like `action.continuous`/`observation.state.vehicle` instead): every episode's
+  `action`/`state` loaded as `None`, so `_content_hash` produced the same empty digest for
+  all of them. An episode with both `None` is now excluded from exact-duplicate hashing,
+  and `load_dataset` adds a `Dataset.warnings` entry naming the missing feature instead of
+  leaving every check silently empty. `demoqc score yaak-ai/L2D --max-episodes 15` went
+  from mean 53.3 (`duplicate` x14) to 100.0 (0 flags, warning printed). See the Log entry
+  under "Next up" for full details.

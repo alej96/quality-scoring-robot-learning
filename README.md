@@ -142,6 +142,21 @@ or guessing, and prints a warning naming the affected indices so the rest of the
 still scores cleanly. Explicitly requesting one of those indices via `--episodes` raises a
 clear error instead of the generic "not in the dataset" one.
 
+## Datasets without a flat `action`/`observation.state` feature
+
+`demoqc` reads the literal `action` and `observation.state` columns LeRobot's standard
+format writes. Some real datasets (e.g. a car-driving dataset with a mixed continuous/
+discrete action space, or structured per-signal state) instead store this data under
+per-key feature names like `action.continuous`/`observation.state.vehicle`, with no flat
+`action`/`observation.state` feature in `meta/info.json` at all. `demoqc` doesn't read that
+representation, so every episode loads with no action/state data -- a `demoqc score` on
+one of these prints a warning naming it (`no action or observation.state feature in
+meta/info.json; ...`) instead of silently scoring as if the dataset were clean. Most checks
+need this data and are silently skipped, same as they already are per-episode when a value
+is missing; duplicate detection in particular is excluded from this rather than comparing
+nothing to nothing, which previously flagged nearly every episode of such a dataset as an
+"exact duplicate" of the first one.
+
 ## What it checks
 
 | Check | Detects | How |
