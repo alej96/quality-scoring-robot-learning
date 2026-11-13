@@ -158,6 +158,18 @@ def load_dataset(
             f"which recording is the real one): {duplicate_episodes}"
         )
 
+    features = info.get("features", {})
+    missing_cols = [c for c in ("action", "observation.state") if c not in features]
+    if missing_cols:
+        # a dataset can store its action/state under structured per-key feature names
+        # instead (e.g. "action.continuous"/"observation.state.vehicle"); demoqc only reads
+        # the literal "action"/"observation.state" columns, so every episode loads with
+        # none of this data and most checks (and duplicate detection) have nothing to score.
+        warnings.append(
+            f"no {' or '.join(missing_cols)} feature in meta/info.json; most checks and "
+            f"duplicate detection need this data and found none for any episode"
+        )
+
     episodes_out = []
     for ep_idx, group in frames.groupby("episode_index", sort=True):
         group = group.sort_values("frame_index", kind="stable")

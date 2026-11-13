@@ -168,6 +168,13 @@ def find_duplicates(
 ) -> list[DuplicateGroup]:
     by_hash: dict[str, list[int]] = {}
     for ep in ds.episodes:
+        if ep.action is None and ep.state is None:
+            # nothing was loaded for this episode (e.g. a dataset whose action/state live
+            # under structured per-key names like "action.continuous"/"observation.state.vehicle"
+            # instead of a single flat "action"/"observation.state" array demoqc reads) --
+            # every such episode hashes identically to every other, which is an artifact of
+            # having no data to compare, not evidence they're duplicates.
+            continue
         by_hash.setdefault(_content_hash(ep), []).append(ep.index)
     exact_sets = {tuple(sorted(v)) for v in by_hash.values() if len(v) > 1}
     groups = [DuplicateGroup(list(members), "exact", 0.0) for members in exact_sets]
