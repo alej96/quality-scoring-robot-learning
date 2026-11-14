@@ -81,6 +81,25 @@ def test_very_short_frozen_episode_flags_no_motion(make_dataset):
     assert all("idle" not in _checks(r) for i, r in enumerate(results) if i not in (1, 3))
 
 
+def test_structured_action_state_feeds_real_checks(make_dataset):
+    # Follow-up to the yaak-ai/L2D exact-duplicate fix (see ROADMAP.md's Log): that fix
+    # only stopped the false "exact duplicate" flag by excluding action/state-less
+    # episodes from hashing -- every other check still saw ep.action/ep.state as None for
+    # any dataset whose meta/info.json has no literal action/observation.state feature,
+    # since the real dataset stores it under structured per-key names instead. Now that
+    # dataset.py reconstructs a flat action/state array from the numeric structured
+    # sub-features (test_dataset.py), an ordinary check like `idle` should fire on a real
+    # defect in a structured-feature dataset exactly as it would on a flat one.
+    specs = clean_specs()
+    specs[2] = EpisodeSpec(seconds=1.5 / FPS, frozen_action=True, seed=2)  # 1 frame, no motion
+    ds = make_dataset(specs, structured_action_state=True)
+    results = evaluate(load_dataset(ds))
+
+    assert "idle" in _checks(results[2])
+    assert any("no motion detected" in f.message for f in results[2].flags)
+    assert all("idle" not in _checks(r) for i, r in enumerate(results) if i != 2)
+
+
 def test_dropped_frames(make_dataset):
     specs = clean_specs()
     specs[5] = EpisodeSpec(drop_frames=list(range(100, 106)), seed=5)

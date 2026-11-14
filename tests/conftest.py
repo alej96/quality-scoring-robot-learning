@@ -137,6 +137,7 @@ def write_dataset(
     extra_action_dim: bool = False,
     grouped_names: bool = False,
     omit_action_state: bool = False,
+    structured_action_state: bool = False,
 ) -> Path:
     """``data_files`` > 1 spreads the episodes over that many v3.0 data files.
 
@@ -149,12 +150,20 @@ def write_dataset(
     ``action``/``observation.state`` columns or features at all, matching a real dataset
     (e.g. a driving dataset) that stores this data under structured per-key names like
     ``action.continuous``/``observation.state.vehicle`` instead of a single flat array.
+    ``structured_action_state`` writes that structured representation for real (instead of
+    just omitting the flat columns): ``action`` is split into ``action.part_a``/
+    ``action.part_b`` (numeric, dims 0:3 / 3:6, so concatenating them back reconstructs the
+    original action including the gripper dim at its usual position) and
+    ``observation.state`` into ``observation.state.part_a``/``.label`` (a ``string`` dtype
+    sub-feature, which should be skipped, not concatenated)/``.part_b``, matching the real
+    ``yaak-ai/L2D`` dataset's shape (several numeric sub-features plus string ones).
     """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
     frames, episodes, episode_stats = [], [], []
     index = 0
     rng = np.random.default_rng(123)
+    boundary = 3  # split point for structured_action_state's two numeric sub-features
     for ep, spec in enumerate(specs):
         ts, action, state = make_episode(spec)
         if state_perm is not None:
@@ -170,9 +179,15 @@ def write_dataset(
             "index": np.arange(index, index + n),
             "task_index": 0,
         }
-        if not omit_action_state:
+        if not omit_action_state and not structured_action_state:
             frame_cols["action"] = list(action.astype(np.float32))
             frame_cols["observation.state"] = list(state.astype(np.float32))
+        elif structured_action_state:
+            frame_cols["action.part_a"] = list(action[:, :boundary].astype(np.float32))
+            frame_cols["action.part_b"] = list(action[:, boundary:].astype(np.float32))
+            frame_cols["observation.state.part_a"] = list(state[:, :boundary].astype(np.float32))
+            frame_cols["observation.state.label"] = ["dry"] * n
+            frame_cols["observation.state.part_b"] = list(state[:, boundary:].astype(np.float32))
         frames.append(pd.DataFrame(frame_cols))
         span = spec.video_span_s if spec.video_span_s is not None else n / FPS
         stats = {
@@ -180,7 +195,7 @@ def write_dataset(
             "episode_index": _stats(np.full(n, ep)),
             "observation.images.top": _image_stats(rng, n, dead=spec.camera_dead),
         }
-        if not omit_action_state:
+        if not omit_action_state and not structured_action_state:
             stats["action"] = _stats(action)
             stats["observation.state"] = _stats(state)
         episode_stats.append(stats)
@@ -230,7 +245,7 @@ def write_dataset(
         "index": {"dtype": "int64", **scalar},
         "task_index": {"dtype": "int64", **scalar},
     }
-    if not omit_action_state:
+    if not omit_action_state and not structured_action_state:
         info["features"]["action"] = {
             "dtype": "float32",
             "shape": [len(action_names)],
@@ -240,6 +255,32 @@ def write_dataset(
             "dtype": "float32",
             "shape": [len(state_names)],
             "names": state_names_out,
+        }
+    elif structured_action_state:
+        info["features"]["action.part_a"] = {
+            "dtype": "float32",
+            "shape": [boundary],
+            "names": action_names[:boundary],
+        }
+        info["features"]["action.part_b"] = {
+            "dtype": "float32",
+            "shape": [len(action_names) - boundary],
+            "names": action_names[boundary:],
+        }
+        info["features"]["observation.state.part_a"] = {
+            "dtype": "float32",
+            "shape": [boundary],
+            "names": state_names[:boundary],
+        }
+        info["features"]["observation.state.label"] = {
+            "dtype": "string",
+            "shape": [1],
+            "names": None,
+        }
+        info["features"]["observation.state.part_b"] = {
+            "dtype": "float32",
+            "shape": [len(state_names) - boundary],
+            "names": state_names[boundary:],
         }
     info["total_tasks"] = 1
     info["chunks_size"] = 1000
@@ -261,7 +302,7 @@ def write_dataset(
         "episode_index": _stats(all_frames["episode_index"].to_numpy()),
         "observation.images.top": _image_stats(rng, index),
     }
-    if not omit_action_state:
+    if not omit_action_state and not structured_action_state:
         dataset_stats["action"] = _stats(np.stack(all_frames["action"]))
         dataset_stats["observation.state"] = _stats(np.stack(all_frames["observation.state"]))
     (root / "meta" / "stats.json").write_text(json.dumps(dataset_stats))
@@ -308,6 +349,7 @@ def make_dataset(tmp_path):
         extra_action_dim: bool = False,
         grouped_names: bool = False,
         omit_action_state: bool = False,
+        structured_action_state: bool = False,
     ) -> Path:
         return write_dataset(
             tmp_path / f"ds-{version}",
@@ -318,6 +360,7 @@ def make_dataset(tmp_path):
             extra_action_dim,
             grouped_names,
             omit_action_state,
+            structured_action_state,
         )
 
     return _make
