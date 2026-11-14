@@ -51,11 +51,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
       flag counts to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2 / 95.2), confirming
       this is a no-op whenever a dataset actually has `action`/`observation.state` data to
       hash.
-      Follow-up: this only stops the false duplicate flag and names the problem; actually
-      reading a dotted/structured action or state representation (concatenating
-      `action.*`/`observation.state.*` sub-features the way `names` grouped under a motor
-      key is already flattened) so checks beyond `duplicate` get real signal on a dataset
-      like this is still open.
+      Follow-up (resolved 2026-11-14): `load_dataset` now reconstructs a flat `action`/
+      `observation.state` array from a dataset's numeric dotted sub-features, so checks
+      beyond `duplicate` get real signal too; see the Log entry.
 - [x] **Fix `check_smoothness`/`check_gripper_chatter` not recognizing a VR-teleop
       controller's `trigger`/`squeeze` axis as the gripper-equivalent dim it is.** Found
       by running `demoqc score` against a real Hub dataset beyond the existing validation
@@ -1565,3 +1563,40 @@ Work top-down through **Next up**. Each item should ship in one focused session
   leaving every check silently empty. `demoqc score yaak-ai/L2D --max-episodes 15` went
   from mean 53.3 (`duplicate` x14) to 100.0 (0 flags, warning printed). See the Log entry
   under "Next up" for full details.
+- 2026-11-14: Follow-up to the above: `load_dataset` now reconstructs a flat `action`/
+  `observation.state` array for a dataset with no literal feature but a structured,
+  dotted per-key representation (`action.continuous`/`action.discrete`,
+  `observation.state.vehicle`/`.waypoints`/`.road`/...), instead of only suppressing the
+  false duplicate flag and leaving every other check blind. `_structured_subfeatures`
+  picks the numeric (non-`string`, non-`video`) sub-feature keys for `action`/
+  `observation.state` from `meta/info.json`; `_concat_structured_columns` stacks and
+  concatenates them per frame, skipping (not crashing on) any sub-feature whose declared
+  `shape` doesn't actually hold row-to-row -- found on `yaak-ai/L2D` itself:
+  `observation.state.waypoints` declares `shape: [10, 2]` but is stored as an Arrow
+  variable-length nested list that round-trips ragged (`ValueError`/`TypeError` from
+  `np.stack`/`np.asarray` without this guard, confirmed via a direct
+  `load_dataset("yaak-ai/L2D", max_episodes=1)` call before the guard was added). `demoqc
+  score yaak-ai/L2D --max-episodes 15` went from mean 100.0 (0 flags -- correct for
+  "nothing was checked", but nothing to find either) to mean 87.4 (`idle` x15,
+  `smoothness` x2, `length` x1, 3/15 below 70), all plausible real signal for a
+  car-driving dataset (idle at red lights, mid-episode operator pauses, one aborted short
+  demo) and no new `duplicate` false positives. New
+  `tests/test_dataset.py::test_structured_action_state_is_concatenated_from_numeric_subfeatures`
+  (asserts the reconstructed `ep.action`/`ep.state` and prefixed per-dim names against a
+  new `structured_action_state` flag on `tests/conftest.py`'s `write_dataset`, which splits
+  the existing flat action/state into two numeric dotted sub-features plus one `string`
+  one, reproducing `yaak-ai/L2D`'s shape) and
+  `tests/test_checks.py::test_structured_action_state_feeds_real_checks` (a frozen-action
+  episode's `idle` flag now fires on a structured-feature dataset exactly as it would on a
+  flat one); both fail without this change (confirmed via `git stash` on
+  `src/demoqc/dataset.py` -- the dataset test gets the "no action or observation.state
+  feature" warning instead of `[]`, and the checks test gets no `idle` flag since
+  `ep.action` is `None`). Re-ran the full existing validation set
+  (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+  `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and `pytest -m
+  network`: byte-identical mean scores to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2
+  / 95.2), confirming this is a no-op whenever a dataset already has a literal `action`/
+  `observation.state` feature.
+  Follow-up: a `string`-typed structured sub-feature (road surface, lighting, etc.) is
+  still never read by any check; turning a dataset's categorical state into a signal
+  (e.g. a check for a stuck/constant categorical reading) is open but likely low value.
