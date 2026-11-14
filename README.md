@@ -142,20 +142,27 @@ or guessing, and prints a warning naming the affected indices so the rest of the
 still scores cleanly. Explicitly requesting one of those indices via `--episodes` raises a
 clear error instead of the generic "not in the dataset" one.
 
-## Datasets without a flat `action`/`observation.state` feature
+## Datasets with a structured `action`/`observation.state` feature
 
-`demoqc` reads the literal `action` and `observation.state` columns LeRobot's standard
-format writes. Some real datasets (e.g. a car-driving dataset with a mixed continuous/
-discrete action space, or structured per-signal state) instead store this data under
-per-key feature names like `action.continuous`/`observation.state.vehicle`, with no flat
-`action`/`observation.state` feature in `meta/info.json` at all. `demoqc` doesn't read that
-representation, so every episode loads with no action/state data -- a `demoqc score` on
-one of these prints a warning naming it (`no action or observation.state feature in
-meta/info.json; ...`) instead of silently scoring as if the dataset were clean. Most checks
-need this data and are silently skipped, same as they already are per-episode when a value
-is missing; duplicate detection in particular is excluded from this rather than comparing
-nothing to nothing, which previously flagged nearly every episode of such a dataset as an
-"exact duplicate" of the first one.
+Some real datasets (e.g. a car-driving dataset with a mixed continuous/discrete action
+space, or structured per-signal state) have no flat `action`/`observation.state` feature in
+`meta/info.json` at all; instead they store this data under per-key dotted feature names
+like `action.continuous`/`action.discrete`/`observation.state.vehicle`. `demoqc`
+reconstructs a flat `action`/`observation.state` array by concatenating every such
+sub-feature (in `meta/info.json`'s own order), so every check gets the same real signal it
+would on a dataset with the literal feature. A `string`-typed sub-feature (e.g. a
+categorical road-surface or lighting label) can't be concatenated into a numeric array and
+carries no signal any check reads, so it's skipped; a sub-feature whose declared `shape`
+doesn't actually hold row-to-row (e.g. a variable-length list that round-trips ragged) is
+also skipped rather than crashing the load, so one malformed sub-feature doesn't lose every
+other, well-formed one. If a dataset has no literal feature *and* no numeric structured
+sub-features to reconstruct from, every episode loads with no action/state data at all, and
+a `demoqc score` on it prints a warning naming it (`no action or observation.state feature
+in meta/info.json; ...`) instead of silently scoring as if the dataset were clean. Most
+checks need this data and are silently skipped, same as they already are per-episode when a
+value is missing; duplicate detection in particular is excluded from this rather than
+comparing nothing to nothing, which previously flagged nearly every episode of such a
+dataset as an "exact duplicate" of the first one.
 
 ## What it checks
 
