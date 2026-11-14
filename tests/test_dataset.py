@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from demoqc.dataset import load_dataset
-from tests.conftest import FPS, clean_specs
+from tests.conftest import FEATURE_NAMES, FPS, clean_specs, make_episode
 
 
 @pytest.mark.parametrize("version", ["v3.0", "v2.1"])
@@ -57,6 +57,33 @@ def test_structured_action_state_names_load_as_missing_with_a_warning(make_datas
         "no action or observation.state feature in meta/info.json; most checks and "
         "duplicate detection need this data and found none for any episode"
     ]
+
+
+def test_structured_action_state_is_concatenated_from_numeric_subfeatures(make_dataset):
+    # Follow-up to the test above (see also the yaak-ai/L2D entry in ROADMAP.md's Log): a
+    # dataset with no literal action/observation.state feature isn't necessarily
+    # unreadable -- the real dataset stores action/state in a structured, per-key form
+    # instead ("action.continuous"/"action.discrete", "observation.state.vehicle"/
+    # "observation.state.road"/..., with several "string"-dtype sub-features mixed in
+    # among numeric ones). demoqc should reconstruct the numeric sub-features into a flat
+    # action/state array (skipping the string ones, which can't be concatenated into a
+    # numeric array and carry no signal any check reads) instead of giving up, so every
+    # check -- not just the already-fixed false exact-duplicate one -- gets real signal.
+    specs = clean_specs(3)
+    ds = load_dataset(make_dataset(specs, structured_action_state=True))
+
+    assert ds.warnings == []
+    for ep, spec in zip(ds.episodes, specs, strict=True):
+        _, orig_action, orig_state = make_episode(spec)
+        want_action = orig_action.astype(np.float32).astype(np.float64)
+        want_state = orig_state.astype(np.float32).astype(np.float64)
+        np.testing.assert_allclose(ep.action, want_action)
+        np.testing.assert_allclose(ep.state, want_state)
+    want_names = [f"part_a.{n}" for n in FEATURE_NAMES[:3]] + [
+        f"part_b.{n}" for n in FEATURE_NAMES[3:]
+    ]
+    assert ds.action_names == want_names
+    assert ds.state_names == want_names
 
 
 def test_v3_video_spans(make_dataset):

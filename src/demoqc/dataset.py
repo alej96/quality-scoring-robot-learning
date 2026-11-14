@@ -50,6 +50,94 @@ def _flatten_feature_names(names: object) -> list[str] | None:
     return None
 
 
+def _structured_subfeatures(features: dict, prefix: str) -> list[str]:
+    """Dotted structured sub-feature keys for ``prefix`` (``"action"`` or
+    ``"observation.state"``).
+
+    A dataset with a mixed continuous/discrete action space or a structured per-signal
+    state (e.g. a car-driving dataset) can store this data under per-key feature names
+    instead of a single flat ``action``/``observation.state`` feature: ``action.continuous``,
+    ``action.discrete``, ``observation.state.vehicle``, ``observation.state.waypoints``, etc.
+    Returns the matching keys in ``meta/info.json``'s own feature order, limited to numeric
+    ones -- a string-typed sub-feature (e.g. a categorical road-surface label) can't be
+    concatenated into a numeric action/state array and carries no signal any check reads.
+    """
+    want = f"{prefix}."
+    return [
+        key
+        for key, feat in features.items()
+        if key.startswith(want)
+        and isinstance(feat, dict)
+        and feat.get("dtype") not in ("string", "video")
+    ]
+
+
+def _structured_subfeature_names(features: dict, subkeys: list[str]) -> list[str] | None:
+    """Per-dim names for the concatenation of ``subkeys`` (see ``_structured_subfeatures``),
+    each prefixed by its own sub-feature's suffix (e.g. ``"continuous.gas_pedal_normalized"``)
+    so dims from different sub-features never collide. Falls back to a numbered name for a
+    sub-feature whose declared ``names`` don't cover its declared ``shape`` (e.g. names
+    one per logical group rather than one per flattened scalar, as in a ``[10, 2]``
+    waypoints array named ``["way", "point"]``)."""
+    if not subkeys:
+        return None
+    out: list[str] = []
+    for key in subkeys:
+        feat = features.get(key, {})
+        suffix = key.rsplit(".", 1)[-1]
+        shape = feat.get("shape")
+        width = None
+        if isinstance(shape, list) and shape:
+            width = 1
+            for d in shape:
+                width *= int(d)
+        sub_names = _flatten_feature_names(feat.get("names"))
+        if sub_names is None or (width is not None and len(sub_names) != width):
+            sub_names = [str(i) for i in range(width)] if width is not None else [suffix]
+        out.extend(f"{suffix}.{n}" for n in sub_names)
+    return out
+
+
+def _stack_structured_subfeature(frames: pd.DataFrame, key: str) -> np.ndarray | None:
+    """``(n_frames, width)`` float array for one dotted sub-feature column, or ``None`` if
+    it can't be read as a consistent fixed-width numeric array for every row.
+
+    A sub-feature's declared ``shape`` in ``meta/info.json`` doesn't always hold: a real
+    dataset (``yaak-ai/L2D``) declares ``observation.state.waypoints`` as ``[10, 2]`` but
+    stores it as an Arrow variable-length nested list, which round-trips as a *ragged*
+    per-row array (a trailing waypoint dropped near an episode's end, say) that can't be
+    reshaped into one fixed width at all. Skipping just that one sub-feature instead of
+    failing the whole concatenation keeps every other, well-formed sub-feature readable.
+    """
+    try:
+        rows = [np.asarray(v, dtype=np.float64).reshape(-1) for v in frames[key].to_numpy()]
+    except (TypeError, ValueError):
+        return None
+    if not rows or any(r.shape != rows[0].shape for r in rows):
+        return None
+    return np.stack(rows)
+
+
+def _concat_structured_columns(
+    frames: pd.DataFrame, subkeys: list[str]
+) -> tuple[list[np.ndarray], list[str]]:
+    """One concatenated 1-D float array per row from several dotted sub-feature columns, in
+    ``subkeys`` order -- the structured equivalent of a single flat ``action``/
+    ``observation.state`` column. Returns the per-row arrays plus the subset of ``subkeys``
+    actually used (see ``_stack_structured_subfeature``); empty/empty if none could be read.
+    """
+    parts: list[np.ndarray] = []
+    used: list[str] = []
+    for key in subkeys:
+        arr = _stack_structured_subfeature(frames, key)
+        if arr is not None:
+            parts.append(arr)
+            used.append(key)
+    if not parts:
+        return [], []
+    return list(np.concatenate(parts, axis=1)), used
+
+
 @dataclass
 class Episode:
     index: int
@@ -138,8 +226,32 @@ def load_dataset(
             patterns = [f"data/*/{n}" for n in sorted(names)] + ["meta/*", "meta/**"]
         path = _download(repo_id, revision, cache_dir, patterns)
 
-    frames = _read_frames(path, want, info)
+    features = info.get("features", {})
+    structured_subkeys: dict[str, list[str]] = {}
+    for col in ("action", "observation.state"):
+        if col not in features:
+            subkeys = _structured_subfeatures(features, col)
+            if subkeys:
+                structured_subkeys[col] = subkeys
+    extra_columns = [k for subkeys in structured_subkeys.values() for k in subkeys]
+
+    frames = _read_frames(path, want, info, extra_columns)
     tasks = _read_tasks(path)
+
+    for col, subkeys in list(structured_subkeys.items()):
+        values, used = (
+            _concat_structured_columns(frames, subkeys)
+            if all(k in frames.columns for k in subkeys)
+            else ([], [])
+        )
+        if used:
+            frames[col] = values
+            structured_subkeys[col] = used  # only the sub-features actually concatenated
+        else:
+            # declared in meta/info.json but missing from the actual data schema, or none
+            # of it could be read as a consistent numeric array; nothing to synthesize,
+            # fall through to the "no action/state feature" warning below
+            del structured_subkeys[col]
 
     warnings: list[str] = []
     if duplicate_episodes:
@@ -158,13 +270,18 @@ def load_dataset(
             f"which recording is the real one): {duplicate_episodes}"
         )
 
-    features = info.get("features", {})
-    missing_cols = [c for c in ("action", "observation.state") if c not in features]
+    missing_cols = [
+        c
+        for c in ("action", "observation.state")
+        if c not in features and c not in structured_subkeys
+    ]
     if missing_cols:
-        # a dataset can store its action/state under structured per-key feature names
-        # instead (e.g. "action.continuous"/"observation.state.vehicle"); demoqc only reads
-        # the literal "action"/"observation.state" columns, so every episode loads with
-        # none of this data and most checks (and duplicate detection) have nothing to score.
+        # some datasets store action/state under structured per-key feature names instead
+        # (e.g. "action.continuous"/"observation.state.vehicle"), reconstructed above when
+        # every sub-feature is numeric and actually present in the data; this warns only
+        # when that reconstruction found nothing to work with (no literal column and no
+        # numeric structured sub-features either), so every episode loads with none of this
+        # data and most checks (and duplicate detection) have nothing to score.
         warnings.append(
             f"no {' or '.join(missing_cols)} feature in meta/info.json; most checks and "
             f"duplicate detection need this data and found none for any episode"
@@ -199,11 +316,13 @@ def load_dataset(
         robot_type=info.get("robot_type"),
         episodes=episodes_out,
         repo_id=repo_id,
-        action_names=_flatten_feature_names(
-            info.get("features", {}).get("action", {}).get("names")
-        ),
-        state_names=_flatten_feature_names(
-            info.get("features", {}).get("observation.state", {}).get("names")
+        action_names=_flatten_feature_names(features.get("action", {}).get("names"))
+        if "action" in features
+        else _structured_subfeature_names(features, structured_subkeys.get("action", [])),
+        state_names=_flatten_feature_names(features.get("observation.state", {}).get("names"))
+        if "observation.state" in features
+        else _structured_subfeature_names(
+            features, structured_subkeys.get("observation.state", [])
         ),
         camera_names=camera_names,
         video_path_template=info.get("video_path"),
@@ -288,7 +407,9 @@ def _download(
     return Path(local)
 
 
-def _read_frames(root: Path, want: frozenset[int] | None, info: dict) -> pd.DataFrame:
+def _read_frames(
+    root: Path, want: frozenset[int] | None, info: dict, extra_columns: list[str] = ()
+) -> pd.DataFrame:
     files = sorted((root / "data").rglob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"no parquet files under {root / 'data'}")
@@ -298,12 +419,11 @@ def _read_frames(root: Path, want: frozenset[int] | None, info: dict) -> pd.Data
             narrowed = [f for f in files if f.name in names]
             if narrowed:
                 files = narrowed
+    wanted_columns = _FRAME_COLUMNS + ["task_index"] + list(extra_columns)
     tables = []
     for f in files:
         names = set(pq.read_schema(f).names)
-        tables.append(
-            pq.read_table(f, columns=[c for c in _FRAME_COLUMNS + ["task_index"] if c in names])
-        )
+        tables.append(pq.read_table(f, columns=[c for c in wanted_columns if c in names]))
     table = pa.concat_tables(tables, promote_options="default")
     df = table.to_pandas()
     for required in ("episode_index", "frame_index", "timestamp"):
