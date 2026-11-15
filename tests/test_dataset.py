@@ -41,6 +41,21 @@ def test_grouped_feature_names_are_flattened(make_dataset):
     assert ds.state_names == FEATURE_NAMES
 
 
+def test_wrapped_feature_names_are_flattened(make_dataset):
+    # Found scoring a real Hub dataset (flex-pi/self_repair_gripper_dagger, a bimanual
+    # arm+gripper teleop dataset): its meta/info.json stores action/observation.state
+    # "names" as the flat per-dim list wrapped in an extra, redundant outer list
+    # ([[...]], one element, itself a list) instead of the flat list itself. Reading that
+    # as-is made every per-dim name consumer (gripper_dims, _match_sync_dims) iterate a
+    # single "dim" whose "name" is the whole list, crashing on the first `name.lower()`
+    # call (AttributeError: 'list' object has no attribute 'lower') before any check ran.
+    # ds.action_names/state_names must come out as the flat per-dim list either way.
+    ds = load_dataset(make_dataset(clean_specs(2), wrapped_names=True))
+
+    assert ds.action_names == FEATURE_NAMES
+    assert ds.state_names == FEATURE_NAMES
+
+
 def test_structured_action_state_names_load_as_missing_with_a_warning(make_dataset):
     # Found scoring a real Hub dataset (a driving dataset) whose meta/info.json has no
     # literal "action"/"observation.state" feature at all -- it stores this data under

@@ -37,6 +37,16 @@ def _flatten_feature_names(names: object) -> list[str] | None:
     away everything else -- so every grouped-feature dataset silently lost both gripper
     detection and all but one sync dim with no visible symptom. Flattening dict values (in
     their stored order) in here, once, fixes both call sites.
+
+    A real dataset (``flex-pi/self_repair_gripper_dagger``, a bimanual arm+gripper teleop
+    dataset) writes a third shape: the flat per-dim list wrapped in an extra, redundant
+    outer list (``[["left_pos_x", ..., "right_joint_5"]]``, one element, itself a list, not
+    a dict). Reading that as-is (the old ``isinstance(names, list): return names`` branch)
+    made every per-dim name consumer below iterate a single "dim" whose "name" is the whole
+    32-element list, crashing the very first ``name.lower()`` call in ``gripper_dims``
+    (``AttributeError: 'list' object has no attribute 'lower'``) before any check ever ran.
+    A list whose elements aren't all strings is therefore flattened the same way a dict's
+    *values* are, rather than returned as-is.
     """
     if isinstance(names, dict):
         flat: list[str] = []
@@ -46,7 +56,14 @@ def _flatten_feature_names(names: object) -> list[str] | None:
             flat.extend(group)
         return flat
     if isinstance(names, list):
-        return names
+        if all(isinstance(n, str) for n in names):
+            return names
+        flat = []
+        for group in names:
+            if not isinstance(group, list):
+                return None  # unrecognised shape; don't guess
+            flat.extend(group)
+        return flat
     return None
 
 
