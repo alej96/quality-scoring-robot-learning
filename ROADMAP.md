@@ -9,6 +9,41 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `demoqc score`/`dedupe` crashing on a dataset whose `meta/info.json` wraps its
+      per-dim feature names in an extra outer list.** Found by running `demoqc score`
+      against a real Hub dataset beyond the existing validation set
+      (`flex-pi/self_repair_gripper_dagger`, a bimanual arm+gripper teleop dataset found
+      via `list_datasets(filter="LeRobot", sort="downloads")`): `demoqc score
+      flex-pi/self_repair_gripper_dagger --max-episodes 20` crashed outright with
+      `AttributeError: 'list' object has no attribute 'lower'` in `DatasetContext.build`'s
+      `gripper_dims` comprehension, before any check ran. Root cause: this dataset's
+      `meta/info.json` stores `action`/`observation.state`'s `names` as the flat 32-entry
+      per-dim list wrapped in one extra, redundant outer list (`[["left_pos_x", ...,
+      "right_joint_5"]]`, confirmed directly via `hf_hub_download` + `json.load` on the raw
+      file) -- a third shape beyond the flat list and the ALOHA-style
+      `{"motors": [...]}` dict `_flatten_feature_names` already handles.
+      `_flatten_feature_names`'s `isinstance(names, list): return names` branch returned
+      this one-element list as-is, so every per-dim name consumer (`gripper_dims`,
+      `_match_sync_dims`) iterated a single "dim" whose "name" was the whole 32-string
+      list, crashing on the first `name.lower()` call. Fixed by only returning a list
+      as-is when every element is already a string; otherwise (a list of lists, as here)
+      it's flattened the same way a dict's values already are, instead of guessed at or
+      passed through. New `tests/test_dataset.py::test_wrapped_feature_names_are_flattened`
+      (`ds.action_names`/`state_names` come out flat) and
+      `tests/test_checks.py::test_gripper_chatter_detected_with_wrapped_feature_names` (the
+      full crash reproduction via `evaluate()`, reusing the existing `gripper_chatter_at`
+      fixture), plus a new `wrapped_names` flag on `tests/conftest.py`'s `write_dataset`
+      that writes the real `[[...]]` shape; both new tests fail with the pre-fix code
+      (confirmed via `git stash` on just `src/demoqc/dataset.py` -- both raise the exact
+      `AttributeError: 'list' object has no attribute 'lower'` from the real dataset).
+      Validated on the real dataset: `demoqc score flex-pi/self_repair_gripper_dagger
+      --max-episodes 20` now runs to completion (mean 99.8, `smoothness` x1, 20 episodes,
+      3694 frames; previously an unhandled crash with no score at all). Re-ran the full
+      existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got byte-identical mean scores and
+      flag counts to every prior Log entry (97.1 / 92.9 / 92.2 / 99.2 / 95.2), confirming
+      this is a no-op whenever `names` is already a flat list of strings.
 - [x] **Fix `demoqc dedupe`/`score` flagging nearly every episode of a dataset with no
       `action`/`observation.state` feature as an exact duplicate.** Found by running
       `demoqc score` against a real Hub dataset beyond the existing validation set
@@ -1600,3 +1635,11 @@ Work top-down through **Next up**. Each item should ship in one focused session
   Follow-up: a `string`-typed structured sub-feature (road surface, lighting, etc.) is
   still never read by any check; turning a dataset's categorical state into a signal
   (e.g. a check for a stuck/constant categorical reading) is open but likely low value.
+- 2026-11-15: Fixed `demoqc score`/`dedupe` crashing (`AttributeError: 'list' object has
+  no attribute 'lower'`) on a dataset whose `meta/info.json` wraps its flat per-dim
+  `names` list in an extra outer list (`flex-pi/self_repair_gripper_dagger`), a third
+  shape beyond the flat list and the ALOHA-style grouped dict `_flatten_feature_names`
+  already handled. `demoqc score flex-pi/self_repair_gripper_dagger --max-episodes 20`
+  went from an unhandled crash to mean 99.8 (`smoothness` x1); the full existing
+  validation set reproduced byte-identical scores. See the "Next up" entry for the
+  full root cause.
