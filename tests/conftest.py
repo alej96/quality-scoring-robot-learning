@@ -136,6 +136,7 @@ def write_dataset(
     state_perm: list[int] | None = None,
     extra_action_dim: bool = False,
     grouped_names: bool = False,
+    wrapped_names: bool = False,
     omit_action_state: bool = False,
     structured_action_state: bool = False,
 ) -> Path:
@@ -146,7 +147,9 @@ def write_dataset(
     a constant action-only column (an unmatched extra sensor with no observation.state
     counterpart) named ``force_sensor``. ``grouped_names`` writes ``names`` as
     ``{"motors": [...]}`` instead of a flat list, matching real ALOHA-format datasets
-    on the Hub (e.g. ``lerobot/aloha_static_cups_open``). ``omit_action_state`` writes no
+    on the Hub (e.g. ``lerobot/aloha_static_cups_open``). ``wrapped_names`` writes ``names``
+    as the flat list wrapped in an extra outer list (``[[...]]``), matching a real dataset
+    on the Hub (``flex-pi/self_repair_gripper_dagger``). ``omit_action_state`` writes no
     ``action``/``observation.state`` columns or features at all, matching a real dataset
     (e.g. a driving dataset) that stores this data under structured per-key names like
     ``action.continuous``/``observation.state.vehicle`` instead of a single flat array.
@@ -234,6 +237,9 @@ def write_dataset(
     if grouped_names:
         action_names_out: object = {"motors": action_names}
         state_names_out: object = {"motors": state_names}
+    elif wrapped_names:
+        action_names_out = [action_names]
+        state_names_out = [state_names]
     else:
         action_names_out = action_names
         state_names_out = state_names
@@ -348,6 +354,7 @@ def make_dataset(tmp_path):
         state_perm: list[int] | None = None,
         extra_action_dim: bool = False,
         grouped_names: bool = False,
+        wrapped_names: bool = False,
         omit_action_state: bool = False,
         structured_action_state: bool = False,
     ) -> Path:
@@ -359,6 +366,7 @@ def make_dataset(tmp_path):
             state_perm,
             extra_action_dim,
             grouped_names,
+            wrapped_names,
             omit_action_state,
             structured_action_state,
         )

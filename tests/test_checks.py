@@ -805,6 +805,23 @@ def test_gripper_chatter_detected_with_grouped_feature_names(make_dataset):
     assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
 
 
+def test_gripper_chatter_detected_with_wrapped_feature_names(make_dataset):
+    # Real dataset flex-pi/self_repair_gripper_dagger stores action/observation.state
+    # "names" as the flat per-dim list wrapped in an extra outer list ([[...]], see
+    # test_dataset.test_wrapped_feature_names_are_flattened for the full root cause).
+    # Before flattening it, DatasetContext.gripper_dims iterated that single "dim" (whose
+    # "name" is the whole 6-element list) and crashed on `name.lower()` -- so this dataset
+    # couldn't be scored at all, not even silently miscalibrated.
+    specs = clean_specs()
+    specs[3] = EpisodeSpec(gripper_chatter_at=(100, 115), seed=3)
+    path = make_dataset(specs, wrapped_names=True)
+    results = evaluate(load_dataset(path))
+
+    assert results[3].metrics["gripper_toggles_per_window"] >= 4
+    assert "gripper_chatter" in _checks(results[3])
+    assert all("gripper_chatter" not in _checks(r) for i, r in enumerate(results) if i != 3)
+
+
 def test_sync_matches_all_dims_with_grouped_feature_names(make_dataset):
     # Same root cause as the gripper_chatter case above: with "names" as an unflattened
     # dict ({"motors": [...]}), _match_sync_dims read it via enumerate()/`in`, which only
