@@ -338,6 +338,78 @@ def test_smoothness_counts_a_sustained_ramp_as_one_jump():
         assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
 
 
+def _noisy_sustained_ramp_dataset() -> Dataset:
+    """Like ``_sustained_ramp_dataset``'s ramp episode, but the ramp's per-frame step
+    alternates between just-above and just-below the spike threshold instead of exceeding
+    it on every single frame.
+
+    Found on a real Hub dataset (``RoboCOIN/Galbot_G1_load_floor_trash_3``, a wheeled-base
+    humanoid): its base orientation is logged as a quaternion z/w pair, and ``w`` sits
+    within 0.045 of 1.0 for virtually the whole dataset (the robot rarely rotates its
+    base), so its own step_p99 baseline is tiny. A genuine, continuous, smooth base
+    rotation then produces a long run of frames whose step ratio exceeds
+    ``spike_factor * step_p99`` -- but ordinary frame-to-frame measurement noise, not a
+    perfectly uniform step size, drops some of those frames back under the threshold
+    mid-turn, so the already-fixed sustained-ramp collapsing (only literally consecutive
+    big frames merge into one run) still split one continuous rotation into 3-17 separate
+    "jumps" per episode instead of the one real event it is.
+    """
+    n = 90
+    t = np.arange(n)
+    n_clean = 120
+
+    def episode(idx: int, still_dim: np.ndarray) -> Episode:
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * (idx % 10)
+        action = np.stack([joint, still_dim], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    def baseline(idx: int) -> np.ndarray:
+        return 0.2 + 0.01 * np.sin(2 * np.pi * t / 13 + idx)
+
+    clean = [episode(i, baseline(i)) for i in range(n_clean)]
+
+    # one continuous, monotonic rotation whose per-frame step alternates big/small (net
+    # +0.8 over 20 frames), held afterwards -- never reverses direction
+    noisy_ramp = baseline(n_clean).copy()
+    deltas = np.tile([0.08, 0.002], 10)
+    noisy_ramp[40:60] = noisy_ramp[39] + np.cumsum(deltas)
+    noisy_ramp[60:] = noisy_ramp[59]
+    ramp_ep = episode(n_clean, noisy_ramp)
+
+    # two genuinely separate single-frame discontinuities, far apart in time -- must stay
+    # two jumps, not get bridged into one just because they're both "big"
+    two_jumps = baseline(n_clean + 1).copy()
+    two_jumps[30:] += 0.5
+    two_jumps[70:] += 0.5
+    jump_ep = episode(n_clean + 1, two_jumps)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, ramp_ep, jump_ep],
+    )
+
+
+def test_smoothness_bridges_short_gaps_in_a_sustained_ramp():
+    results = {r.episode_index: r for r in evaluate(_noisy_sustained_ramp_dataset())}
+
+    ramp_result = results[120]
+    assert ramp_result.metrics["spikes"] == 0
+    assert ramp_result.metrics["jumps"] == 1  # pre-fix: 10, one per contiguous sub-run
+
+    # the fix must not merge two genuinely separate discontinuities into one
+    jump_result = results[121]
+    assert jump_result.metrics["jumps"] == 2
+
+    # every clean episode (dim at dataset-wide baseline jitter only) stays silent
+    for i in range(120):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+
+
 def _noise_dominated_dim_dataset() -> Dataset:
     """A synthetic dataset with five normal, actively-moving joint dims plus one dim that
     sits almost frozen for the whole dataset (like a torso/neck joint the task never

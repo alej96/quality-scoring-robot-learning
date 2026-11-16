@@ -79,6 +79,9 @@ class Config:
     smoothness_dim_outlier_z: float = 4.0  # exclude a dim from spike/jump detection if
     # log(step_p99) is this many robust MADs from the dataset's other action dims' own
     # median -- a joint/axis the task barely ever moves, so step_p99 reflects only noise
+    smoothness_ramp_gap_frames: int = 10  # bridge a same-direction gap of up to this many
+    # frames between two big-step frames on the same dim before counting runs -- frame-to-
+    # frame noise mid-ramp shouldn't split one continuous motion into many "jumps"
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -423,6 +426,41 @@ def _suppress_gimbal_lock_pairs(
         big[cancels, b] = False
 
 
+def _bridge_sustained_motion_gaps(big: np.ndarray, step: np.ndarray, max_gap: int) -> np.ndarray:
+    """Fill a short, same-direction gap between two big-step frames on the same dim.
+
+    Found on a real dataset (``RoboCOIN/Galbot_G1_load_floor_trash_3``, a wheeled-base
+    humanoid): its base orientation is logged as a quaternion z/w pair, and ``w`` sits
+    within 0.045 of 1.0 for virtually the entire dataset (the robot rarely rotates its
+    base), so its own IQR-based ``scale`` -- and therefore ``step_p99`` -- is tiny. A
+    genuine, continuous, smooth base rotation then produces a long run of frames whose
+    step ratio exceeds ``spike_factor * step_p99``, exactly the already-handled "sustained
+    ramp" case (see ``check_smoothness``) -- but ordinary frame-to-frame measurement noise
+    occasionally drops one or two consecutive frames' ratio back under that threshold mid-
+    turn, since the motion isn't perfectly uniform. ``_runs`` only merges *literally
+    consecutive* big frames, so what is physically one continuous rotation was split into
+    8-22 separate "jumps" per episode (several hitting the check's max penalty) instead of
+    the one real event it is. Bridges a gap of up to ``max_gap`` frames between two big
+    frames on the *same dim* only when the step's sign doesn't change across the gap, so
+    two genuinely separate, oppositely-signed excursions close together are never merged
+    (confirmed on the real dataset: every genuinely distinct rotation event there is
+    hundreds of frames from the next, far past any reasonable gap tolerance).
+    """
+    if max_gap <= 0:
+        return big
+    out = big.copy()
+    for d in range(big.shape[1]):
+        idx = np.flatnonzero(big[:, d])
+        if len(idx) < 2:
+            continue
+        gaps = np.diff(idx)
+        bridge = (gaps > 1) & (gaps <= max_gap + 1)
+        for start, end in zip(idx[:-1][bridge], idx[1:][bridge], strict=True):
+            if np.sign(step[start, d]) == np.sign(step[end, d]):
+                out[start + 1 : end, d] = True
+    return out
+
+
 def _speed(action: np.ndarray, scale: np.ndarray, fps: float) -> np.ndarray:
     """RMS speed across (scaled) action dims, one value per transition.
 
@@ -741,7 +779,11 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
     if ctx.angular_pairs:
         _suppress_gimbal_lock_pairs(ep.action, big, ctx.angular_pairs, cfg.angular_pair_cancel_frac)
     any_big = big.any(axis=1)
-    # a glitch is a large step immediately reversed by a large step on the same dim
+    # a glitch is a large step immediately reversed by a large step on the same dim. This
+    # must run on the *un-bridged* big frames: bridging below fills in frames whose own
+    # step is small (that's the point), and running reversal detection on those too would
+    # read ordinary small-amplitude noise at a bridged frame as a brand-new spike that
+    # didn't exist before bridging.
     reversal = big[:-1] & big[1:] & (np.sign(step[:-1]) != np.sign(step[1:]))
     frame_reversal = reversal.any(axis=1)
     spikes = int(frame_reversal.sum())
@@ -753,11 +795,16 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
     # spans -- found on a real dataset (zekaiwang/trex_dataset) whose dexterous-hand finger
     # targets sit still almost the whole episode, so step_p99 for those dims is tiny, and a
     # single smooth, monotonic grasp closing over ~20 frames was reported as "20 abrupt
-    # action jumps" even though none of those steps is actually discontinuous.
+    # action jumps" even though none of those steps is actually discontinuous. A gap of a
+    # frame or two below the big-step threshold, in the middle of an otherwise continuous,
+    # same-direction run (ordinary measurement noise, not a pause), is bridged the same way
+    # before counting runs (see ``_bridge_sustained_motion_gaps``).
+    bridged = _bridge_sustained_motion_gaps(big, step, cfg.smoothness_ramp_gap_frames)
+    any_bridged = bridged.any(axis=1)
     consumed = np.zeros_like(any_big)
     consumed[:-1] |= frame_reversal
     consumed[1:] |= frame_reversal
-    jumps = len(_runs(any_big & ~consumed))
+    jumps = len(_runs(any_bridged & ~consumed))
     out.metrics.update(spikes=spikes, jumps=jumps)
     if spikes:
         out.flags.append(
