@@ -827,6 +827,74 @@ Work top-down through **Next up**. Each item should ship in one focused session
       a no-op on real, clean data and only changes behavior when a dataset is actually
       corrupted.
 
+- [x] **Fix `check_smoothness` splitting one continuous, noisy sustained motion into many
+      "abrupt action jumps."** Found by running `demoqc score` against a real Hub dataset
+      beyond the existing validation set (`RoboCOIN/Galbot_G1_load_floor_trash_3`, a
+      wheeled-base humanoid found via `list_datasets(filter="LeRobot", sort="downloads")`):
+      14/20 episodes carried a `smoothness` "abrupt action jump(s)" flag (mean score 89.8),
+      several hitting the check's max 20-point penalty with 7-24 "jumps" each, on a dataset
+      whose other checks looked clean. Per-dim inspection of the flagged frames found the
+      main cause: the robot's base orientation is logged as a quaternion z/w pair, and `w`
+      (`base_orient_quat_w`) sits within 0.045 of 1.0 for virtually the whole dataset (the
+      robot rarely rotates its base), so its own IQR-based `scale` -- and therefore
+      `step_p99` -- is tiny; a genuine, continuous, smooth base rotation then produces a
+      long run of frames whose step ratio exceeds `spike_factor * step_p99`, exactly the
+      already-handled "sustained ramp" case (see the 2026-11-07 Log entry for
+      `zekaiwang/trex_dataset`) -- but ordinary frame-to-frame measurement noise, not a
+      perfectly uniform per-frame step, dropped a frame or two back under the threshold
+      every few frames throughout the turn (confirmed by printing the raw quat values: a
+      smooth, monotonic decrease from 0.992 to 0.955 over ~20 frames, never reversing).
+      Because `_runs` only merges *literally consecutive* big frames, one real rotation
+      event was split into 3-17 separate "jumps" instead of the one it is. Fixed by adding
+      `checks._bridge_sustained_motion_gaps`, called from `check_smoothness` right after
+      gimbal-lock-pair suppression: bridges a gap of up to `Config.smoothness_ramp_gap_frames`
+      (10, new) frames between two big-step frames on the *same dim*, but only when the
+      step's sign doesn't change across the gap, so two genuinely separate, oppositely-
+      signed excursions close together are never merged. Bridging runs on a separate copy
+      of `big` used only for run-counting; the existing single-frame-glitch/"spike"
+      detection still runs on the original, un-bridged frames, so a bridged (originally
+      below-threshold) frame can't be misread as a brand-new reversal glitch (an early
+      version of this fix that bridged before spike detection did exactly that, replacing
+      every fixed episode's jump flags with a pile of spurious spike flags instead --
+      caught by re-running the real dataset before committing). New
+      `tests/test_checks.py::test_smoothness_bridges_short_gaps_in_a_sustained_ramp` builds
+      a 122-episode synthetic dataset by hand (120 clean episodes, one episode with a
+      continuous rotation whose per-frame step alternates big/small -- same net direction
+      throughout -- and one episode with two genuinely separate single-frame jumps 40
+      frames apart) and asserts the noisy-ramp episode gets exactly 1 jump (not 10) while
+      the two-jump episode still gets 2 and every clean episode stays silent; fails without
+      this change (confirmed via `git stash` on just `src/demoqc/checks.py` -- the
+      noisy-ramp episode asserts `10 == 1`, reproducing the real dataset's fragmentation
+      exactly). Validated on the real dataset: `demoqc score
+      RoboCOIN/Galbot_G1_load_floor_trash_3 --max-episodes 20` went from mean 89.8 (median
+      92.5, `smoothness` x14, several episodes at 7-24 jumps) to mean 90.8 (median 95.0,
+      same 14 episodes still flagged -- this fix doesn't claim the remaining jumps are false
+      positives, only that fragmented sub-runs of one event shouldn't each count separately
+      -- but with much smaller, more accurate per-episode counts, e.g. one episode's 24
+      jumps -> 4 real contiguous turns). Also re-ran `zekaiwang/trex_dataset`
+      (`--max-episodes 50`, the original sustained-ramp fix's own validation dataset): mean
+      95.2 -> 97.3, same 19 episodes still flagged `smoothness`, with 11 of those 19 getting
+      further-reduced jump counts (e.g. episode 12's already-reduced 8 -> 2) -- this fix is
+      a direct, narrower extension of that one, not a different mechanism. Re-ran the full
+      existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and the other previously-fixed
+      smoothness datasets (`lerobot/aloha_static_battery`,
+      `RoboCOIN/Agilex_Cobot_Magic_heat_burger`, `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`,
+      `allenai/MolmoAct2-BimanualYAM-Dataset`) and got byte-identical mean scores and flag
+      counts to every prior Log entry on all nine, confirming this is a no-op whenever a
+      dataset has no same-dim, same-direction gap to bridge.
+      Follow-up: the same dataset's `torso_joint_2/4/5_rad` and `head_joint_1/2_rad` dims
+      are a *different* defect (same `_exclude_noise_dominated_dims` cross-dim-outlier
+      pattern already tracked as a follow-up on `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`
+      above, just with a less extreme step_p99 z-score here too, 1.14-2.08) -- scattered
+      single-frame noise blips on a barely-used joint, not a sustained ramp, so gap-bridging
+      doesn't help them. A dim's own raw `scale` (not just its `step_p99` relative to other
+      dims) is a much cleaner signal for this real dataset specifically (torso/head score_z
+      4.47-7.49 vs. every genuinely driven dim's z < 3.1 using the dataset's own robust
+      median/MAD of log-scale), but combining it safely with the existing step_p99-based
+      exclusion, across every previously-validated dataset, needs its own session.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -1643,3 +1711,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
   went from an unhandled crash to mean 99.8 (`smoothness` x1); the full existing
   validation set reproduced byte-identical scores. See the "Next up" entry for the
   full root cause.
+- 2026-11-16: Fixed `check_smoothness` splitting one continuous, noisy sustained motion
+  (e.g. a slow base rotation logged as a near-pinned quaternion component) into many
+  separate "abrupt action jump" flags instead of the one real event it is.
+  `RoboCOIN/Galbot_G1_load_floor_trash_3 --max-episodes 20` went from mean 89.8
+  (`smoothness` x14, 7-24 jumps on the worst episodes) to mean 90.8 (same 14 episodes,
+  much smaller, more accurate counts); `zekaiwang/trex_dataset --max-episodes 50` (the
+  original sustained-ramp fix's own dataset) went from 95.2 to 97.3 with further-reduced
+  jump counts on 11 of its 19 flagged episodes. See the "Next up" entry for the full root
+  cause and the torso/head follow-up this run also found but didn't fix.
