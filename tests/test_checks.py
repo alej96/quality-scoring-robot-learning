@@ -685,6 +685,56 @@ def test_smoothness_ignores_vr_controller_trigger_snap():
     assert "smoothness" in _checks(jump_result)
 
 
+def test_gripper_dims_matches_dexterous_hand_joint_names():
+    # Found on RoboCOIN/Unitree_G1edu_u3_place_bread_1 (a Unitree G1 humanoid with a
+    # dexterous multi-finger hand instead of a simple gripper): its grasp-actuation action
+    # dims are named "left_hand_joint_1_rad".."left_hand_joint_7_rad" (and the same for
+    # "right_"), not literally "gripper". gripper_dims matched only "gripper"/"trigger"/
+    # "squeeze", so none of these 14 per-finger dims were ever detected.
+    ds = _gripper_snap_dataset()
+    ds.action_names = [
+        "joint_0",
+        "joint_1",
+        "joint_2",
+        "joint_3",
+        "left_hand_joint_4_rad",
+        "right_hand_joint_7_rad",
+    ]
+    ctx = DatasetContext.build(ds, Config())
+    assert ctx.gripper_dims == [4, 5]
+
+
+def test_smoothness_ignores_dexterous_hand_joint_snap():
+    # Same real dataset as above: 5/10 episodes carried spurious "abrupt action jump(s)"
+    # smoothness flags, every flagged frame on a "*_hand_joint_*" dim -- each finger joint
+    # sits at a steady setpoint almost the whole episode and snaps through its own range in
+    # 1-2 frames during a deliberate grasp/release, exactly the already-fixed
+    # literal-"gripper"-named case, just under a dexterous-hand naming convention.
+    ds = _gripper_snap_dataset()
+    ds.action_names = [
+        "joint_0",
+        "joint_1",
+        "joint_2",
+        "joint_3",
+        "joint_4",
+        "left_hand_joint_3_rad",
+    ]
+    results = {r.episode_index: r for r in evaluate(ds)}
+
+    for i in range(36):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert "smoothness" not in _checks(results[i]), (i, results[i].flags)
+
+    snap_result = results[36]
+    assert snap_result.metrics["jumps"] == 0
+    assert "smoothness" not in _checks(snap_result), snap_result.flags
+
+    # a genuine, unrelated jump on a normal joint dim must still be caught
+    jump_result = results[37]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)
