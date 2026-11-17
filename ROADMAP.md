@@ -895,6 +895,45 @@ Work top-down through **Next up**. Each item should ship in one focused session
       median/MAD of log-scale), but combining it safely with the existing step_p99-based
       exclusion, across every previously-validated dataset, needs its own session.
 
+- [x] **Fix `check_smoothness` flagging a dexterous hand's finger-joint grasp as an abrupt
+      action jump.** Found by running `demoqc score` against a real Hub dataset beyond the
+      existing validation set (`RoboCOIN/Unitree_G1edu_u3_place_bread_1`, a Unitree G1
+      humanoid with a dexterous multi-finger hand, found via `list_datasets(filter=
+      "LeRobot", sort="downloads")`): 5/10 episodes carried a `smoothness` "abrupt action
+      jump(s)" flag (mean score 95.0). Per-dim inspection of the flagged frames found the
+      cause: this robot has no literal gripper at all -- grasping is done with a 7-joint
+      dexterous hand per arm, named `left/right_hand_joint_1..7_rad`. Each finger joint
+      sits at a steady open/closed setpoint for almost the whole episode (confirmed by
+      printing the raw values around every flagged frame: e.g. `left_hand_joint_1_rad` held
+      at exactly -1.035 for 586 frames, then one single-frame jump to -0.317 followed by a
+      smooth continuation) and snaps through its own range in 1-2 frames during a
+      deliberate grasp/release -- precisely the already-fixed literal-`*gripper*`-dim and
+      VR-controller-`*trigger*`/`*squeeze*` pattern, just under a dexterous-hand naming
+      convention `gripper_dims`' keyword match didn't cover. Fixed by adding `"hand_joint"`
+      to `checks._GRIPPER_NAME_KEYWORDS` (narrower than bare `"hand"`, so a continuous
+      eef/wrist pose dim incidentally named `*_hand_pos_*`/`*_hand_rot_*` isn't swept in
+      too); every `*_hand_joint_*` dim is then excluded from spike/jump detection via the
+      same `_exclude_gripper_dims` mechanism, and `check_gripper_chatter` now also watches
+      these dims for genuine rapid open/close toggling. New
+      `tests/test_checks.py::test_gripper_dims_matches_dexterous_hand_joint_names` (asserts
+      `DatasetContext.build(...).gripper_dims` directly) and
+      `test_smoothness_ignores_dexterous_hand_joint_snap` (the full false-positive
+      reproduction, reusing the existing `_gripper_snap_dataset` fixture with its gripper
+      dim renamed to `"left_hand_joint_3_rad"`) both fail without this change (confirmed via
+      `git stash` on just `src/demoqc/checks.py` -- `gripper_dims == []` and every "clean"
+      episode asserts `1 == 0` on `jumps`, reproducing the real dataset's false positives
+      exactly). Validated on the real dataset: `demoqc score
+      RoboCOIN/Unitree_G1edu_u3_place_bread_1 --max-episodes 10` went from mean 95.0
+      (`smoothness` x5, every flagged frame on a `*_hand_joint_*` dim) to mean 98.0
+      (`smoothness` x1) -- the one remaining flag (episode 8) is on `left_arm_joint_3/5/6`,
+      a genuine fast arm motion after a mid-episode pause, confirming the fix removed only
+      the hand-joint false positives and left real arm-joint jumps intact. Re-ran the full
+      existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got byte-identical mean scores
+      (97.1 / 92.9 / 92.2 / 99.2 / 95.2) to every prior Log entry, confirming this is a
+      no-op whenever a dataset has no dim named with any of the four keywords.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -1720,3 +1759,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
   original sustained-ramp fix's own dataset) went from 95.2 to 97.3 with further-reduced
   jump counts on 11 of its 19 flagged episodes. See the "Next up" entry for the full root
   cause and the torso/head follow-up this run also found but didn't fix.
+- 2026-11-17: Fixed `check_smoothness` flagging a dexterous hand's finger-joint grasp
+  (`left/right_hand_joint_1..7_rad`, no literal gripper dim at all) as an abrupt action
+  jump, by adding `"hand_joint"` to `checks._GRIPPER_NAME_KEYWORDS`.
+  `RoboCOIN/Unitree_G1edu_u3_place_bread_1 --max-episodes 10` went from mean 95.0
+  (`smoothness` x5, all on hand-joint dims) to mean 98.0 (`smoothness` x1, a genuine
+  arm-joint jump); the full existing validation set reproduced byte-identical scores. See
+  the "Next up" entry for the full root cause.
