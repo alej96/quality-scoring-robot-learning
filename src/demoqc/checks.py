@@ -292,10 +292,16 @@ def _exclude_noise_dominated_dims(step_p99: np.ndarray, z_thresh: float) -> np.n
     return out
 
 
-_GRIPPER_NAME_KEYWORDS = ("gripper", "trigger", "squeeze")
+_GRIPPER_NAME_KEYWORDS = ("gripper", "trigger", "squeeze", "hand_joint")
 # "trigger"/"squeeze" cover VR-controller teleop naming (e.g. a Quest-style controller's
 # index-trigger/grip-squeeze axis driving a humanoid hand's open/close), the same
 # near-binary actuator pattern as a literal "*gripper*" dim -- see _exclude_gripper_dims.
+# "hand_joint" covers a dexterous multi-finger hand replacing a simple gripper (e.g. a
+# Unitree G1's per-finger joints, "left_hand_joint_1_rad".."left_hand_joint_7_rad"): each
+# finger joint sits at a steady open/closed setpoint almost the whole episode and snaps
+# through its range in 1-2 frames during a deliberate grasp/release, exactly the gripper
+# pattern -- "hand_joint" rather than bare "hand" so an eef/wrist pose dim incidentally
+# named "*_hand_pos_*"/"*_hand_rot_*" (continuous, not near-binary) isn't swept in too.
 
 
 def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.ndarray:
@@ -324,6 +330,13 @@ def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.n
     were invisible to the "gripper" name match -- 19/20 episodes carried spurious "abrupt
     action jump(s)" flags, almost entirely on those two dims. See
     ``_GRIPPER_NAME_KEYWORDS``.
+
+    Also recurs on a humanoid with a dexterous multi-finger hand instead of a simple
+    gripper: found on ``RoboCOIN/Unitree_G1edu_u3_place_bread_1``, whose
+    ``left/right_hand_joint_1..7_rad`` action dims (14 per-finger joints) each sit at a
+    steady setpoint for most of an episode and snap through their own range in 1-2 frames
+    during a grasp/release, same as a literal gripper dim -- 5/10 episodes carried spurious
+    "abrupt action jump(s)" flags, every flagged frame on a ``*_hand_joint_*`` dim.
     """
     if not gripper_dims:
         return step_p99
