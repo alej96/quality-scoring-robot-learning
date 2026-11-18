@@ -531,6 +531,88 @@ def _jerkier_than_peers_dataset() -> Dataset:
     )
 
 
+def _scale_outlier_dim_dataset() -> Dataset:
+    """A synthetic dataset with five normal, actively-moving joint dims plus one dim
+    that moves smoothly but through a vanishingly small range (like a torso/neck joint
+    whose own typical per-frame step, after normalising by its own tiny range, still
+    looks like ordinary motion -- so ``_exclude_noise_dominated_dims``'s step_p99
+    comparison across dims doesn't flag it), with an occasional held sensor blip that
+    is tiny in absolute terms but huge relative to the dim's own near-zero range.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    n_clean = 40
+    rng = np.random.default_rng(0)
+    freqs = np.array([1.0, 1.6, 0.6, 2.2, 0.9])
+    amps = np.array([5.0, 3.0, 7.0, 2.0, 6.0])
+    phases0 = np.array([0.3, 1.1, 2.0, 2.9, 4.0])
+
+    def active_dims(idx: int) -> np.ndarray:
+        return amps * np.sin(2 * np.pi * freqs[None, :] * t[:, None] / n + phases0 + 0.01 * idx)
+
+    def tiny_dim(idx: int, blip_frame: int | None = None, blip_mag: float = 0.0) -> np.ndarray:
+        d = 0.00008 * np.sin(2 * np.pi * 0.3 * t / n + 0.05 * idx) + rng.normal(0, 2e-6, n)
+        if blip_frame is not None:
+            d = d.copy()
+            d[blip_frame : blip_frame + 5] += blip_mag  # held, not an immediate reversal
+        return d
+
+    def episode(
+        idx: int,
+        tiny: np.ndarray,
+        jump_dim: int | None = None,
+        jump_frame: int | None = None,
+        jump_mag: float = 0.0,
+    ) -> Episode:
+        act = active_dims(idx)
+        if jump_dim is not None:
+            act = act.copy()
+            act[jump_frame:, jump_dim] += jump_mag
+        action = np.concatenate([act, tiny[:, None]], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    clean = [episode(i, tiny_dim(i)) for i in range(n_clean)]
+    # a real, false-positive-triggering noise blip on the tiny dim: tiny in absolute
+    # terms (0.00015) but ~2x the dim's own dataset-wide range
+    blip_ep = episode(n_clean, tiny_dim(n_clean, blip_frame=30, blip_mag=0.00015))
+    # a genuine, unrelated jump on one of the five normal dims
+    jump_ep = episode(n_clean + 1, tiny_dim(n_clean + 1), jump_dim=1, jump_frame=45, jump_mag=10.0)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, blip_ep, jump_ep],
+    )
+
+
+def test_smoothness_ignores_a_scale_outlier_dim():
+    # Found on a real Hub dataset (RoboCOIN/AI2_Alphabot_2_insert_water_pipe), as a
+    # residual of the noise-dominated-dim fix above: its `neck_joint_1/2_rad` and
+    # `torso_joint_4_rad` dims have a dataset-wide range under 0.0002 rad (scale outlier
+    # z=4.1-5.1 against the dataset's other action dims' own scale), but their own
+    # step_p99 -- already normalised by that same tiny range -- lands close enough to a
+    # genuinely driven dim's step_p99 (outlier z only 1.1-3.0, short of the 4.0
+    # threshold) that `_exclude_noise_dominated_dims` let them through, so they kept
+    # contributing scattered single-frame blips to the dataset's `smoothness` flags.
+    results = {r.episode_index: r for r in evaluate(_scale_outlier_dim_dataset())}
+
+    for i in range(40):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert results[i].metrics["spikes"] == 0, (i, results[i].metrics)
+    blip_result = results[40]
+    assert blip_result.metrics["jumps"] == 0, blip_result.metrics
+    assert blip_result.metrics["spikes"] == 0, blip_result.metrics
+
+    # the fix must not blind the check to a real jump on one of the normal dims
+    jump_result = results[41]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_smoothness_jerkier_than_peers_needs_a_material_ldlj_gap():
     # Found by running `demoqc score` against a real Hub dataset beyond the existing
     # validation set (EPITECH-LILLE/eval_training): episode 37, scored against a

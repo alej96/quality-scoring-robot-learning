@@ -230,6 +230,7 @@ class DatasetContext:
         # leave them out of spike detection rather than flag every toggle
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
         step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
+        step_p99 = _exclude_scale_outlier_dims(step_p99, scale, cfg.smoothness_dim_outlier_z)
         step_p99 = _exclude_gripper_dims(step_p99, gripper_dims)
         idle_speed = cfg.idle_fraction_of_p75 * p75
         stale_fracs = [
@@ -289,6 +290,52 @@ def _exclude_noise_dominated_dims(step_p99: np.ndarray, z_thresh: float) -> np.n
     z = np.abs(logp - med) / mad
     out = step_p99.copy()
     out[idx[z > z_thresh]] = np.nan
+    return out
+
+
+def _exclude_scale_outlier_dims(
+    step_p99: np.ndarray, scale: np.ndarray, z_thresh: float
+) -> np.ndarray:
+    """Exclude (set to NaN) action dims whose own range (robust ``scale``) is a wild
+    low outlier among this dataset's *other* dims, in log space.
+
+    A dim that moves a tiny amount all episode (e.g. a torso/neck joint the task barely
+    uses) can still pass ``_exclude_noise_dominated_dims``: that check compares each dim's
+    ``step_p99`` -- the 99th-pct per-frame step *already divided by the dim's own scale* --
+    across dims, and dividing a dim's own sensor noise by its own (equally tiny) scale can
+    land that ratio in the same range as a genuinely driven dim's ratio, hiding exactly the
+    dim it's meant to catch. The dim's raw ``scale`` itself, compared directly to every
+    other dim's ``scale`` (not run through that same per-dim normalisation), has no such
+    blind spot.
+
+    Found on a real dataset (``RoboCOIN/AI2_Alphabot_2_insert_water_pipe``): its
+    ``neck_joint_1/2_rad`` and ``torso_joint_4_rad`` dims have a dataset-wide range under
+    0.0002 rad -- scale outlier z=4.1-5.1 against the dataset's other dims' own
+    median/MAD of log-scale -- yet their ``step_p99`` outlier z (against other dims'
+    ``step_p99``) only reaches 1.1-2.1, well short of ``smoothness_dim_outlier_z``'s 4.0,
+    so they stayed in spike/jump detection and kept contributing scattered single-frame
+    noise blips to the dataset's `smoothness` flags. Every genuinely driven dim in the
+    same dataset sits within scale outlier z=+-1.4 of the median (confirmed directly), and
+    on ``zekaiwang/trex_dataset`` (58 action dims spanning a naturally wide range of motion
+    scale) every dim stays within z=+-2.2, so this needs no per-unit tuning either. Only a
+    *low*-side outlier (a barely-used dim) is excluded -- a dim with an unusually *large*
+    scale (e.g. a literal gripper's wide open/closed range) is a legitimate signal, not
+    this artifact, and gripper dims are already excluded by name via
+    ``_exclude_gripper_dims``. Skipped entirely below 5 live dims, same as
+    ``_exclude_noise_dominated_dims``.
+    """
+    valid = np.isfinite(scale) & (scale > 0)
+    if valid.sum() < 5:
+        return step_p99
+    idx = np.flatnonzero(valid)
+    logs = np.log(scale[idx])
+    med = np.median(logs)
+    mad = np.median(np.abs(logs - med)) * 1.4826
+    if mad < 1e-9:
+        return step_p99
+    z = (logs - med) / mad
+    out = step_p99.copy()
+    out[idx[z < -z_thresh]] = np.nan
     return out
 
 
