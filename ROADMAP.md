@@ -9,6 +9,19 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [ ] **Fix `demoqc score` crashing on a dataset whose parquet files mix `float32` and
+      `float64` for the same column across episodes.** Found incidentally while validating
+      this run's fix on `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`: scoring the whole
+      dataset (no `--episodes`/`--max-episodes`) crashes with `pyarrow.lib.ArrowTypeError:
+      Unable to merge: Field action has incompatible types: list<element: double> vs
+      list<element: float>` in `dataset.py`'s `_read_frames` (`pa.concat_tables`), while
+      `--max-episodes 15` (this run's and the gimbal-lock fix's validation subset) loads
+      fine -- so only some of the dataset's parquet files actually have the mismatched
+      dtype. Needs `_read_frames` (or wherever tables are read before concatenation) to
+      cast columns to a common dtype before merging, with a synthetic-defect test
+      (`tests/conftest.py`'s `write_dataset` would need a way to write one file with
+      `float32` and another with `float64` for the same column) and re-validation on this
+      dataset and the rest of the existing validation set.
 - [x] **Fix `demoqc score`/`dedupe` crashing on a dataset whose `meta/info.json` wraps its
       per-dim feature names in an extra outer list.** Found by running `demoqc score`
       against a real Hub dataset beyond the existing validation set
@@ -338,6 +351,47 @@ Work top-down through **Next up**. Each item should ship in one focused session
       same defect with a less extreme outlier z-score (2.5-3.0); lowering the threshold to
       catch them loses the safety margin against `trex_dataset`'s real dims (max z=2.94)
       and needs either a smarter combined signal or more real-dataset evidence first.
+      Follow-up (resolved 2026-11-18): added `checks._exclude_scale_outlier_dims`, called
+      from `DatasetContext.build` right after `_exclude_noise_dominated_dims`, using the
+      "smarter combined signal" anticipated above: a dim's own robust `scale` (its
+      dataset-wide IQR/std, already computed for normalising steps) compared directly to
+      every other action dim's `scale`, rather than to its own `step_p99` ratio. The three
+      residual dims' `step_p99` ratio looked unremarkable (z=1.1-3.0, the same reason the
+      first fix's threshold missed them: dividing a dim's own tiny noise by its own equally
+      tiny scale can land the ratio in the same range as a genuinely driven dim's), but
+      their raw `scale` is a decisive low outlier (z=4.1-5.1) against the dataset's other
+      dims -- confirmed directly on `RoboCOIN/AI2_Alphabot_2_insert_water_pipe`. Only a
+      *low*-side scale outlier is excluded (an unusually *large* scale, e.g. a literal
+      gripper's wide open/closed range, is a legitimate signal and already excluded by name
+      via `_exclude_gripper_dims` when it applies); this needed no new `Config` field, since
+      it reuses `smoothness_dim_outlier_z` for the same cross-dim-outlier comparison, just
+      on a different quantity. New
+      `tests/test_checks.py::test_smoothness_ignores_a_scale_outlier_dim` builds a
+      42-episode synthetic dataset by hand (5 normal joint dims, a 6th dim moving smoothly
+      through a vanishingly small range so its own `step_p99` ratio stays unremarkable, one
+      episode with a held sensor blip on that 6th dim that is tiny in absolute terms but
+      huge relative to its own near-zero range, one episode with a genuine jump on a normal
+      dim) and asserts the blip episode is silent while the genuine-jump episode still
+      flags; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- the blip episode asserts `2 == 0` on `jumps`, reproducing
+      the real dataset's residual false positive exactly). Validated on the real dataset:
+      `demoqc score RoboCOIN/AI2_Alphabot_2_insert_water_pipe --max-episodes 20` went from
+      mean 94.8 (`smoothness` x7) to mean 99.1 (0/20 below 70, `smoothness` x0) -- every
+      residual false positive from this follow-up is gone. Re-ran the full existing
+      validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got
+      byte-identical mean scores and flag counts to every prior Log entry (97.1 / 92.9 /
+      92.2 / 99.2 / 95.2). Also re-ran every dataset from the dim-outlier/gap-bridging
+      series (`zekaiwang/trex_dataset`, `RoboCOIN/Galbot_G1_load_floor_trash_3`,
+      `RoboCOIN/Unitree_G1edu_u3_place_bread_1`, both ALOHA joint-space datasets, both
+      Agilex datasets, `allenai/MolmoAct2-BimanualYAM-Dataset`, `BitRobot/HIW-500-LeRobot`,
+      `EPITECH-LILLE/eval_training`): `trex_dataset` (58 naturally-varied-scale dims, the
+      real stress test for this exclusion) and every other dataset reproduced its existing
+      validated mean score and flag count exactly except `Galbot_G1_load_floor_trash_3`,
+      which rose from 90.8 to 91.2 (same 14 episodes still flagged, smaller jump counts) --
+      the exact dataset this fix's own docstring names as having the same torso/head
+      scale-outlier pattern, confirming this is a real improvement there too, not a
+      regression anywhere else.
 - [x] **Fix `check_smoothness` counting every frame of one sustained, smooth motion as a
       separate "abrupt action jump".** Found by running `demoqc score` against a real Hub
       dataset beyond the existing validation set (`zekaiwang/trex_dataset`, a dual-arm
@@ -1766,3 +1820,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
   (`smoothness` x5, all on hand-joint dims) to mean 98.0 (`smoothness` x1, a genuine
   arm-joint jump); the full existing validation set reproduced byte-identical scores. See
   the "Next up" entry for the full root cause.
+- 2026-11-18: Resolved the torso/head scale-outlier follow-up from 2026-11-16: added
+  `checks._exclude_scale_outlier_dims`, excluding an action dim from `smoothness`
+  spike/jump detection when its own raw `scale` (not just its `step_p99` ratio) is a wild
+  low outlier among the dataset's other dims. `RoboCOIN/AI2_Alphabot_2_insert_water_pipe
+  --max-episodes 20` went from mean 94.8 (`smoothness` x7) to mean 99.1 (0 `smoothness`
+  flags); `RoboCOIN/Galbot_G1_load_floor_trash_3 --max-episodes 20` (the same pattern on a
+  different robot) rose from 90.8 to 91.2. The full existing validation set and every
+  other previously-fixed smoothness dataset reproduced byte-identical scores. See the
+  "Next up" entry for the full root cause.
