@@ -139,6 +139,7 @@ def write_dataset(
     wrapped_names: bool = False,
     omit_action_state: bool = False,
     structured_action_state: bool = False,
+    mixed_dtype_files: bool = False,
 ) -> Path:
     """``data_files`` > 1 spreads the episodes over that many v3.0 data files.
 
@@ -160,6 +161,11 @@ def write_dataset(
     ``observation.state`` into ``observation.state.part_a``/``.label`` (a ``string`` dtype
     sub-feature, which should be skipped, not concatenated)/``.part_b``, matching the real
     ``yaak-ai/L2D`` dataset's shape (several numeric sub-features plus string ones).
+    ``mixed_dtype_files`` (v3.0 only, needs ``data_files`` > 1) writes the first data file's
+    ``action``/``observation.state`` columns as ``float64`` while every other data file keeps
+    the usual ``float32``, matching a real dataset
+    (``RoboCOIN/Agilex_Cobot_Magic_place_towel_flat``) whose parquet files disagree on the
+    dtype of the same column across the dataset.
     """
     (root / "meta").mkdir(parents=True)
     (root / "data" / "chunk-000").mkdir(parents=True)
@@ -316,9 +322,12 @@ def write_dataset(
     if version.startswith("v3"):
         for k in range(data_files):
             part = [f for ep, f in enumerate(frames) if ep * data_files // len(specs) == k]
-            pd.concat(part, ignore_index=True).to_parquet(
-                root / "data" / "chunk-000" / f"file-{k:03d}.parquet", index=False
-            )
+            part_df = pd.concat(part, ignore_index=True)
+            if mixed_dtype_files and k == 0:
+                for col in ("action", "observation.state"):
+                    if col in part_df:
+                        part_df[col] = part_df[col].apply(lambda a: a.astype(np.float64))
+            part_df.to_parquet(root / "data" / "chunk-000" / f"file-{k:03d}.parquet", index=False)
         (root / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
         pd.DataFrame(episodes).to_parquet(
             root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
@@ -357,6 +366,7 @@ def make_dataset(tmp_path):
         wrapped_names: bool = False,
         omit_action_state: bool = False,
         structured_action_state: bool = False,
+        mixed_dtype_files: bool = False,
     ) -> Path:
         return write_dataset(
             tmp_path / f"ds-{version}",
@@ -369,6 +379,7 @@ def make_dataset(tmp_path):
             wrapped_names,
             omit_action_state,
             structured_action_state,
+            mixed_dtype_files,
         )
 
     return _make

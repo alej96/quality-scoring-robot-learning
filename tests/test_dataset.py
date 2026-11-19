@@ -56,6 +56,21 @@ def test_wrapped_feature_names_are_flattened(make_dataset):
     assert ds.state_names == FEATURE_NAMES
 
 
+def test_loads_dataset_with_mixed_dtype_across_data_files(make_dataset):
+    # Found scoring a real Hub dataset (RoboCOIN/Agilex_Cobot_Magic_place_towel_flat):
+    # scoring the whole dataset crashed with pyarrow.lib.ArrowTypeError ("Unable to merge:
+    # Field action has incompatible types: list<element: double> vs list<element: float>")
+    # in _read_frames's pa.concat_tables, because only some of the dataset's v3.0 data files
+    # had action/observation.state written as float64 while the rest used the usual
+    # float32. Loading must succeed and the data must come out as real float64, not raise.
+    ds = load_dataset(make_dataset(clean_specs(4), "v3.0", data_files=2, mixed_dtype_files=True))
+
+    assert [e.index for e in ds.episodes] == [0, 1, 2, 3]
+    for ep in ds.episodes:
+        assert ep.action.shape == (ep.length, 6)
+        assert ep.state.shape == (ep.length, 6)
+
+
 def test_structured_action_state_names_load_as_missing_with_a_warning(make_dataset):
     # Found scoring a real Hub dataset (a driving dataset) whose meta/info.json has no
     # literal "action"/"observation.state" feature at all -- it stores this data under

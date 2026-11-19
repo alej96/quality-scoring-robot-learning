@@ -441,7 +441,10 @@ def _read_frames(
     for f in files:
         names = set(pq.read_schema(f).names)
         tables.append(pq.read_table(f, columns=[c for c in wanted_columns if c in names]))
-    table = pa.concat_tables(tables, promote_options="default")
+    # "permissive" (not "default") is required here: some real datasets' per-episode/file
+    # parquet files disagree on the dtype of the same column (e.g. float32 vs float64 for
+    # `action`), and "default" raises instead of unifying to the common wider type.
+    table = pa.concat_tables(tables, promote_options="permissive")
     df = table.to_pandas()
     for required in ("episode_index", "frame_index", "timestamp"):
         if required not in df:
