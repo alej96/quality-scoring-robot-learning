@@ -9,19 +9,40 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
-- [ ] **Fix `demoqc score` crashing on a dataset whose parquet files mix `float32` and
+- [x] **Fix `demoqc score` crashing on a dataset whose parquet files mix `float32` and
       `float64` for the same column across episodes.** Found incidentally while validating
-      this run's fix on `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`: scoring the whole
-      dataset (no `--episodes`/`--max-episodes`) crashes with `pyarrow.lib.ArrowTypeError:
-      Unable to merge: Field action has incompatible types: list<element: double> vs
-      list<element: float>` in `dataset.py`'s `_read_frames` (`pa.concat_tables`), while
-      `--max-episodes 15` (this run's and the gimbal-lock fix's validation subset) loads
-      fine -- so only some of the dataset's parquet files actually have the mismatched
-      dtype. Needs `_read_frames` (or wherever tables are read before concatenation) to
-      cast columns to a common dtype before merging, with a synthetic-defect test
-      (`tests/conftest.py`'s `write_dataset` would need a way to write one file with
-      `float32` and another with `float64` for the same column) and re-validation on this
-      dataset and the rest of the existing validation set.
+      an earlier run's fix on `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`: scoring the
+      whole dataset (no `--episodes`/`--max-episodes`) crashed with
+      `pyarrow.lib.ArrowTypeError: Unable to merge: Field action has incompatible types:
+      list<element: double> vs list<element: float>` in `dataset.py`'s `_read_frames`
+      (`pa.concat_tables`), while `--max-episodes 15` (that run's and the gimbal-lock fix's
+      validation subset) loaded fine -- so only some of the dataset's parquet files
+      actually had the mismatched dtype. Root cause: `_read_frames` called
+      `pa.concat_tables(tables, promote_options="default")`; `"default"` only fills in
+      missing fields with nulls and promotes null-typed arrays, it does not unify two
+      tables that both have a real, differently-typed `action`/`observation.state` column
+      (confirmed directly: a minimal `list<float32>` vs `list<float64>` table pair raises
+      the exact same error under `"default"`). Fixed by switching to
+      `promote_options="permissive"` (one-line change), which pyarrow's own docs describe
+      as "the behavior of default plus types will be promoted to the common denominator
+      that fits all the fields" -- confirmed directly that it resolves both the flat
+      `list<float32>`/`list<float64>` case and the nested `fixed_size_list` variant, and
+      leaves already-passing cases (same dtype everywhere, or a field missing from some
+      files) unchanged, since it's a strict superset of `"default"`. New
+      `tests/test_dataset.py::test_loads_dataset_with_mixed_dtype_across_data_files` (a new
+      `mixed_dtype_files` flag on `tests/conftest.py`'s `write_dataset`/`make_dataset`
+      writes a v3.0 dataset's first data file with `action`/`observation.state` as
+      `float64` while the rest keep the usual `float32`) fails with the pre-fix code
+      (confirmed via `git stash` on just `src/demoqc/dataset.py` -- raises the exact same
+      `pyarrow.lib.ArrowTypeError` as the real dataset). Validated on the real dataset:
+      `demoqc score RoboCOIN/Agilex_Cobot_Magic_place_towel_flat` (the full dataset, no
+      episode cap -- previously an unhandled crash) now runs to completion: 962 episodes,
+      mean 92.8, 0 below 70, `idle` x945 and `smoothness` x7, no crash. Re-ran the full
+      existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`) and got byte-identical mean scores to
+      every prior Log entry (97.1 / 92.9), confirming this is a no-op whenever a dataset's
+      parquet files already agree on dtype. Also ran `pytest -m network`: all network tests
+      pass.
 - [x] **Fix `demoqc score`/`dedupe` crashing on a dataset whose `meta/info.json` wraps its
       per-dim feature names in an extra outer list.** Found by running `demoqc score`
       against a real Hub dataset beyond the existing validation set
@@ -1829,3 +1850,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
   different robot) rose from 90.8 to 91.2. The full existing validation set and every
   other previously-fixed smoothness dataset reproduced byte-identical scores. See the
   "Next up" entry for the full root cause.
+- 2026-11-19: Fixed `demoqc score` crashing (`pyarrow.lib.ArrowTypeError`) on a dataset
+  whose parquet files mix `float32` and `float64` for the same `action`/
+  `observation.state` column across files, by switching `_read_frames`'s
+  `pa.concat_tables` call from `promote_options="default"` to `"permissive"` (pyarrow's
+  own superset that unifies mismatched column types instead of raising).
+  `demoqc score RoboCOIN/Agilex_Cobot_Magic_place_towel_flat` (the full 962-episode
+  dataset, previously an unhandled crash) now scores to completion (mean 92.8); the full
+  existing validation set reproduced byte-identical scores. See the "Next up" entry for
+  the full root cause.
