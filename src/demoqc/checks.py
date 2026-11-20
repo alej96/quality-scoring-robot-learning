@@ -58,6 +58,9 @@ class Config:
     # z-score inflated by a tiny MAD when most episodes share a near-identical motion
     sync_max_lag_s: float = 0.5  # search window for action/state cross-correlation
     sync_min_peak_corr: float = 0.4  # below this, the lag estimate is unreliable
+    sync_corr_min_drop: float = 0.25  # once a dataset has a reliable baseline peak correlation
+    # (DatasetContext.sync_corr_baseline), a "weak correlation" flag also needs the episode's
+    # own peak correlation to fall at least this far below it -- see check_sync
     sync_lag_outlier_frames: float = 2.0  # flag if an episode's lag differs from the median by more
     dedupe_resample_len: int = 50  # points each trimmed action trajectory is resampled to
     dedupe_z: float = 3.0  # near-duplicate if nn distance < median nn distance - this * MAD
@@ -174,6 +177,11 @@ class DatasetContext:
     # some robots (e.g. a humanoid whose chassis/arm state publishes slower than the logging
     # fps) hold observation.state for a frame or two on every episode as a hardware artifact,
     # not a recorder bug -- see check_staleness.
+    sync_corr_baseline: float | None = None  # dataset's own median per-episode sync peak
+    # correlation (None below 5 qualifying episodes); some action encodings (e.g. an absolute
+    # target end-effector pose in a different frame/representation than observation.state, as
+    # opposed to a direct per-joint command) cap out at a moderate correlation for every
+    # episode even with no desync at all -- see check_sync.
     # --decode-video support (check_video_freeze); video_root is only set for a local
     # dataset (v2.x or v3.0), since videos are never downloaded from the Hub (see
     # video.resolve_v2_video_path/resolve_v3_video_path).
@@ -192,6 +200,7 @@ class DatasetContext:
         a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
         s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
         sync_dims = _match_sync_dims(ds.action_names, ds.state_names, a_width, s_width)
+        sync_corr_baseline = _sync_corr_baseline(ds.episodes, sync_dims, cfg.sync_max_lag_s, ds.fps)
         video_root = ds.root if decode_video and ds.repo_id is None else None
         video_ctx = dict(
             video_root=video_root,
@@ -201,7 +210,16 @@ class DatasetContext:
         )
         actions = [e.action for e in ds.episodes if e.action is not None and len(e.action) > 1]
         if not actions:
-            return cls(ds.fps, None, None, 0.0, gripper_dims, sync_dims, **video_ctx)
+            return cls(
+                ds.fps,
+                None,
+                None,
+                0.0,
+                gripper_dims,
+                sync_dims,
+                sync_corr_baseline=sync_corr_baseline,
+                **video_ctx,
+            )
         allA = np.concatenate(actions)
         # nan-aware: a single non-finite value (sensor glitch, corrupted write) in one
         # episode must not poison the scale for every other episode in the dataset. A
@@ -249,6 +267,7 @@ class DatasetContext:
             angular_dims=angular_dims,
             angular_pairs=angular_pairs,
             stale_state_baseline=stale_state_baseline,
+            sync_corr_baseline=sync_corr_baseline,
             **video_ctx,
         )
 
@@ -978,12 +997,55 @@ def _best_lag(a: np.ndarray, s: np.ndarray, max_lag: int) -> tuple[int, float]:
     return best_lag, best_corr
 
 
+def _sync_corr_baseline(
+    episodes: list[Episode],
+    sync_dims: tuple[list[int], list[int]] | None,
+    max_lag_s: float,
+    fps: float,
+) -> float | None:
+    """Dataset's own median per-episode sync peak correlation, or ``None`` below 5
+    qualifying episodes (the same gate every other dataset-relative check uses).
+
+    Found on real Hub datasets (``lerobot/LIBERO-Cosmos3``, ``lerobot/LIBERO_10-Cosmos3``):
+    their ``action`` feature is an absolute target end-effector pose (position + a 6D
+    rotation) in a different representation/frame than ``observation.state`` (position +
+    axis-angle), rather than a direct per-joint command -- so even with no desync at all,
+    the two streams' matched dims (position and a binary gripper) only ever reach a
+    moderate correlation, confirmed directly: every one of 20 sampled episodes landed in a
+    tight 0.30-0.53 band, with no separation between any "low" and "high" cluster, yet
+    40-60% of episodes (whichever happened to fall under the fixed 0.4 cutoff) carried a
+    "weak correlation" flag -- the exact fixed-absolute-threshold instability already fixed
+    for ``stale_state``/``length``/``ldlj_z``, just not yet extended to this check.
+    """
+    if sync_dims is None:
+        return None
+    a_idx, s_idx = sync_dims
+    max_lag = max(1, int(round(max_lag_s * fps)))
+    corrs = []
+    for ep in episodes:
+        if ep.action is None or ep.state is None or ep.length < 10:
+            continue
+        if max(a_idx) >= ep.action.shape[1] or max(s_idx) >= ep.state.shape[1]:
+            continue
+        _, corr = _best_lag(
+            np.diff(ep.action[:, a_idx], axis=0), np.diff(ep.state[:, s_idx], axis=0), max_lag
+        )
+        corrs.append(corr)
+    return float(np.median(corrs)) if len(corrs) >= 5 else None
+
+
 def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
     """Estimate the lag between commanded ``action`` and observed ``observation.state``.
 
     A USB latency spike or a recorder bug desyncs the two streams for part of a recording
     session; that episode's best-fit lag will differ from its peers' even though each
     stream looks fine on its own.
+
+    The "weak correlation" flag also requires a material drop from the dataset's own
+    baseline correlation (``ctx.sync_corr_baseline``) once there's a reliable one -- some
+    action encodings cap out at a moderate correlation for every episode with no desync at
+    all; see ``_sync_corr_baseline``. A dataset with no such baseline (too few episodes, or
+    unmatched/positionally-matched dims) falls back to the plain fixed cutoff, unchanged.
     """
     if ep.action is None or ep.state is None or ep.length < 10 or ctx.sync_dims is None:
         return
@@ -994,13 +1056,17 @@ def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
     max_lag = max(1, int(round(cfg.sync_max_lag_s * ctx.fps)))
     lag, corr = _best_lag(np.diff(action, axis=0), np.diff(state, axis=0), max_lag)
     out.metrics.update(sync_lag_frames=float(lag), sync_lag_s=lag / ctx.fps, sync_peak_corr=corr)
-    if corr < cfg.sync_min_peak_corr:
+    baseline = ctx.sync_corr_baseline
+    if corr < cfg.sync_min_peak_corr and (
+        baseline is None or baseline - corr > cfg.sync_corr_min_drop
+    ):
+        baseline_note = f" (dataset baseline r={baseline:.2f})" if baseline is not None else ""
         out.flags.append(
             Flag(
                 "sync",
                 WARN,
                 f"action/observation.state correlation is weak (r={corr:.2f}); "
-                "lag estimate unreliable",
+                f"lag estimate unreliable{baseline_note}",
                 10,
             )
         )
