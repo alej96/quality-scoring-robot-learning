@@ -967,6 +967,66 @@ def test_sync_survives_extra_unmatched_action_dim(make_dataset):
     assert all("sync" not in _checks(r) for i, r in enumerate(results) if i != 6)
 
 
+def _moderate_corr_sync_dataset() -> Dataset:
+    """A single-dim dataset where ``observation.state`` is only ever a partial echo of
+    ``action`` (mixed with an unrelated motion at a different frequency), so every clean
+    episode's peak correlation lands in a tight, moderate 0.3-0.4 band -- mirroring a real
+    action encoding (e.g. an absolute target end-effector pose in a different
+    representation/frame than observation.state) that never reaches a high correlation
+    even with no desync at all. One episode's state is genuinely scrambled (a real
+    recorder defect) and must still be caught.
+    """
+    n = 240  # 8s at FPS
+    t = np.arange(n) / FPS
+    f1, f2, lag, alpha = 0.6, 1.3, 1, 0.48
+
+    def episode(idx: int, rng: np.random.Generator | None) -> Episode:
+        phase1, phase2 = 0.1 * idx, 0.37 + 0.13 * idx
+        action = 50.0 * np.sin(2 * np.pi * f1 * t + phase1)
+        if rng is not None:
+            # a real recorder bug: state is unrelated to action, not a delayed/mixed copy
+            state = rng.permutation(action)
+        else:
+            action_lagged = np.concatenate([np.repeat(action[:1], lag), action[:-lag]])
+            indep = 50.0 * np.sin(2 * np.pi * f2 * t + phase2)
+            state = alpha * action_lagged + (1 - alpha) * indep
+        frame_index = np.arange(n)
+        return Episode(
+            index=idx,
+            timestamps=frame_index / FPS,
+            frame_index=frame_index,
+            action=action[:, None],
+            state=state[:, None],
+        )
+
+    episodes = [episode(i, None) for i in range(12)]
+    episodes.append(episode(12, np.random.default_rng(0)))
+    return Dataset(
+        root=Path("."), fps=FPS, codebase_version="v3.0", robot_type=None, episodes=episodes
+    )
+
+
+def test_sync_weak_correlation_needs_a_material_drop_from_baseline():
+    # Found by running `demoqc score` against real Hub datasets beyond the existing
+    # validation set (`lerobot/LIBERO-Cosmos3`, `lerobot/LIBERO_10-Cosmos3`): 40-60% of
+    # episodes carried a "weak correlation" `sync` flag, with peak correlations spread
+    # smoothly across a tight 0.30-0.53 band and no separation between any "low" and
+    # "high" cluster -- the dataset's own action encoding (an absolute target
+    # end-effector pose in a different representation than observation.state) just
+    # never reaches a high correlation, the same fixed-absolute-threshold instability
+    # already fixed for stale_state/length/ldlj_z.
+    results = {r.episode_index: r for r in evaluate(_moderate_corr_sync_dataset())}
+
+    for i in range(12):
+        assert results[i].metrics["sync_peak_corr"] < Config().sync_min_peak_corr
+        assert "sync" not in _checks(results[i]), (i, results[i].flags)
+
+    # a genuine recorder defect (state unrelated to action) must still be caught
+    scrambled = results[12]
+    assert scrambled.metrics["sync_peak_corr"] < 0.1
+    assert "sync" in _checks(scrambled)
+
+
 @pytest.mark.parametrize("version", ["v3.0", "v2.1"])
 def test_camera_dead(make_dataset, version):
     # one episode's camera stats are near-black for the whole episode: a disconnected
