@@ -1009,6 +1009,53 @@ Work top-down through **Next up**. Each item should ship in one focused session
       (97.1 / 92.9 / 92.2 / 99.2 / 95.2) to every prior Log entry, confirming this is a
       no-op whenever a dataset has no dim named with any of the four keywords.
 
+- [x] **Fix `check_sync` flagging most of a dataset as "weak correlation" when the
+      action encoding itself just never reaches a high correlation.** Found by running
+      `demoqc score` against real Hub datasets beyond the existing validation set
+      (`lerobot/LIBERO-Cosmos3` and `lerobot/LIBERO_10-Cosmos3`, Cosmos-rendered LIBERO
+      variants found via `list_datasets(filter="LeRobot", sort="downloads")`): 8/20 and
+      12/20 episodes respectively carried a `sync` "action/observation.state correlation
+      is weak" flag (mean scores 96.0 and ~85.0), on datasets whose other checks looked
+      clean. Per-episode inspection of every sampled episode's peak correlation (printed
+      directly) found the cause: both datasets' `action` feature is an absolute target
+      end-effector pose (3-D position + a 6D rotation) in a different representation/frame
+      than `observation.state` (position + axis-angle) -- not a direct per-joint command --
+      so the check's matched dims (position + a binary gripper) only ever reach a moderate
+      correlation, confirmed directly: all 20 sampled episodes of `LIBERO-Cosmos3` landed
+      in a tight 0.305-0.526 band with no separation between any "low" and "high" cluster,
+      yet roughly half of them (whichever happened to fall under the fixed
+      `sync_min_peak_corr` cutoff, 0.4) got flagged -- the exact fixed-absolute-threshold
+      instability already fixed for `stale_state`/`length`/`ldlj_z`, just not yet extended
+      to this check (confirmed this isn't a desync in the underlying demonstrations either:
+      the base `lerobot/libero` dataset, presumably the same physical trajectories under a
+      different, directly-trackable action encoding, carries zero `sync` flags). Fixed by
+      adding `DatasetContext.sync_corr_baseline` (via the new `_sync_corr_baseline` helper,
+      the dataset's own median per-episode peak correlation, `None` below 5 qualifying
+      episodes): `check_sync`'s "weak correlation" flag now also requires the episode's own
+      correlation to fall more than `Config.sync_corr_min_drop` (0.25, new) below that
+      baseline, once one exists -- a no-op whenever the dataset's baseline is high (every
+      dataset in the existing validation set), since a correlation below 0.4 against a high
+      baseline always clears a 0.25 drop too. New
+      `tests/test_checks.py::test_sync_weak_correlation_needs_a_material_drop_from_baseline`
+      builds a 13-episode synthetic dataset by hand (12 clean episodes whose
+      `observation.state` is a fixed partial mix of `action` and an unrelated motion at a
+      different frequency, landing every one in a tight moderate-correlation band below the
+      fixed cutoff, plus one episode with a genuinely scrambled, unrelated state -- a real
+      recorder defect) and asserts every clean episode stays silent while the scrambled one
+      is still flagged; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- every clean episode asserts `'sync' not in {'sync'}`,
+      reproducing the real datasets' false positives exactly). Validated on the real
+      datasets: `demoqc score lerobot/LIBERO-Cosmos3 --max-episodes 20` went from mean 96.0
+      (`sync` x8) to mean 100.0 (0 flags); `demoqc score lerobot/LIBERO_10-Cosmos3
+      --max-episodes 20` went from `sync` x12 (plus an unrelated `length` flag) to just the
+      same `length` x1 (0 `sync` flags). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace` and `masato-ka/so100_cutlery_handling_simple`, full
+      datasets, no episode cap) and got byte-identical mean scores to every prior Log entry
+      (97.1 / 92.9), plus `aaronsu11/so100_lego`, `shylee/so100_cube` and
+      `jccj/so100_block_in_cup` at `--max-episodes 20` (none of which has ever carried a
+      `sync` flag), confirming this only removes flags whose dataset-wide baseline was too
+      low to make them material, not real localized desyncs.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -1859,3 +1906,13 @@ Work top-down through **Next up**. Each item should ship in one focused session
   dataset, previously an unhandled crash) now scores to completion (mean 92.8); the full
   existing validation set reproduced byte-identical scores. See the "Next up" entry for
   the full root cause.
+- 2026-11-20: Fixed `check_sync` flagging roughly half of two real datasets
+  (`lerobot/LIBERO-Cosmos3`, `lerobot/LIBERO_10-Cosmos3`) as "weak correlation" because
+  their action encoding (an absolute end-effector pose in a different representation than
+  `observation.state`) never reaches a high correlation at all, by adding
+  `DatasetContext.sync_corr_baseline` and requiring a material drop below it
+  (`Config.sync_corr_min_drop`). `lerobot/LIBERO-Cosmos3 --max-episodes 20` went from mean
+  96.0 (`sync` x8) to 100.0 (0 flags); `lerobot/LIBERO_10-Cosmos3 --max-episodes 20` lost
+  all 12 `sync` flags, keeping only an unrelated `length` one. The full existing
+  validation set reproduced byte-identical scores. See the "Next up" entry for the full
+  root cause.
