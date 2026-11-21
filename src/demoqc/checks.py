@@ -974,12 +974,25 @@ def _best_lag(a: np.ndarray, s: np.ndarray, max_lag: int) -> tuple[int, float]:
     """Lag (in frames) and peak Pearson correlation that best aligns ``s[t + lag]`` with
     ``a[t]``, averaged over dims with enough variance in both signals. ``a`` and ``s`` are
     per-dim velocity series of equal length; a positive lag means ``s`` trails ``a``.
+
+    Returns ``nan`` for the correlation when no lag in ``[-max_lag, max_lag]`` had enough
+    overlapping samples to measure one at all (a very short episode, close to this
+    function's own ``len(at) < 10`` floor, can fail that floor at *every* lag). Found on a
+    real Hub dataset (``IPEC-COMMUNITY/kuka_lerobot``, 10 fps, many ~1s episodes): episodes
+    right at `check_sync`'s own ``ep.length < 10`` minimum have a velocity series of only 9
+    frames, shorter than 10 at every lag, so the loop below never updated the initial
+    ``best_corr`` sentinel and it leaked out as the "measured" correlation -- an impossible
+    value outside [-1, 1] (confirmed directly: `demoqc score` printed `r=-2.00` in a `sync`
+    flag message). The same sentinel also polluted `_sync_corr_baseline`'s per-episode
+    correlation list, dragging a dataset's median baseline down to near 0 and silently
+    making the "weak correlation" check far too lenient dataset-wide once several episodes
+    this short exist.
     """
     n = len(a)
     valid_a = a.std(axis=0) > 1e-9
     if not valid_a.any():
         return 0, 0.0
-    best_lag, best_corr = 0, -2.0
+    best_lag, best_corr = 0, float("-inf")
     for lag in range(-max_lag, max_lag + 1):
         at, st = (a[: n - lag], s[lag:]) if lag >= 0 else (a[-lag:], s[: n + lag])
         if len(at) < 10:
@@ -991,9 +1004,11 @@ def _best_lag(a: np.ndarray, s: np.ndarray, max_lag: int) -> tuple[int, float]:
         at, st = at[:, ok] - at[:, ok].mean(axis=0), st[:, ok] - st[:, ok].mean(axis=0)
         num = (at * st).sum(axis=0)
         den = np.sqrt((at**2).sum(axis=0) * (st**2).sum(axis=0))
-        avg_corr = float(np.mean(np.where(den > 1e-9, num / den, 0.0)))
+        avg_corr = float(np.mean(np.divide(num, den, out=np.zeros_like(num), where=den > 1e-9)))
         if avg_corr > best_corr:
             best_lag, best_corr = lag, avg_corr
+    if best_corr == float("-inf"):
+        return 0, float("nan")
     return best_lag, best_corr
 
 
@@ -1030,7 +1045,8 @@ def _sync_corr_baseline(
         _, corr = _best_lag(
             np.diff(ep.action[:, a_idx], axis=0), np.diff(ep.state[:, s_idx], axis=0), max_lag
         )
-        corrs.append(corr)
+        if not np.isnan(corr):
+            corrs.append(corr)
     return float(np.median(corrs)) if len(corrs) >= 5 else None
 
 
@@ -1055,6 +1071,8 @@ def check_sync(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
     action, state = ep.action[:, a_idx], ep.state[:, s_idx]
     max_lag = max(1, int(round(cfg.sync_max_lag_s * ctx.fps)))
     lag, corr = _best_lag(np.diff(action, axis=0), np.diff(state, axis=0), max_lag)
+    if np.isnan(corr):
+        return  # too short, at every lag, to measure a correlation at all
     out.metrics.update(sync_lag_frames=float(lag), sync_lag_s=lag / ctx.fps, sync_peak_corr=corr)
     baseline = ctx.sync_corr_baseline
     if corr < cfg.sync_min_peak_corr and (
