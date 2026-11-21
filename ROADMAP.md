@@ -1055,6 +1055,55 @@ Work top-down through **Next up**. Each item should ship in one focused session
       `jccj/so100_block_in_cup` at `--max-episodes 20` (none of which has ever carried a
       `sync` flag), confirming this only removes flags whose dataset-wide baseline was too
       low to make them material, not real localized desyncs.
+- [x] **Fix `check_sync` printing an impossible correlation (`r=-2.00`) and a
+      `RuntimeWarning` on a very short episode, and polluting the dataset's own sync
+      baseline with that value.** Found by running `demoqc score` against a real Hub
+      dataset beyond the existing validation set (`IPEC-COMMUNITY/kuka_lerobot`, a 10 fps
+      arm dataset with many ~1s episodes, found via `list_datasets(filter="LeRobot",
+      sort="downloads")`): `demoqc score IPEC-COMMUNITY/kuka_lerobot --max-episodes 20`
+      printed a `RuntimeWarning: invalid value encountered in divide` from `checks.py`, and
+      one episode's `sync` flag read "correlation is weak (r=-2.00)" -- a Pearson
+      correlation outside the mathematically possible [-1, 1] range. Root cause:
+      `check_sync`'s own guard only requires `ep.length >= 10`, but `_best_lag`'s
+      velocity series (`np.diff`, one frame shorter) is then only 9 frames for an episode
+      right at that floor -- too short for `_best_lag`'s own inner `len(at) < 10` floor at
+      *every* lag in its ±0.5s search window, so its loop never updated the function's
+      initial `best_corr = -2.0` sentinel, which leaked out unmodified as the "measured"
+      peak correlation (confirmed directly: an episode with exactly 10 frames reproduces
+      this with a minimal `_best_lag` call). The same sentinel was also collected by
+      `_sync_corr_baseline` from every episode this short, dragging a dataset's median
+      baseline toward that impossible value and risking silently suppressing the "weak
+      correlation" flag on a genuinely desynced episode elsewhere in the same dataset (the
+      exact mechanism the new test demonstrates). The `RuntimeWarning` was a separate,
+      smaller issue in the same function: `np.where(den > 1e-9, num / den, 0.0)` still
+      evaluates `num / den` (incl. `0/0`) for every element before picking a branch; fixed
+      alongside this by switching to `np.divide(..., out=..., where=...)`, which never
+      evaluates the division where `where` is false. Fixed by having `_best_lag` return
+      `nan` for the correlation when no lag ever had enough samples, instead of leaking its
+      sentinel; `check_sync` now skips the episode entirely (no metric, no flag) in that
+      case, and `_sync_corr_baseline` excludes such episodes from its median instead of
+      folding the sentinel in. New
+      `tests/test_checks.py::test_sync_short_episode_does_not_produce_an_impossible_correlation`
+      builds a 15-episode synthetic dataset by hand (8 long clean episodes establishing a
+      high real baseline, 6 episodes exactly 10 frames long -- the real dataset's failure
+      mode -- and one long, genuinely desynced episode) under
+      `warnings.simplefilter("error", RuntimeWarning)`, and asserts every 10-frame episode
+      gets no `sync_peak_corr` metric and no flag, the baseline stays high (not dragged
+      toward -2.0), and the genuinely desynced episode is still caught; fails without this
+      change (confirmed via `git stash` on just `src/demoqc/checks.py` -- the 10-frame
+      episodes assert `'sync_peak_corr' not in metrics` and get one anyway, reproducing the
+      real dataset's `r=-2.00` exactly). Validated on the real dataset: `demoqc score
+      IPEC-COMMUNITY/kuka_lerobot --max-episodes 20` went from mean 95.4 (`sync` x3,
+      including the impossible-value flag, plus the stray `RuntimeWarning`) to mean 95.9
+      (`sync` x2, no warning) -- the one removed flag is exactly the 10-frame episode that
+      previously printed `r=-2.00`; the two remaining `sync` flags (r=-0.46/-0.43 against a
+      real dataset-wide baseline of 0.05) are on ordinary, longer episodes and unaffected by
+      this fix. Re-ran the full existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) at `--max-episodes 20` and got the same
+      scores and flag counts as every prior Log entry at that subset size, plus `pytest -m
+      network`, all passing -- confirming this is a no-op whenever a dataset has no episode
+      this short.
 
 ## Needs the owner
 
@@ -1916,3 +1965,8 @@ Work top-down through **Next up**. Each item should ship in one focused session
   all 12 `sync` flags, keeping only an unrelated `length` one. The full existing
   validation set reproduced byte-identical scores. See the "Next up" entry for the full
   root cause.
+- 2026-11-21: Fixed `check_sync`/`_sync_corr_baseline` leaking `_best_lag`'s internal
+  sentinel as an impossible `r=-2.00` correlation (plus a stray `RuntimeWarning`) on an
+  episode too short, at every search lag, to measure one at all -- found on
+  `IPEC-COMMUNITY/kuka_lerobot` (`sync` x3 including the bogus flag -> x2, no warning).
+  See the "Next up" entry for the full root cause.
