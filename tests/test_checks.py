@@ -1027,6 +1027,85 @@ def test_sync_weak_correlation_needs_a_material_drop_from_baseline():
     assert "sync" in _checks(scrambled)
 
 
+def test_sync_short_episode_does_not_produce_an_impossible_correlation():
+    # Found by running `demoqc score` against a real Hub dataset beyond the existing
+    # validation set (`IPEC-COMMUNITY/kuka_lerobot`, 10 fps, many ~1s episodes): several
+    # short episodes' `sync` flag printed "r=-2.00" -- a Pearson correlation outside the
+    # mathematically possible [-1, 1] range -- alongside a `RuntimeWarning: invalid value
+    # encountered in divide`. Root cause: `check_sync`'s own `ep.length < 10` floor admits
+    # an episode whose velocity series (one frame shorter, from `np.diff`) has only 9
+    # frames -- too short for `_best_lag`'s inner `len(at) < 10` floor at *every* lag in
+    # its search window, so the loop never updated `best_corr`'s initial sentinel and it
+    # leaked out unmodified as the "measured" correlation. The same sentinel, pulled in by
+    # `_sync_corr_baseline` from every episode this short, drags a dataset's median
+    # baseline down toward that impossible value -- demonstrated below by a baseline that
+    # would otherwise suppress the flag on a genuinely desynced episode.
+    n_long, length_long = 8, 8 * FPS
+    t = np.arange(length_long) / FPS
+
+    def clean_long(idx: int) -> Episode:
+        action = 50.0 * np.sin(2 * np.pi * 0.6 * t + 0.1 * idx)
+        state = np.concatenate([action[:1], action[:-1]])  # tracks action with a 1-frame lag
+        frame_index = np.arange(length_long)
+        return Episode(
+            index=idx,
+            timestamps=frame_index / FPS,
+            frame_index=frame_index,
+            action=action[:, None],
+            state=state[:, None],
+        )
+
+    def short(idx: int) -> Episode:
+        length = 10  # right at check_sync's own `ep.length < 10` floor
+        action = 50.0 * np.sin(2 * np.pi * 0.6 * np.arange(length) / FPS + 0.2 * idx)
+        state = np.concatenate([action[:1], action[:-1]])  # same clean 1-frame lag, just short
+        frame_index = np.arange(length)
+        return Episode(
+            index=idx,
+            timestamps=frame_index / FPS,
+            frame_index=frame_index,
+            action=action[:, None],
+            state=state[:, None],
+        )
+
+    def scrambled(idx: int) -> Episode:
+        action = 50.0 * np.sin(2 * np.pi * 0.6 * t + 0.3)
+        state = np.random.default_rng(0).permutation(action)  # a real recorder defect
+        frame_index = np.arange(length_long)
+        return Episode(
+            index=idx,
+            timestamps=frame_index / FPS,
+            frame_index=frame_index,
+            action=action[:, None],
+            state=state[:, None],
+        )
+
+    episodes = [clean_long(i) for i in range(n_long)]
+    episodes += [short(n_long + i) for i in range(6)]
+    episodes.append(scrambled(n_long + 6))
+    ds = Dataset(
+        root=Path("."), fps=FPS, codebase_version="v3.0", robot_type=None, episodes=episodes
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        results = {r.episode_index: r for r in evaluate(ds)}
+
+    # too short to measure a correlation at all -- no bogus metric, no flag off a sentinel
+    for i in range(n_long, n_long + 6):
+        assert "sync_peak_corr" not in results[i].metrics
+        assert "sync" not in _checks(results[i])
+
+    # the sentinel must not have dragged the dataset's own baseline toward -2.0
+    for i in range(n_long):
+        assert results[i].metrics["sync_peak_corr"] > 0.8
+
+    # with a sane baseline, the genuinely desynced episode is still caught
+    scrambled_result = results[n_long + 6]
+    assert scrambled_result.metrics["sync_peak_corr"] < 0.3
+    assert "sync" in _checks(scrambled_result)
+
+
 @pytest.mark.parametrize("version", ["v3.0", "v2.1"])
 def test_camera_dead(make_dataset, version):
     # one episode's camera stats are near-black for the whole episode: a disconnected
