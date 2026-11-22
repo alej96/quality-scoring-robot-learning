@@ -85,6 +85,9 @@ class Config:
     smoothness_ramp_gap_frames: int = 10  # bridge a same-direction gap of up to this many
     # frames between two big-step frames on the same dim before counting runs -- frame-to-
     # frame noise mid-ramp shouldn't split one continuous motion into many "jumps"
+    quaternion_norm_tol: float = 0.05  # a candidate group of 4 action dims (by feature name)
+    # is only trusted as a real unit quaternion if its dataset-wide sum-of-squares stays
+    # within this of 1.0 -- rejects a false grouping from naming coincidence alone
 
     def with_overrides(self, values: dict[str, object], source: str = "--config") -> Config:
         """Return a copy with ``values`` applied, validating keys and types.
@@ -173,6 +176,9 @@ class DatasetContext:
     angular_dims: np.ndarray | None = None  # action dims that wrap as a radian angle in [-pi, pi]
     angular_pairs: list[tuple[int, int]] = field(default_factory=list)  # x/z axis dim pairs of
     # the same Euler-angle rotation triple, which can trade off at a gimbal-lock singularity
+    quaternion_groups: list[tuple[int, int, int, int]] = field(default_factory=list)  # groups of
+    # 4 action dims (w, x, y, z) that together form a unit quaternion -- see
+    # _quaternion_action_groups
     stale_state_baseline: float = 0.0  # dataset's own median per-episode stale-state fraction;
     # some robots (e.g. a humanoid whose chassis/arm state publishes slower than the logging
     # fps) hold observation.state for a frame or two on every episode as a hardware artifact,
@@ -233,7 +239,11 @@ class DatasetContext:
         scale = np.where(scale > 1e-9, scale, np.nan)  # constant dims are ignored
         angular_dims = _angular_action_dims(allA, cfg)
         angular_pairs = _angular_pair_axes(ds.action_names, angular_dims)
-        steps = np.concatenate([np.abs(_angular_diff(a, angular_dims)) / scale for a in actions])
+        quaternion_groups = _quaternion_action_groups(ds.action_names, allA, cfg)
+        corrected_actions = [_correct_quaternion_signs(a, quaternion_groups) for a in actions]
+        steps = np.concatenate(
+            [np.abs(_angular_diff(a, angular_dims)) / scale for a in corrected_actions]
+        )
         speeds = np.concatenate([_speed(a, scale, ds.fps) for a in actions])
         p75 = float(np.nanpercentile(speeds, 75)) if np.isfinite(speeds).any() else 0.0
         # a dim with scale already NaN'd out above (constant dataset-wide) makes its whole
@@ -266,6 +276,7 @@ class DatasetContext:
             sync_dims=sync_dims,
             angular_dims=angular_dims,
             angular_pairs=angular_pairs,
+            quaternion_groups=quaternion_groups,
             stale_state_baseline=stale_state_baseline,
             sync_corr_baseline=sync_corr_baseline,
             **video_ctx,
@@ -503,6 +514,76 @@ def _suppress_gimbal_lock_pairs(
         cancels = flagged & (best_combo < cancel_frac * dominant)
         big[cancels, a] = False
         big[cancels, b] = False
+
+
+_QUATERNION_SUFFIX = re.compile(r"^(.+?)[._-]?q([wxyz])$", re.IGNORECASE)
+
+
+def _quaternion_action_groups(
+    action_names: list[str] | None, allA: np.ndarray, cfg: Config
+) -> list[tuple[int, int, int, int]]:
+    """Groups of 4 action dims that together form a unit quaternion (e.g. an end-effector
+    orientation stored as ``left_ee.qw``/``left_ee.qx``/``left_ee.qy``/``left_ee.qz``).
+
+    Candidate groups are found by feature name (four dims sharing a prefix, each ending in
+    a ``q``+w/x/y/z suffix), then confirmed from the data itself: a real quaternion's
+    components always sum-of-squares to 1 for every frame, so a false grouping from naming
+    coincidence alone is rejected rather than trusted -- the same "data decides, name only
+    narrows the search" approach as ``_angular_action_dims``.
+    """
+    if action_names is None:
+        return []
+    groups: dict[str, dict[str, int]] = {}
+    for i, name in enumerate(action_names):
+        m = _QUATERNION_SUFFIX.match(name) if name else None
+        if m:
+            groups.setdefault(m.group(1), {})[m.group(2).lower()] = i
+    out = []
+    for g in groups.values():
+        if not all(c in g for c in "wxyz") or len(g) != 4:
+            continue
+        cols = (g["w"], g["x"], g["y"], g["z"])
+        norm_sq = np.nansum(allA[:, cols] ** 2, axis=1)
+        finite = np.isfinite(norm_sq)
+        if finite.sum() < 10:
+            continue
+        if np.median(np.abs(norm_sq[finite] - 1.0)) > cfg.quaternion_norm_tol:
+            continue
+        out.append(cols)
+    return out
+
+
+def _correct_quaternion_signs(
+    action: np.ndarray, groups: list[tuple[int, int, int, int]]
+) -> np.ndarray:
+    """Return a copy of ``action`` with each quaternion group's sign made continuous
+    frame-to-frame.
+
+    Found on a real Hub dataset beyond the existing validation set
+    (``adityx23/icl-dataset``, a bimanual arm teleoperated via end-effector pose): its
+    ``left/right_ee.qw/qx/qy/qz`` action dims flip sign outright between two consecutive
+    frames (confirmed directly: the dot product of the two frames' quaternions is exactly
+    -1.0), which plain per-dim diffing reads as all four dims jumping by up to their full
+    range in a single frame -- but a unit quaternion ``q`` and its negation ``-q`` represent
+    the *exact same* orientation (the standard double-cover property of the representation),
+    so nothing about the robot's pose actually changed. For each group, the sign of every
+    frame after the first is flipped (cumulatively) whenever its raw dot product with the
+    previous frame is negative, which removes exactly this artifact and nothing else: two
+    genuinely close orientations already have a positive dot product and are untouched.
+    """
+    if not groups:
+        return action
+    out = action.copy()
+    for cols in groups:
+        q = out[:, cols]
+        if len(q) < 2:
+            continue
+        raw_dot = np.sum(q[:-1] * q[1:], axis=1)
+        sign = np.where(raw_dot >= 0, 1.0, -1.0)
+        sign = np.where(np.isfinite(raw_dot), sign, 1.0)  # a non-finite frame: don't flip
+        s = np.concatenate([[1.0], np.cumprod(sign)])
+        out[:, cols] = q * s[:, None]
+    return out
 
 
 def _bridge_sustained_motion_gaps(big: np.ndarray, step: np.ndarray, max_gap: int) -> np.ndarray:
@@ -852,7 +933,8 @@ def check_idle(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult
 def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: EpisodeResult) -> None:
     if ep.action is None or ctx.action_scale is None or ep.length < 3:
         return
-    step = _angular_diff(ep.action, ctx.angular_dims) / ctx.action_scale
+    corrected_action = _correct_quaternion_signs(ep.action, ctx.quaternion_groups)
+    step = _angular_diff(corrected_action, ctx.angular_dims) / ctx.action_scale
     limit = cfg.spike_factor * ctx.step_p99
     big = np.abs(step) > limit
     if ctx.angular_pairs:
@@ -900,7 +982,7 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
         )
 
     start, end = out.trim or (0, ep.length)
-    seg = ep.action[start:end] / ctx.action_scale
+    seg = corrected_action[start:end] / ctx.action_scale
     seg = seg[:, np.isfinite(ctx.action_scale)]
     if len(seg) >= 10:
         out.metrics["ldlj"] = _ldlj(seg, ctx.fps)
