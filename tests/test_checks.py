@@ -4,7 +4,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from demoqc.checks import Config, DatasetContext, _angular_action_dims, evaluate
+from demoqc.checks import (
+    Config,
+    DatasetContext,
+    _angular_action_dims,
+    _quaternion_action_groups,
+    evaluate,
+)
 from demoqc.dataset import Dataset, Episode, load_dataset
 from tests.conftest import FPS, EpisodeSpec, clean_specs
 
@@ -264,6 +270,108 @@ def test_smoothness_ignores_gimbal_lock_pair_cancellation():
     jump_result = results[8]
     assert jump_result.metrics["jumps"] > 0
     assert "smoothness" in _checks(jump_result)
+
+
+def _quaternion_dataset() -> Dataset:
+    """A synthetic dataset with one action dim group that's a unit quaternion
+    (``ee_rot.qw/qx/qy/qz``, a smoothly rotating end-effector orientation) plus a normal,
+    unrelated joint dim.
+
+    Built by hand for the same reason as ``_angular_dataset``: it needs dims that are
+    genuinely a unit quaternion (sum-of-squares exactly 1 every frame), with one episode
+    where the representation's sign flips outright between two frames (dot product -1,
+    the real dataset's failure mode) without the underlying orientation actually changing.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    names = ["ee_rot.qw", "ee_rot.qx", "ee_rot.qy", "ee_rot.qz", "joint"]
+    axis = np.array([0.3, 0.6, 0.7])
+    axis = axis / np.linalg.norm(axis)
+
+    def quat(theta: np.ndarray) -> np.ndarray:
+        half = theta / 2
+        return np.stack(
+            [np.cos(half), *(a * np.sin(half) for a in axis)],
+            axis=1,
+        )
+
+    def episode(idx: int, theta: np.ndarray, jump_at: int | None = None) -> Episode:
+        q = quat(theta)
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * idx
+        if jump_at is not None:
+            joint = joint.copy()
+            joint[jump_at:] += 40.0  # a real, unrelated abrupt jump, not a sign flip
+        action = np.concatenate([q, joint[:, None]], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    # small, continuous rotation step every frame: a normal dataset-wide step_p99 baseline
+    clean = [episode(i, 0.01 * (t + i)) for i in range(6)]
+
+    # the same smooth rotation as a clean episode, but the sign is flipped outright
+    # starting mid-episode -- the exact same orientation, represented differently
+    flip_theta = 0.01 * t
+    flip_q = quat(flip_theta)
+    flip_q[45:] *= -1.0
+    flip_joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * 6
+    flip_action = np.concatenate([flip_q, flip_joint[:, None]], axis=1)
+    flip_ep = Episode(
+        index=6, timestamps=t / FPS, frame_index=t, action=flip_action, state=flip_action.copy()
+    )
+
+    jump_ep = episode(7, 0.01 * t, jump_at=45)  # a real defect, unrelated to the quaternion
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, flip_ep, jump_ep],
+        action_names=names,
+    )
+
+
+def test_smoothness_ignores_quaternion_sign_flip():
+    # Found on a real Hub dataset (adityx23/icl-dataset, a bimanual arm teleoperated via
+    # end-effector pose): two episodes had a frame where the right_ee.qw/qx/qy/qz action
+    # dims all flipped sign at once (confirmed directly: the dot product of the two
+    # frames' quaternions is exactly -1.0), which check_smoothness's plain per-dim diff
+    # read as 4 dims all jumping by up to their full range in one frame -- a "smoothness"
+    # flag with no real defect, since a unit quaternion and its negation represent the
+    # exact same orientation.
+    results = {r.episode_index: r for r in evaluate(_quaternion_dataset())}
+
+    flip_result = results[6]
+    assert flip_result.metrics["spikes"] == 0
+    assert flip_result.metrics["jumps"] == 0
+    assert not [f for f in flip_result.flags if f.check == "smoothness"], flip_result.flags
+
+    # the fix must not blind the check to a real, unrelated jump on a non-quaternion dim
+    jump_result = results[7]
+    assert jump_result.metrics["jumps"] > 0
+    assert "smoothness" in _checks(jump_result)
+
+
+def test_quaternion_action_groups_requires_unit_norm():
+    # 4 dims whose sum-of-squares is always 1 (a real quaternion) are detected; 4 more
+    # dims that happen to be named the same way but whose sum-of-squares is nowhere near 1
+    # are a naming coincidence, not a real quaternion, and must be rejected.
+    theta = np.linspace(0, 2 * np.pi, 12)
+    real = np.stack([np.cos(theta / 2), np.sin(theta / 2), np.zeros(12), np.zeros(12)], axis=1)
+    fake = 2.0 * real  # sum-of-squares is always 4, not 1
+    allA = np.concatenate([real, fake], axis=1)
+    names = [
+        "real.qw",
+        "real.qx",
+        "real.qy",
+        "real.qz",
+        "fake.qw",
+        "fake.qx",
+        "fake.qy",
+        "fake.qz",
+    ]
+    groups = _quaternion_action_groups(names, allA, Config())
+    assert groups == [(0, 1, 2, 3)]
 
 
 def _sustained_ramp_dataset() -> Dataset:
