@@ -1105,6 +1105,63 @@ Work top-down through **Next up**. Each item should ship in one focused session
       network`, all passing -- confirming this is a no-op whenever a dataset has no episode
       this short.
 
+- [x] **Fix `check_smoothness` flagging a quaternion sign flip as every orientation dim
+      jumping by its full range at once.** Found by running `demoqc score` against a real
+      Hub dataset beyond the existing validation set (`adityx23/icl-dataset`, a bimanual
+      arm teleoperated via end-effector pose, found via `list_datasets(filter="LeRobot",
+      sort="downloads")`): episode 12 of 20 carried an 11-spike/9-jump `smoothness` flag
+      (score 55.0), and two other episodes (17, 18) each carried a single "abrupt action
+      jump(s)" flag. Per-dim inspection of every flagged frame on `right_ee.qw/qx/qy/qz`
+      (the dataset's `action` stores end-effector orientation as a quaternion, not Euler
+      angles) found two distinct causes mixed into the same flag: episode 12's flagged
+      frames are genuinely erratic jumps (confirmed directly -- the dot product between
+      consecutive quaternions is near 0, meaning a real, large, unexplained orientation
+      change, not a representation artifact), a true positive; episodes 17 and 18's single
+      flagged frame each have a dot product of exactly -1.0 between consecutive frames --
+      the textbook signature of a quaternion's double-cover property, where `q` and `-q`
+      represent the *exact same* orientation, so nothing about the robot's pose actually
+      changed even though all 4 raw component values flipped sign in one frame.
+      `check_smoothness`'s plain per-dim diff has no notion of this representation
+      ambiguity, so it read each of the 4 dims' sign flip as an independent abrupt jump
+      (and the same artifact separately corrupted the episode's LDLJ jerk metric, since
+      that also diffed the raw, sign-discontinuous quaternion). Fixed by adding
+      `checks._quaternion_action_groups` (`DatasetContext.build`): groups of 4 action dims
+      are found by feature name (a shared prefix with `qw`/`qx`/`qy`/`qz` suffixes, e.g.
+      `left_ee.qw`..`left_ee.qz`), then confirmed as a real quaternion only if their
+      sum-of-squares stays at 1 across the whole dataset (`Config.quaternion_norm_tol`) --
+      the same "name narrows the search, data decides" approach `_angular_action_dims`
+      already uses for wrapped Euler angles, so a naming coincidence with no real unit-norm
+      property is rejected rather than trusted. `checks._correct_quaternion_signs`, used
+      both in `DatasetContext.build`'s `step_p99` baseline and in `check_smoothness` (and
+      its LDLJ segment) itself, then makes each group's sign continuous frame-to-frame:
+      whenever two consecutive frames' raw dot product is negative, every frame from there
+      on is flipped (cumulatively, fully vectorised via `np.cumprod` of the per-transition
+      sign), which removes exactly the double-cover artifact and leaves two genuinely close
+      orientations (already positive dot product) untouched. New
+      `tests/test_checks.py::test_smoothness_ignores_quaternion_sign_flip` builds a small
+      synthetic dataset by hand (a smoothly, continuously rotating quaternion dim group
+      across several clean episodes, one episode where the sign flips outright mid-episode
+      with no change in the underlying rotation, one episode with a real, unrelated jump on
+      a non-quaternion joint dim) and asserts the flip episode gets zero smoothness flags
+      while the real-jump episode still gets one; fails without this change (confirmed by
+      temporarily forcing an empty quaternion-group list at both call sites -- the flip
+      episode asserts `1 == 0` on `jumps`, reproducing the real dataset's false positive
+      exactly). A second new test, `test_quaternion_action_groups_requires_unit_norm`,
+      locks in the name-plus-data-validation detection directly (a second, identically-named
+      group whose sum-of-squares is always 4, not 1, is rejected). Validated on the real
+      dataset: `demoqc score adityx23/icl-dataset --max-episodes 20` went from mean 97.2
+      (`smoothness` x4 across episodes 12/17/18) to mean 97.8 (`smoothness` x2, only
+      episode 12's genuine erratic-rotation flags remain) -- the two sign-flip false
+      positives are gone, the one real defect is untouched. Re-ran the full existing
+      validation set (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got
+      byte-identical mean scores and flag counts to every prior Log entry (97.1 / 92.9 /
+      92.2 / 99.2 / 95.2), plus `RoboCOIN/Galbot_G1_load_floor_trash_3` (whose base
+      orientation is a quaternion *pair*, not a full 4-dim group, so it never qualifies)
+      and `zekaiwang/trex_dataset` (no quaternion-named dims at all) -- confirming this is
+      a no-op whenever a dataset has no real unit-quaternion action group. Also ran
+      `pytest -m network`: all network tests pass.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -1970,3 +2027,7 @@ Work top-down through **Next up**. Each item should ship in one focused session
   episode too short, at every search lag, to measure one at all -- found on
   `IPEC-COMMUNITY/kuka_lerobot` (`sync` x3 including the bogus flag -> x2, no warning).
   See the "Next up" entry for the full root cause.
+- 2026-11-22: Fixed `check_smoothness` reading a quaternion sign flip (`q`/`-q`, the same
+  orientation) as every component dim jumping by its full range at once -- found on
+  `adityx23/icl-dataset` (`smoothness` x4 -> x2, keeping only its one genuine
+  erratic-rotation episode). See the "Next up" entry for the full root cause.
