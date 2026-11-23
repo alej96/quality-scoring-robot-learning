@@ -925,6 +925,54 @@ def test_smoothness_ignores_dexterous_hand_joint_snap():
     assert "smoothness" in _checks(jump_result)
 
 
+def test_gripper_dims_excludes_ee_pose_group_named_with_a_gripper_frame_qualifier():
+    # Found on unitreerobotics/G1_Dex1_Hang_Pants: its structured
+    # action.left_ee_pose_gripper_base/action.right_ee_pose_gripper_torso sub-features (a
+    # continuous end-effector pose *expressed in the gripper's own base/torso frame*, not a
+    # gripper actuator) flatten into per-dim names like "left_ee_pose_gripper_base.x"/".roll"
+    # -- gripper_dims' bare "gripper" substring search matched all six of these pose-axis
+    # dims purely because "gripper" happens to appear in their shared frame-qualifier
+    # prefix, not because any of them is a gripper.
+    ds = _gripper_snap_dataset()
+    ds.action_names = [
+        "left_ee_pose_gripper_base.x",
+        "left_ee_pose_gripper_base.y",
+        "left_ee_pose_gripper_base.z",
+        "left_ee_pose_gripper_base.roll",
+        "left_ee_pose_gripper_base.pitch",
+        "gripper",
+    ]
+    ctx = DatasetContext.build(ds, Config())
+    assert ctx.gripper_dims == [5]
+
+
+def test_smoothness_detects_a_jump_on_an_ee_pose_dim_named_with_a_gripper_frame_qualifier():
+    # Same real dataset as above: before this fix, every one of these pose-axis dims was
+    # wrongly treated as a gripper dim and excluded from spike/jump detection entirely (its
+    # step_p99 set to NaN) -- so a genuine jump on any of them would go completely
+    # undetected, not merely miscounted.
+    ds = _gripper_snap_dataset()
+    ds.action_names = [
+        "ee_pose_gripper_base.x",
+        "ee_pose_gripper_base.y",
+        "ee_pose_gripper_base.z",
+        "ee_pose_gripper_base.roll",
+        "ee_pose_gripper_base.pitch",
+        "gripper",
+    ]
+    results = {r.episode_index: r for r in evaluate(ds)}
+
+    # the genuine, unrelated jump injected on dim 1 ("ee_pose_gripper_base.y") must be caught
+    jump_result = results[37]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+    # every ordinary episode (including the gripper's own real snap) stays silent
+    for i in range(36):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert "smoothness" not in _checks(results[i]), (i, results[i].flags)
+
+
 def test_stale_state(make_dataset):
     specs = clean_specs()
     specs[7] = EpisodeSpec(stale_state_from=(60, 150), seed=7)

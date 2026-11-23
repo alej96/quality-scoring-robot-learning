@@ -198,10 +198,13 @@ class DatasetContext:
 
     @classmethod
     def build(cls, ds: Dataset, cfg: Config, decode_video: bool = False) -> DatasetContext:
+        action_names = ds.action_names or []
         gripper_dims = [
             i
-            for i, name in enumerate(ds.action_names or [])
-            if name and any(kw in name.lower() for kw in _GRIPPER_NAME_KEYWORDS)
+            for i, name in enumerate(action_names)
+            if name
+            and any(kw in name.lower() for kw in _GRIPPER_NAME_KEYWORDS)
+            and not _is_pose_axis_group_member(name, action_names)
         ]
         a_width = next((e.action.shape[1] for e in ds.episodes if e.action is not None), None)
         s_width = next((e.state.shape[1] for e in ds.episodes if e.state is not None), None)
@@ -379,6 +382,47 @@ _GRIPPER_NAME_KEYWORDS = ("gripper", "trigger", "squeeze", "hand_joint")
 # through its range in 1-2 frames during a deliberate grasp/release, exactly the gripper
 # pattern -- "hand_joint" rather than bare "hand" so an eef/wrist pose dim incidentally
 # named "*_hand_pos_*"/"*_hand_rot_*" (continuous, not near-binary) isn't swept in too.
+
+_POSE_AXIS_SUFFIXES = frozenset({"x", "y", "z", "roll", "pitch", "yaw"})
+
+
+def _is_pose_axis_group_member(name: str, all_names: list[str]) -> bool:
+    """True if ``name`` is one axis of a >=3-dim position/orientation group sharing a
+    dotted prefix (e.g. ``"left_ee_pose_gripper_base.x"``, one of that group's
+    ``.x``/``.y``/``.z``/``.roll``/``.pitch``/``.yaw`` siblings).
+
+    Found on a real Hub dataset beyond the existing validation set
+    (``unitreerobotics/G1_Dex1_Hang_Pants``, found via ``list_datasets(filter="LeRobot",
+    sort="downloads")``): its structured ``action.left_ee_pose_gripper_base``/
+    ``action.right_ee_pose_gripper_torso`` sub-features (a continuous end-effector pose
+    *expressed in the gripper's own base/torso frame*, not a gripper actuator) get flattened
+    into per-dim names like ``"left_ee_pose_gripper_base.x"``/``".roll"`` by
+    ``dataset._structured_subfeature_names``, which prefixes each axis with the
+    sub-feature's own dotted key. ``gripper_dims``' bare ``"gripper" in name.lower()``
+    search matches every one of these 24 dims purely because "gripper" happens to appear in
+    that shared *reference-frame* qualifier, not because any of them is a gripper -- unlike
+    a real gripper/trigger/squeeze/hand_joint actuator, whose own per-dim name (not just a
+    shared group prefix) encodes the keyword (``"gripper_pos"``, ``"left_trigger"``,
+    ``"left_hand_joint_1_rad"``). Confirmed on the real dataset: these dims are continuous,
+    high-cardinality position/orientation signals (1100+ distinct values across ~1700
+    frames of one episode, smoothly varying throughout), not a near-binary actuator -- and
+    excluding them from spike/jump detection (as every other ``gripper_dims`` member is)
+    silently disabled smoothness checking on all 24 of them with no visible symptom, exactly
+    the "silently disabled, no error" failure mode this tool already treats as seriously as
+    a false positive. A group is only recognised this way with 3+ of its dims actually
+    sharing one of the six canonical pose-axis suffixes, so a coincidental single dim
+    literally named e.g. ``"some_gripper.roll"`` (no x/y/z/pitch/yaw siblings) is left alone.
+    """
+    if "." not in name:
+        return False
+    prefix, suffix = name.rsplit(".", 1)
+    if suffix.lower() not in _POSE_AXIS_SUFFIXES:
+        return False
+    sibling_prefix = prefix + "."
+    siblings = {
+        n.rsplit(".", 1)[1].lower() for n in all_names if n.startswith(sibling_prefix) and "." in n
+    }
+    return len(siblings & _POSE_AXIS_SUFFIXES) >= 3
 
 
 def _exclude_gripper_dims(step_p99: np.ndarray, gripper_dims: list[int]) -> np.ndarray:
