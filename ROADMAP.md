@@ -1162,6 +1162,64 @@ Work top-down through **Next up**. Each item should ship in one focused session
       a no-op whenever a dataset has no real unit-quaternion action group. Also ran
       `pytest -m network`: all network tests pass.
 
+- [x] **Fix `gripper_dims` matching a continuous end-effector pose dim because "gripper"
+      appears in a reference-frame qualifier, not an actuator name.** Found by running
+      `demoqc score` against a real Hub dataset beyond the existing validation set
+      (`unitreerobotics/G1_Dex1_Hang_Pants`, a Unitree G1 humanoid with a dexterous hand,
+      found via `list_datasets(filter="LeRobot", sort="downloads")`): 9/20 episodes carried
+      a `smoothness` flag (mean score 93.2), which on inspection were real, unrelated
+      jumps -- but a closer look at `DatasetContext.build`'s own `gripper_dims` turned up a
+      separate, silent bug: this dataset stores its end-effector pose under structured
+      dotted sub-features named `action.left_ee_pose_gripper_base`/
+      `action.right_ee_pose_gripper_torso` (6 dims each: `x`/`y`/`z`/`roll`/`pitch`/`yaw`,
+      the pose expressed *in the gripper's own base/torso frame*, not a gripper actuator at
+      all). `dataset._structured_subfeature_names` flattens these into per-dim names like
+      `"left_ee_pose_gripper_base.x"`, and `gripper_dims`' bare `"gripper" in
+      name.lower()` substring search matched all 24 of them purely because "gripper"
+      happens to appear in the shared frame-qualifier prefix -- confirmed directly
+      (`DatasetContext.build(...).gripper_dims` included dims 58-69/82-93, all 24 of them)
+      that these are continuous, high-cardinality position/orientation signals (1100+
+      distinct values across ~1700 frames of one episode, smoothly varying throughout, 0.1-3%
+      of frames near either extreme), the opposite of every genuine gripper/trigger/squeeze
+      dim in this same dataset (82-99% of frames near an extreme) or in any prior validation
+      dataset. Every `gripper_dims` member has its `step_p99` set to NaN
+      (`_exclude_gripper_dims`), which silently disabled spike/jump detection on all 24 of
+      these dims with no visible symptom -- exactly the "silently disabled, no error"
+      failure mode this tool already treats as seriously as a false positive (see the
+      NaN-propagation `integrity` fix). Fixed by adding `checks._is_pose_axis_group_member`:
+      a dim is excluded from the gripper-keyword match if it's one of 3+ sibling dims
+      sharing a dotted prefix whose own per-axis suffixes are canonical pose axes
+      (`x`/`y`/`z`/`roll`/`pitch`/`yaw`) -- the "name narrows the search, data/structure
+      decides" pattern already used for angular/quaternion detection, just applied to
+      `gripper_dims` for the first time. This only ever fires on a *shared*-prefix pose
+      group, so a literal flat `"gripper.pos"` (SO-100/101, a single dim with no pose-axis
+      siblings) and every other already-matched gripper/trigger/squeeze/hand_joint name
+      (none of which happens to be one axis of a 3+ dim x/y/z/roll/pitch/yaw group) are
+      unaffected. New
+      `tests/test_checks.py::test_gripper_dims_excludes_ee_pose_group_named_with_a_gripper_frame_qualifier`
+      (asserts `DatasetContext.build(...).gripper_dims` directly) and
+      `test_smoothness_detects_a_jump_on_an_ee_pose_dim_named_with_a_gripper_frame_qualifier`
+      (reusing the existing `_gripper_snap_dataset` fixture, renaming its 5 continuously-moving
+      joint dims to a `x`/`y`/`z`/`roll`/`pitch` pose group sharing an
+      `"ee_pose_gripper_base"` prefix, keeping its already-injected jump on dim 1) both fail
+      without this change (confirmed via `git stash` on just `src/demoqc/checks.py` -- the
+      first asserts `gripper_dims == [5]` and gets `[0, 1, 2, 3, 4, 5]`, the second asserts
+      `jumps == 1` on the jump episode and gets `0`, reproducing the real dataset's silent
+      detection gap exactly). Validated on the real dataset: `demoqc score
+      unitreerobotics/G1_Dex1_Hang_Pants --max-episodes 20`/`--max-episodes 60` both
+      reproduced byte-identical scores and flag counts before and after this fix (mean 93.2
+      and 94.5 respectively) -- this dataset's actual pose-axis dims happen to stay smooth
+      throughout every sampled episode, so the fix closes a real blind spot without
+      surfacing a new flag here, consistent with the synthetic reproduction proving the gap
+      is real and the fix closes it. Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus every
+      other real dataset with a literal gripper/trigger/squeeze/hand_joint dim from prior
+      Log entries (`BitRobot/HIW-500-LeRobot`, `allenai/MolmoAct2-BimanualYAM-Dataset`,
+      `RoboCOIN/Unitree_G1edu_u3_place_bread_1`) via `git stash` before/after and got
+      byte-identical mean scores and flag counts on all eight, confirming this is a no-op
+      whenever a dataset has no pose-axis group sharing a gripper-keyword prefix.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -2031,3 +2089,13 @@ Work top-down through **Next up**. Each item should ship in one focused session
   orientation) as every component dim jumping by its full range at once -- found on
   `adityx23/icl-dataset` (`smoothness` x4 -> x2, keeping only its one genuine
   erratic-rotation episode). See the "Next up" entry for the full root cause.
+- 2026-11-23: Fixed `gripper_dims` silently disabling smoothness spike/jump detection on 24
+  continuous end-effector pose dims because "gripper" appears in their shared
+  reference-frame qualifier (`"left_ee_pose_gripper_base.x"`, the pose *in the gripper's own
+  frame*), not because any of them is an actuator -- found on
+  `unitreerobotics/G1_Dex1_Hang_Pants`. Added `checks._is_pose_axis_group_member` so a
+  `x`/`y`/`z`/`roll`/`pitch`/`yaw` pose group sharing a dotted prefix is excluded from the
+  gripper-keyword match regardless of what that prefix contains. No real-dataset score
+  changed (every sampled dataset's pose dims happen to stay smooth), but a new synthetic
+  test reproduces the exact silent gap and confirms the fix closes it. See the "Next up"
+  entry for the full root cause.
