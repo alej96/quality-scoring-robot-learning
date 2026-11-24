@@ -164,6 +164,19 @@ value is missing; duplicate detection in particular is excluded from this rather
 comparing nothing to nothing, which previously flagged nearly every episode of such a
 dataset as an "exact duplicate" of the first one.
 
+## A placeholder `action`/`observation.state` feature
+
+Some real datasets (e.g. an egocentric hand-tracking recording) declare a real
+`action`/`observation.state` feature with real per-dim names, and it loads fine -- but every
+value in it, across every episode, is bit-identical (an unpopulated placeholder shipped as
+all zero, say, because the real signal lives in a video or sensor stream `demoqc` doesn't
+read). `idle`'s absolute "no motion detected" fallback correctly flags every single episode
+as a result, since nothing in that data ever moves; without an explanation, that reads as
+every demo independently failing to record, rather than the actual cause. `demoqc score`
+prints a warning naming it (`action and observation.state never vary across any frame in
+this dataset; ...`) so a dataset-wide wall of `idle` flags isn't mistaken for a pile of
+unrelated recording failures.
+
 ## What it checks
 
 | Check | Detects | How |
