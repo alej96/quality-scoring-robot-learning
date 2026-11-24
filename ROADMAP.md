@@ -1219,6 +1219,55 @@ Work top-down through **Next up**. Each item should ship in one focused session
       `RoboCOIN/Unitree_G1edu_u3_place_bread_1`) via `git stash` before/after and got
       byte-identical mean scores and flag counts on all eight, confirming this is a no-op
       whenever a dataset has no pose-axis group sharing a gripper-keyword prefix.
+- [x] **Explain a dataset-wide-constant `action`/`observation.state` feature instead of
+      leaving every episode looking like an unrelated recording failure.** Found by
+      scanning ~300 real Hub datasets beyond the existing validation set
+      (`list_datasets(filter="LeRobot")`, sorted by downloads and by last-modified) for
+      crashes and false positives: `wake-inc/wake-egocentric-10h-sample` (an egocentric
+      hand-tracking dataset) scored mean 33.3 with 15/15 episodes flagged, every one
+      carrying `idle: no motion detected in the whole episode`. `meta/info.json` declares a
+      real `action`/`observation.state` feature with real per-dim names
+      (`u`/`v`/`d`/`qx`/`qy`/`qz`/`qw`/`grip`), and it loads fine (confirmed directly:
+      `ep.action`/`ep.state` are real arrays, not `None`) -- but every single value in both
+      columns, across all 15 sampled episodes, is bit-identical (`0.0`): an unpopulated
+      placeholder, not real motion data (the dataset's real signal presumably lives in its
+      egocentric video, which `demoqc` never reads). `check_idle`'s absolute "no motion
+      detected" fallback is already designed to flag exactly this (see the
+      2026-11-02 `test_frozen_action_whole_dataset_flags_no_motion` fix for
+      `omkarmayekar555/robot-learning-tutorial-data`, found the same way): `_speed` already
+      returns a real zero speed, not an unknown one, when every action dim is constant
+      dataset-wide, so the ERROR correctly fires on every episode -- but nothing anywhere
+      explained *why*, so a wall of 15 identical-looking ERRORs reads as 15 independent
+      recording failures rather than one dataset-wide data-representation problem. Fixed by
+      adding a `Dataset.warnings` entry in `dataset.py` (`load_dataset`), parallel to the
+      existing "no action or observation.state feature" warning for the *missing*-feature
+      case: when a present `action`/`observation.state` column's values are bit-identical
+      across every frame of the whole dataset (not just one episode), a warning names it
+      instead of leaving the cause silent. This needed the guard loosened while writing it:
+      an earlier version required 2+ episodes (to avoid flagging a trivial single-episode
+      test fixture), but `omkarmayekar555/robot-learning-tutorial-data` itself turned out to
+      have exactly one real episode (confirmed via its own `meta/info.json`,
+      `total_episodes: 1`) and genuinely exhibits this defect -- so the guard now only
+      requires 2+ frames (any dataset with real data to be constant over), not 2+ episodes.
+      New `tests/test_dataset.py::test_dataset_wide_constant_action_and_state_gets_a_warning`
+      (3 episodes with `EpisodeSpec(frozen_action=True, seed=0)`, so every episode gets the
+      exact same random draw) fails without this change (confirmed: `ds.warnings == []`
+      instead of the new message). Validated on both real datasets:
+      `wake-inc/wake-egocentric-10h-sample --max-episodes 15` and
+      `omkarmayekar555/robot-learning-tutorial-data` (its one real episode) now both print
+      the new warning with byte-identical scores to before this change (33.3 and 30.0
+      respectively) -- this only explains the existing flags, it never changes them. Re-ran
+      the full existing validation set (`lerobot/svla_so101_pickplace`,
+      `masato-ka/so100_cutlery_handling_simple`, `aaronsu11/so100_lego`,
+      `shylee/so100_cube`, `jccj/so100_block_in_cup`) and got byte-identical mean scores and
+      zero new warnings on all five, confirming this is a no-op whenever a dataset's
+      action/state actually varies anywhere. Also ran `pytest -m network`: passes.
+      Follow-up: the ~300-dataset scan surfaced no crashes and no other false positive in
+      this heavily-fixed codebase; most "low score" datasets it found (e.g. a Isaac Sim
+      rollout dataset with half its episodes aborted and half with a frozen observation
+      stream, a dataset with every episode duplicated as a consecutive pair) look like real
+      defects in those specific datasets, not tool bugs -- tracked here rather than acted on
+      further without more evidence.
 
 ## Needs the owner
 
@@ -2099,3 +2148,9 @@ Work top-down through **Next up**. Each item should ship in one focused session
   changed (every sampled dataset's pose dims happen to stay smooth), but a new synthetic
   test reproduces the exact silent gap and confirms the fix closes it. See the "Next up"
   entry for the full root cause.
+- 2026-11-24: Scanned ~300 real Hub datasets beyond the existing validation set for crashes
+  and false positives; found and fixed `dataset.py` giving no explanation when a dataset's
+  action/observation.state feature is present but bit-identical across every frame of the
+  whole dataset (see the "Next up" entry above for the full root cause, found on
+  `wake-inc/wake-egocentric-10h-sample`). No real-dataset score changed; this only adds a
+  `Dataset.warnings` entry naming the cause.
