@@ -304,6 +304,33 @@ def load_dataset(
             f"duplicate detection need this data and found none for any episode"
         )
 
+    degenerate_cols = []
+    for col in ("action", "observation.state"):
+        if col in missing_cols or col not in frames.columns:
+            continue
+        arr = _stack(frames, col)
+        if (
+            arr is not None
+            and arr.shape[0] > 1
+            and np.isfinite(arr).all()
+            and np.all(arr == arr[0])
+        ):
+            degenerate_cols.append(col)
+    if degenerate_cols:
+        # the feature is declared and present (unlike the missing-feature case above) but
+        # never actually varies anywhere in the dataset -- e.g. an unpopulated placeholder
+        # column shipped as all-zero. DatasetContext.build already reduces such a column's
+        # per-dim scale to NaN and check_idle's "no motion detected" fallback correctly fires
+        # on every episode as a result (a real zero speed, not an unknown one), but without
+        # this warning that reads as every single demo independently failing, rather than the
+        # actual cause: this data never carried any signal to begin with.
+        warnings.append(
+            f"{' and '.join(degenerate_cols)} never vary across any frame in this dataset "
+            f"(every value is identical, e.g. an unpopulated placeholder); checks that read "
+            f"{'it' if len(degenerate_cols) == 1 else 'them'} will flag every episode as "
+            f"having no motion, which reflects the data, not a per-episode defect"
+        )
+
     episodes_out = []
     for ep_idx, group in frames.groupby("episode_index", sort=True):
         group = group.sort_values("frame_index", kind="stable")

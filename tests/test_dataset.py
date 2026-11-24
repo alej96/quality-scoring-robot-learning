@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from demoqc.dataset import load_dataset
-from tests.conftest import FEATURE_NAMES, FPS, clean_specs, make_episode
+from tests.conftest import FEATURE_NAMES, FPS, EpisodeSpec, clean_specs, make_episode
 
 
 @pytest.mark.parametrize("version", ["v3.0", "v2.1"])
@@ -86,6 +86,30 @@ def test_structured_action_state_names_load_as_missing_with_a_warning(make_datas
     assert ds.warnings == [
         "no action or observation.state feature in meta/info.json; most checks and "
         "duplicate detection need this data and found none for any episode"
+    ]
+
+
+def test_dataset_wide_constant_action_and_state_gets_a_warning(make_dataset):
+    # Found scoring a real Hub dataset (wake-inc/wake-egocentric-10h-sample, an egocentric
+    # hand-tracking dataset): meta/info.json declares a real action/observation.state
+    # feature with real per-dim names (u, v, d, qx, qy, qz, qw, grip), and it loads fine
+    # (ep.action/ep.state are not None, unlike the structured-subfeature case above) -- but
+    # every single value in both columns, across every episode, is bit-identical (an
+    # unpopulated placeholder shipped as all zero, confirmed directly against the real
+    # dataset). This is exactly the dataset-wide-frozen-action scenario check_idle's
+    # absolute "no motion detected" fallback is already designed to flag (see
+    # test_checks.py::test_frozen_action_whole_dataset_flags_no_motion): every episode
+    # correctly gets that ERROR (mean score 33.3, 15/15 episodes flagged on the real
+    # dataset), but with nothing anywhere explaining that the cause is placeholder data
+    # with no signal at all, rather than every demo independently failing to move.
+    specs = [EpisodeSpec(seconds=4.0, frozen_action=True, seed=0) for _ in range(3)]
+    ds = load_dataset(make_dataset(specs))
+
+    assert ds.warnings == [
+        "action and observation.state never vary across any frame in this dataset "
+        "(every value is identical, e.g. an unpopulated placeholder); checks that read "
+        "them will flag every episode as having no motion, which reflects the data, not "
+        "a per-episode defect"
     ]
 
 
