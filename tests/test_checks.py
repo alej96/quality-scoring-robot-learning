@@ -8,6 +8,7 @@ from demoqc.checks import (
     Config,
     DatasetContext,
     _angular_action_dims,
+    _half_quaternion_action_groups,
     _quaternion_action_groups,
     evaluate,
 )
@@ -372,6 +373,111 @@ def test_quaternion_action_groups_requires_unit_norm():
     ]
     groups = _quaternion_action_groups(names, allA, Config())
     assert groups == [(0, 1, 2, 3)]
+
+
+def _half_quaternion_dataset() -> Dataset:
+    """A synthetic dataset with a *half* unit quaternion action dim pair
+    (``base_orient_quat_w``/``base_orient_quat_z``, a wheeled base's yaw) plus a normal,
+    unrelated joint dim.
+
+    Found on a real Hub dataset (``RoboCOIN/Galbot_G1_load_floor_trash_3``, a wheeled-base
+    humanoid): ``w = cos(theta/2)`` barely moves for a modest turn (its derivative vanishes
+    near ``theta=0``), so its own dataset-wide IQR-based scale is tiny; diffing ``w`` (and
+    ``z``) directly and normalising by that tiny scale read an ordinary, smooth, modest base
+    turn as an "abrupt action jump" on nearly half the dataset's episodes. Built by hand for
+    the same reason as ``_quaternion_dataset``: it needs dims that are genuinely a (half)
+    unit quaternion (``w**2 + z**2`` exactly 1 every frame), with many clean episodes
+    establishing a baseline of only tiny jitter (the base mostly not turning, as in the real
+    dataset) plus one episode with a modest, perfectly smooth turn and one with a real,
+    abrupt discontinuity.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    n_clean = 60
+    names = ["joint", "base_orient_quat_w", "base_orient_quat_z"]
+
+    def quat_wz(theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        half = theta / 2
+        return np.cos(half), np.sin(half)
+
+    def episode(idx: int, theta: np.ndarray) -> Episode:
+        w, z = quat_wz(theta)
+        joint = 5.0 * np.sin(2 * np.pi * t / n) + 0.01 * idx
+        action = np.stack([joint, w, z], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    def smooth_bump(mag: float, start: int, width: int) -> np.ndarray:
+        bump = np.zeros(n)
+        ramp = mag * 0.5 * (1 - np.cos(np.pi * np.arange(width) / (width - 1)))
+        bump[start : start + width] = ramp
+        bump[start + width :] = mag
+        return bump
+
+    # tiny dataset-wide jitter: the base holds still (within a fraction of a degree) for
+    # virtually every clean episode, same as the real dataset
+    clean = [episode(i, 0.01 * np.sin(2 * np.pi * t / 30 + 0.1 * i)) for i in range(n_clean)]
+
+    # one genuine, smooth, modest turn (~6 degrees) -- real motion, not a glitch, and far
+    # smaller than the dataset's own observed max on the real robot
+    turn_ep = episode(n_clean, smooth_bump(0.1, 25, 25))
+
+    # one real, abrupt discontinuity (unrelated to the smooth-turn representation issue)
+    jerky_theta = np.zeros(n)
+    jerky_theta[45:] = 1.5
+    jerky_ep = episode(n_clean + 1, jerky_theta)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, turn_ep, jerky_ep],
+        action_names=names,
+    )
+
+
+def test_smoothness_ignores_ordinary_half_quaternion_turn():
+    results = {r.episode_index: r for r in evaluate(_half_quaternion_dataset())}
+
+    turn_result = results[60]
+    assert turn_result.metrics["spikes"] == 0
+    assert turn_result.metrics["jumps"] == 0
+    assert not [f for f in turn_result.flags if f.check == "smoothness"], turn_result.flags
+
+    # the fix must not blind the check to a real, unrelated abrupt discontinuity
+    jerky_result = results[61]
+    assert jerky_result.metrics["jumps"] > 0
+    assert "smoothness" in _checks(jerky_result)
+
+    # every clean episode (tiny jitter only) stays silent
+    for i in range(60):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+
+
+def test_half_quaternion_action_groups_requires_unit_norm():
+    # a w/z pair whose sum-of-squares is always 1 (a real half-quaternion) is detected; a
+    # same-named pair whose sum-of-squares is nowhere near 1 is a naming coincidence, not
+    # a real one, and must be rejected. A 4-member group (a full quaternion) must not also
+    # be picked up here -- that's _quaternion_action_groups' job.
+    theta = np.linspace(0, 2 * np.pi, 12)
+    real = np.stack([np.cos(theta / 2), np.sin(theta / 2)], axis=1)
+    fake = 2.0 * real  # sum-of-squares is always 4, not 1
+    full = np.stack([np.cos(theta / 2), np.sin(theta / 2), np.zeros(12), np.zeros(12)], axis=1)
+    allA = np.concatenate([real, fake, full], axis=1)
+    names = [
+        "base.quat_w",
+        "base.quat_z",
+        "fake.quat_w",
+        "fake.quat_z",
+        "full.qw",
+        "full.qx",
+        "full.qy",
+        "full.qz",
+    ]
+    groups = _half_quaternion_action_groups(names, allA, Config())
+    assert groups == [(0, 1)]
 
 
 def _sustained_ramp_dataset() -> Dataset:
