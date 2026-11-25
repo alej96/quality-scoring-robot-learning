@@ -969,6 +969,12 @@ Work top-down through **Next up**. Each item should ship in one focused session
       4.47-7.49 vs. every genuinely driven dim's z < 3.1 using the dataset's own robust
       median/MAD of log-scale), but combining it safely with the existing step_p99-based
       exclusion, across every previously-validated dataset, needs its own session.
+      Follow-up (resolved 2026-11-25): `_exclude_scale_outlier_dims` (shipped 2026-11-18,
+      see below) did exclude this dataset's torso/head joints as intended, but the dataset
+      stayed at mean 91.2 with the same 14 episodes flagged -- a second, unrelated defect on
+      the same dataset (`base_orient_quat_w`/`quat_z`, a half-quaternion base-yaw
+      representation) turned out to be the dominant remaining cause. See the new "half unit
+      quaternion" fix's own Log entry for the root cause and validation numbers.
 
 - [x] **Fix `check_smoothness` flagging a dexterous hand's finger-joint grasp as an abrupt
       action jump.** Found by running `demoqc score` against a real Hub dataset beyond the
@@ -1268,6 +1274,78 @@ Work top-down through **Next up**. Each item should ship in one focused session
       stream, a dataset with every episode duplicated as a consecutive pair) look like real
       defects in those specific datasets, not tool bugs -- tracked here rather than acted on
       further without more evidence.
+- [x] **Fix `check_smoothness` flagging an ordinary, modest base turn as an abrupt action
+      jump because it's logged as a** *half* **unit quaternion.** Found by re-running
+      `demoqc score` against `RoboCOIN/Galbot_G1_load_floor_trash_3` -- the same real Hub
+      dataset the sustained-ramp gap-bridging fix (2026-11-16) and the scale-outlier-dim fix
+      (2026-11-18) were both found on -- to check whether that second fix's own follow-up
+      (torso/head joints, score_z 4.47-7.49) was now fully resolved: it was (both dims'
+      `step_p99` are correctly `NaN`'d out), yet the dataset was still stuck at mean 91.2
+      with the exact same 14/20 episodes flagged. Per-dim inspection of every still-flagged
+      frame found a second, unrelated defect: `base_orient_quat_w`/`base_orient_quat_z`
+      (the wheeled base's yaw, confirmed directly: `z**2 + w**2` is 1.0 to float precision
+      on every frame of every episode) was the *sole* flagged dim on 3 of the 14 episodes
+      (7, 9, 14 -- one with 17 raw "big" frames) and co-flagged alongside other dims on
+      several more. Root cause: for a single-axis rotation quaternion, `w = cos(theta/2)`
+      and `z = sin(theta/2)`; near `theta=0` (true for virtually this whole dataset -- "the
+      robot rarely rotates its base"), `dw/dtheta` vanishes quadratically while `dz/dtheta`
+      stays near its maximum, so an ordinary, smooth, modest turn moves `w` only a little in
+      absolute terms -- but `w`'s own dataset-wide IQR-based `scale` is *equally* tiny for
+      the same reason (confirmed directly: `scale[w]=0.0071` vs. `scale[z]=0.1154`, a 16x
+      gap, for the exact same physical motion), so diffing `w` directly and normalising by
+      its own scale reads the turn as a huge step relative to typical per-frame noise --
+      exactly the already-fixed noise-dominated-dim pattern, except this dim is *not* noise:
+      it carries a real, meaningful signal that's simply encoded non-linearly. Unlike the
+      already-excluded torso/head joints, excluding `w`/`z` outright would blind the check to
+      a genuine bad base-rotation recording with no equivalent coverage elsewhere (no
+      `gripper_chatter`-style check exists for a base). Fixed by adding
+      `checks._half_quaternion_action_groups` (`DatasetContext.build`): a pair of action dims
+      named with the same `q`/`quat`+w/x/y/z suffix convention `_quaternion_action_groups`
+      already uses, but with only 2 of the 4 letters present (`w` plus exactly one axis
+      letter) and confirmed from the data the same "name narrows the search, data decides"
+      way (sum-of-squares near 1, `Config.quaternion_norm_tol`, reused unchanged). For each
+      confirmed pair, `checks._half_quaternion_step` recovers the actual rotation half-angle
+      via `atan2(axis_component, w)` (linear and well-behaved everywhere, unlike either raw
+      component) and takes its shortest-path circular diff (reusing `_wrap_pi`, the same
+      machinery already used for wrapped Euler angles); `checks._half_quaternion_dataset_stats`
+      computes this derived angle's own dataset-wide scale and 99th-percentile step the exact
+      same way every other dim's are computed, and overrides both `step_p99[w]` and
+      `step_p99[a]` with it (after, not instead of, the existing exclusion passes, so it
+      always wins over an exclusion decision made from the misleading raw components); in
+      `check_smoothness`, `checks._apply_half_quaternion_steps` makes the same substitution
+      for the per-episode `step` array before spike/jump detection runs, so both dims share
+      one physically meaningful, well-scaled signal instead of two mismatched ones. New
+      `tests/test_checks.py::test_smoothness_ignores_ordinary_half_quaternion_turn` builds a
+      62-episode synthetic dataset by hand (60 clean episodes with only tiny dataset-wide
+      yaw jitter -- the base mostly not turning, as in the real dataset -- one episode with a
+      modest ~6-degree perfectly smooth turn, one with a real abrupt ~86-degree
+      discontinuity) and asserts the smooth-turn episode gets zero smoothness flags while
+      the abrupt one still flags; fails without this change (confirmed directly: with
+      `_half_quaternion_action_groups` forced to return no groups, the smooth-turn episode
+      asserts `1 == 0` on `jumps`, reproducing the real dataset's false positive exactly). A
+      second new test, `test_half_quaternion_action_groups_requires_unit_norm`, locks in the
+      name-plus-data-validation detection directly, including that it must not also pick up
+      a 4-member full-quaternion group (that's `_quaternion_action_groups`' job). Validated
+      on the real dataset: `demoqc score RoboCOIN/Galbot_G1_load_floor_trash_3
+      --max-episodes 20` went from mean 91.2 (`smoothness` x14) to mean 93.8 (`smoothness`
+      x11) -- episodes 7, 9 and 14 (whose only flagged dim was the quaternion pair) are now
+      completely clean, and every other previously-flagged episode's jump count either fell
+      or stayed the same (e.g. episode 13: 5 jumps -> 1), confirming no new false negatives
+      were introduced. Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) plus
+      `adityx23/icl-dataset` (the full-quaternion sign-flip fix's own dataset) and
+      `zekaiwang/trex_dataset` and got byte-identical mean scores and flag counts to every
+      prior Log entry on all seven (97.1 / 92.9 / 92.2 / 99.2 / 95.2 / 97.8 / 97.3),
+      confirming this is a no-op whenever a dataset has no half-quaternion action dim pair.
+      Also ran `pytest -m network`: all network tests pass.
+      Follow-up: the same dataset's episodes 0/3/11/13 still carry a `base_orient_quat_z`/
+      `base_vel_angular_z_rad_s` co-flag alongside real arm-joint jumps -- `base_vel_angular_z_rad_s`
+      has the *exact same* dataset-wide `scale` as `base_orient_quat_z` (0.1154, confirmed
+      directly), suggesting it may be a literal derivative/duplicate of the same underlying
+      signal rather than an independent measurement; whether that's a second representation
+      artifact worth collapsing, or just two genuinely correlated channels both correctly
+      flagging the same real event, needs more evidence before acting on it.
 
 ## Needs the owner
 
@@ -2154,3 +2232,13 @@ Work top-down through **Next up**. Each item should ship in one focused session
   whole dataset (see the "Next up" entry above for the full root cause, found on
   `wake-inc/wake-egocentric-10h-sample`). No real-dataset score changed; this only adds a
   `Dataset.warnings` entry naming the cause.
+- 2026-11-25: Fixed `check_smoothness` flagging an ordinary, modest base turn as an abrupt
+  action jump because it's logged as a *half* unit quaternion (`base_orient_quat_w`/
+  `quat_z`, `w = cos(theta/2)` barely moving near `theta=0` while its own dataset-wide scale
+  is equally tiny) -- the real remaining cause (not torso/head joints) behind
+  `RoboCOIN/Galbot_G1_load_floor_trash_3` staying stuck at mean 91.2 after the 2026-11-18
+  scale-outlier-dim fix. Added `checks._half_quaternion_action_groups`, which recovers the
+  actual rotation angle via `atan2` and uses its own well-scaled diff instead of either raw
+  component. `RoboCOIN/Galbot_G1_load_floor_trash_3 --max-episodes 20` went from mean 91.2
+  (`smoothness` x14) to 93.8 (`smoothness` x11, 3 episodes now fully clean). See the "Next
+  up" entry for the full root cause and validation details.
