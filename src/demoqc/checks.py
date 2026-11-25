@@ -179,6 +179,9 @@ class DatasetContext:
     quaternion_groups: list[tuple[int, int, int, int]] = field(default_factory=list)  # groups of
     # 4 action dims (w, x, y, z) that together form a unit quaternion -- see
     # _quaternion_action_groups
+    half_quaternion_groups: list[tuple[int, int, float]] = field(default_factory=list)  # (w, a,
+    # scale) pairs of action dims that together form a *half* unit quaternion (a single-axis
+    # rotation, e.g. a wheeled base's yaw) -- see _half_quaternion_action_groups
     stale_state_baseline: float = 0.0  # dataset's own median per-episode stale-state fraction;
     # some robots (e.g. a humanoid whose chassis/arm state publishes slower than the logging
     # fps) hold observation.state for a frame or two on every episode as a hardware artifact,
@@ -263,6 +266,15 @@ class DatasetContext:
         step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
         step_p99 = _exclude_scale_outlier_dims(step_p99, scale, cfg.smoothness_dim_outlier_z)
         step_p99 = _exclude_gripper_dims(step_p99, gripper_dims)
+        # half-quaternion pairs (e.g. base_orient_quat_z/w) would otherwise have just been
+        # excluded above as a scale/noise outlier (their raw components' own IQR-based
+        # scale really is tiny) -- override with the physically meaningful rotation-angle
+        # step instead of leaving them excluded or using the misleading component-based one.
+        half_quaternion_stats = _half_quaternion_dataset_stats(ds.action_names, allA, actions, cfg)
+        for w, a, _hscale, p99 in half_quaternion_stats:
+            step_p99[w] = p99
+            step_p99[a] = p99
+        half_quaternion_groups = [(w, a, hscale) for w, a, hscale, _p99 in half_quaternion_stats]
         idle_speed = cfg.idle_fraction_of_p75 * p75
         stale_fracs = [
             float(_stale_mask(e.action, e.state, scale, idle_speed, ds.fps).mean())
@@ -280,6 +292,7 @@ class DatasetContext:
             angular_dims=angular_dims,
             angular_pairs=angular_pairs,
             quaternion_groups=quaternion_groups,
+            half_quaternion_groups=half_quaternion_groups,
             stale_state_baseline=stale_state_baseline,
             sync_corr_baseline=sync_corr_baseline,
             **video_ctx,
@@ -560,7 +573,10 @@ def _suppress_gimbal_lock_pairs(
         big[cancels, b] = False
 
 
-_QUATERNION_SUFFIX = re.compile(r"^(.+?)[._-]?q([wxyz])$", re.IGNORECASE)
+_QUATERNION_SUFFIX = re.compile(r"^(.+?)[._-]?q(?:uat)?[._-]?([wxyz])$", re.IGNORECASE)
+# matches both a bare "q"+letter suffix ("left_ee.qw") and a spelled-out "quat"+letter
+# suffix ("base_orient_quat_w") -- the latter found on a real Hub dataset (see
+# _half_quaternion_action_groups below).
 
 
 def _quaternion_action_groups(
@@ -594,6 +610,128 @@ def _quaternion_action_groups(
         if np.median(np.abs(norm_sq[finite] - 1.0)) > cfg.quaternion_norm_tol:
             continue
         out.append(cols)
+    return out
+
+
+def _half_quaternion_action_groups(
+    action_names: list[str] | None, allA: np.ndarray, cfg: Config
+) -> list[tuple[int, int]]:
+    """Pairs of action dims (``qw`` plus exactly one of ``qx``/``qy``/``qz``) that together
+    form a *half* unit quaternion: a pure single-axis (planar) rotation, where the other two
+    quaternion components are always exactly 0 and never logged as a feature at all.
+
+    Found on a real Hub dataset beyond the existing validation set
+    (``RoboCOIN/Galbot_G1_load_floor_trash_3``, a wheeled-base humanoid): its base's yaw is
+    stored as ``base_orient_quat_z``/``base_orient_quat_w`` -- no ``qx``/``qy`` feature in
+    sight, confirmed directly that ``z**2 + w**2`` is 1.0 (to float precision) across every
+    frame of every episode. ``w`` sits within 0.045 of 1.0 for virtually the whole dataset
+    (the robot rarely rotates its base), so its own IQR-based ``scale`` is tiny; a genuine,
+    modest, perfectly smooth base turn still moves ``w`` (and ``z``) by many multiples of
+    that tiny scale, well past ``smoothness_dim_outlier_z``'s 4.0 exclusion threshold. Unlike
+    the already-fixed noise-dominated/scale-outlier torso-joint case, this dim is not noise
+    around a fixed setpoint that should simply be excluded -- it carries a real, meaningful
+    signal (how much the base turned) that's just encoded non-linearly (``w = cos(theta/2)``)
+    in a way raw per-component diffing can't see: near ``theta=0`` the component values barely
+    move per radian turned, so per-component ``step_p99`` reflects almost no real motion at
+    all. Candidate pairs are found by feature name (the same ``q``/``quat`` suffix convention
+    as ``_quaternion_action_groups``, just with only 2 of the 4 letters present), then
+    confirmed from the data the same "name narrows the search, data decides" way: a
+    coincidental 2-dim naming match whose sum-of-squares isn't near 1 is rejected. See
+    ``_half_quaternion_step`` for how this is turned into a real, well-scaled step instead.
+    """
+    if action_names is None:
+        return []
+    groups: dict[str, dict[str, int]] = {}
+    for i, name in enumerate(action_names):
+        m = _QUATERNION_SUFFIX.match(name) if name else None
+        if m:
+            groups.setdefault(m.group(1), {})[m.group(2).lower()] = i
+    out = []
+    for g in groups.values():
+        axis_letters = [c for c in "xyz" if c in g]
+        if "w" not in g or len(g) != 2 or len(axis_letters) != 1:
+            continue
+        w, a = g["w"], g[axis_letters[0]]
+        norm_sq = np.nansum(allA[:, [w, a]] ** 2, axis=1)
+        finite = np.isfinite(norm_sq)
+        if finite.sum() < 10:
+            continue
+        if np.median(np.abs(norm_sq[finite] - 1.0)) > cfg.quaternion_norm_tol:
+            continue
+        out.append((w, a))
+    return out
+
+
+def _half_quaternion_angle(action: np.ndarray, w: int, a: int) -> np.ndarray:
+    """The rotation half-angle (radians, ``theta/2``) a half-quaternion ``(w, a)`` pair
+    encodes, recovered directly via ``atan2`` instead of the nonlinear raw components."""
+    return np.arctan2(action[:, a], action[:, w])
+
+
+def _half_quaternion_step(action: np.ndarray, w: int, a: int) -> np.ndarray:
+    """Signed per-frame rotation step (radians) for a half-quaternion ``(w, a)`` pair: the
+    shortest-path circular diff of its recovered half-angle, well-scaled and linear in the
+    real rotation regardless of where ``w``/``a`` individually sit -- unlike diffing ``w``
+    or ``a`` directly, which is most insensitive to real motion exactly where this
+    representation spends almost all its time (``theta`` near 0, i.e. ``w`` near +-1).
+    """
+    return _wrap_pi(np.diff(_half_quaternion_angle(action, w, a)))
+
+
+def _half_quaternion_dataset_stats(
+    action_names: list[str] | None,
+    allA: np.ndarray,
+    actions: list[np.ndarray],
+    cfg: Config,
+) -> list[tuple[int, int, float, float]]:
+    """For each detected half-quaternion pair (``_half_quaternion_action_groups``), the
+    dataset-wide scale (robust IQR of the recovered rotation half-angle, see
+    ``_half_quaternion_angle``) and 99th-percentile normalised step -- computed the exact
+    same way ``DatasetContext.build`` computes every other action dim's ``scale``/
+    ``step_p99``, just on the derived angle instead of the raw, nonlinear components.
+    Returns ``(w, a, scale, step_p99)`` tuples; a pair whose angle never varies at all
+    across the dataset (the base never rotates) is left out, same as any other constant
+    dim.
+    """
+    out = []
+    for w, a in _half_quaternion_action_groups(action_names, allA, cfg):
+        half_theta = _half_quaternion_angle(allA, w, a)
+        finite = np.isfinite(half_theta)
+        if finite.sum() < 2:
+            continue
+        q75, q25 = np.nanpercentile(half_theta[finite], [75, 25])
+        scale = (q75 - q25) / 1.349
+        std = float(np.nanstd(half_theta[finite]))
+        scale = scale if scale > 1e-9 else std
+        if scale <= 1e-9:
+            continue
+        dtheta = np.concatenate(
+            [_half_quaternion_step(act, w, a) for act in actions if len(act) > 1]
+        )
+        if dtheta.size == 0:
+            continue
+        p99 = float(np.nanpercentile(np.abs(dtheta) / scale, 99))
+        if p99 <= 1e-9:
+            continue
+        out.append((w, a, scale, p99))
+    return out
+
+
+def _apply_half_quaternion_steps(
+    step: np.ndarray, action: np.ndarray, groups: list[tuple[int, int, float]]
+) -> np.ndarray:
+    """Replace a half-quaternion pair's own component steps in ``step`` with the shared,
+    physically meaningful rotation-angle step (see ``_half_quaternion_step``), scaled by
+    the dataset-wide spread of that angle (``DatasetContext.build``) instead of either raw
+    component's own (misleadingly tiny or nonlinear) scale.
+    """
+    if not groups:
+        return step
+    out = step.copy()
+    for w, a, scale in groups:
+        dtheta = _half_quaternion_step(action, w, a) / scale
+        out[:, w] = dtheta
+        out[:, a] = dtheta
     return out
 
 
@@ -979,6 +1117,8 @@ def check_smoothness(ep: Episode, ctx: DatasetContext, cfg: Config, out: Episode
         return
     corrected_action = _correct_quaternion_signs(ep.action, ctx.quaternion_groups)
     step = _angular_diff(corrected_action, ctx.angular_dims) / ctx.action_scale
+    if ctx.half_quaternion_groups:
+        step = _apply_half_quaternion_steps(step, corrected_action, ctx.half_quaternion_groups)
     limit = cfg.spike_factor * ctx.step_p99
     big = np.abs(step) > limit
     if ctx.angular_pairs:
