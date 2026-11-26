@@ -274,7 +274,9 @@ demoqc export user/huge-dataset --episodes 0-199 --min-score 80 -o preview  # ex
 On `export`, episodes outside `--episodes`/`--max-episodes` are dropped unconditionally, even
 if `--min-score` or a `--keep-from` report would otherwise keep them (they were never loaded,
 so there is nothing to keep); a `--keep-from` report must have been produced by a `demoqc score`
-run over the same subset, or it's rejected as made for a different dataset.
+run over the same subset, or it's rejected as made for a different dataset. The printed
+`dropped episodes` list is capped at 20 indices (plus a count of the rest), since narrowing to
+a small `--episodes` subset of a huge dataset can drop tens of thousands of episodes at once.
 
 From the Hugging Face Hub, only the data file(s) that actually contain the requested
 episodes are downloaded (metadata is always small and downloaded in full); locally, data

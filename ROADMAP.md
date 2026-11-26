@@ -1346,6 +1346,37 @@ Work top-down through **Next up**. Each item should ship in one focused session
       signal rather than an independent measurement; whether that's a second representation
       artifact worth collapsing, or just two genuinely correlated channels both correctly
       flagging the same real event, needs more evidence before acting on it.
+- [x] **Cap `demoqc export`'s printed `dropped episodes` list.** Found while re-validating
+      an earlier fix on a real Hub dataset (`RoboCOIN/Agilex_Cobot_Magic_heat_burger`, 819
+      episodes): `demoqc export RoboCOIN/Agilex_Cobot_Magic_heat_burger --episodes 0-4
+      --keep-from report.json --apply-trim -o clean_ds` printed a single
+      `dropped episodes: ` line listing all 814 non-requested episode indices one by one.
+      Root cause: `--episodes`/`--max-episodes` (the "scale to large datasets" workflow
+      README.md documents for a "DROID-scale and up" dataset) makes `export` drop every
+      episode outside the requested subset unconditionally -- correct behavior (there's
+      nothing to keep for an episode that was never loaded), but `cli.py`'s
+      `"dropped episodes: " + ", ".join(map(str, result.dropped))` printed the full list
+      with no cap, so the exact workflow the feature exists for (narrowing a huge dataset
+      down to a small subset) is also the one that floods the terminal hardest -- a
+      real DROID-scale dataset (~76k episodes) scored down to a few hundred would print
+      tens of thousands of comma-separated numbers. Fixed by capping the printed list at
+      `cli._MAX_LISTED_DROPPED_EPISODES` (20) indices plus a `", ... and N more"` suffix
+      and a `(count)` in the line itself, so the total is still visible even when the list
+      isn't. New `tests/test_export.py::test_export_command_truncates_a_long_dropped_episode_list`
+      (a 30-episode synthetic dataset, `--episodes 0-4`, 25 dropped) asserts the exact
+      truncated line; fails without this change (confirmed: asserts the truncated line and
+      gets the full untruncated 25-entry list instead). Validated on the real dataset:
+      `demoqc export RoboCOIN/Agilex_Cobot_Magic_heat_burger --episodes 0-4 --keep-from
+      report.json --apply-trim -o clean_ds` now prints `dropped episodes (814): 5, 6, ...,
+      24, ... and 794 more` instead of all 814 numbers; `kept`/`trimmed`/warning lines and
+      the exported dataset itself are byte-identical to before (this only changes what's
+      printed, not what's exported). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) through
+      `demoqc score` (unaffected, this change is `export`-only) and confirmed every existing
+      `export` test (none of which drop more than 20 episodes) still passes unchanged,
+      confirming this is a no-op whenever fewer than 21 episodes are dropped. Also ran
+      `pytest -m network`: all network tests pass.
 
 ## Needs the owner
 
@@ -2242,3 +2273,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
   component. `RoboCOIN/Galbot_G1_load_floor_trash_3 --max-episodes 20` went from mean 91.2
   (`smoothness` x14) to 93.8 (`smoothness` x11, 3 episodes now fully clean). See the "Next
   up" entry for the full root cause and validation details.
+- 2026-11-26: Fixed `demoqc export` printing every dropped episode index with no cap when
+  narrowing a dataset via `--episodes`/`--max-episodes` (the "DROID-scale and up" workflow
+  README.md documents) -- found while re-validating an earlier fix on
+  `RoboCOIN/Agilex_Cobot_Magic_heat_burger` (819 episodes), which printed all 814
+  non-requested indices on one line. Capped the printed list at 20 indices plus a
+  `", ... and N more"` suffix and a total count; the export itself is unchanged, only the
+  console output. See the "Next up" entry for the full root cause and validation details.
