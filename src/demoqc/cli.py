@@ -21,6 +21,11 @@ from demoqc.export import (
 from demoqc.push import push_report
 from demoqc.report import build_report, format_markdown, format_summary, write_csv, write_json
 
+# A huge dataset's --episodes/--max-episodes subset can drop tens of thousands of
+# episodes at once (see the "scale to large datasets" workflow in README.md); cap how many
+# indices export prints so that case doesn't flood the terminal.
+_MAX_LISTED_DROPPED_EPISODES = 20
+
 
 def _episode_spec(spec: str) -> list[int]:
     """Parse '0-9,20,35-40' into a sorted list of episode indices."""
@@ -397,7 +402,12 @@ def _export(args: argparse.Namespace) -> int:
         f"({result.frames} frames) -> {result.out}"
     )
     if result.dropped:
-        print("dropped episodes: " + ", ".join(map(str, result.dropped)))
+        shown = result.dropped[:_MAX_LISTED_DROPPED_EPISODES]
+        listed = ", ".join(map(str, shown))
+        extra = len(result.dropped) - len(shown)
+        if extra:
+            listed += f", ... and {extra} more"
+        print(f"dropped episodes ({len(result.dropped)}): {listed}")
     if result.trimmed_frames:
         print(
             f"trimmed {result.trimmed_frames} idle frames ({result.trimmed_frames / ds.fps:.1f}s)"

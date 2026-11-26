@@ -208,6 +208,19 @@ def test_export_command_drops_rejected_episodes(make_dataset, tmp_path, capsys):
     assert json.loads((out / "meta" / "info.json").read_text())["total_episodes"] == len(keep)
 
 
+def test_export_command_truncates_a_long_dropped_episode_list(make_dataset, tmp_path, capsys):
+    # --episodes on a large dataset drops everything outside the subset unconditionally
+    # (see README's "scale to large datasets" workflow); that can be thousands of episodes,
+    # so the printed list must stay short instead of flooding the terminal.
+    src = make_dataset(clean_specs(30))
+    out = tmp_path / "clean"
+    assert main(["export", str(src), "--episodes", "0-4", "--min-score", "0", "-o", str(out)]) == 0
+    said = capsys.readouterr().out
+    dropped_line = next(line for line in said.splitlines() if line.startswith("dropped episodes"))
+    expected = ", ".join(str(i) for i in range(5, 25))  # first 20 of the 25 dropped (5..29)
+    assert dropped_line == f"dropped episodes (25): {expected}, ... and 5 more"
+
+
 def test_export_command_min_score_matches_a_separate_score_json_run(make_dataset, tmp_path, capsys):
     specs = clean_specs()
     specs[3] = EpisodeSpec(seconds=8.0, spikes_at=[40, 80, 120, 160, 200], seed=3)
