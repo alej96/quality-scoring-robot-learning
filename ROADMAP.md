@@ -9,6 +9,72 @@ Work top-down through **Next up**. Each item should ship in one focused session
 
 ## Next up
 
+- [x] **Fix `check_smoothness` flagging scattered noise on a whole unused bimanual side as
+      abrupt action jumps.** Found by running `demoqc score` against real Hub datasets
+      beyond the existing validation set (`RoboCOIN/AI2_Alphabot_2_package_fruit`,
+      `RoboCOIN/AI2_Alphabot_2_stamp_document`, both found via `list_datasets(filter=
+      "LeRobot", sort="downloads")`): both are single-arm tasks on this robot's dual-arm
+      platform, and 10-14/20 episodes of each carried a `smoothness` "abrupt action jump"
+      flag (mean 94.5 and 95.5) on datasets whose other checks looked clean. Per-dim
+      inspection found the cause: the entire unused `left_arm_joint_1..7_rad`/
+      `left_eef_pos_x/y/z_m`/`left_eef_rot_euler_x/y/z_rad` group -- 10 of ~30 action dims
+      -- sits at a near-frozen setpoint for every episode of the whole dataset (dataset-wide
+      robust `scale` under 4e-5, vs. 0.02-0.3 for the matching `right_*` dim actually driving
+      the task), yet neither existing per-dim exclusion (`_exclude_noise_dominated_dims`,
+      `_exclude_scale_outlier_dims`, both already shipped for a single barely-used torso/neck
+      joint) caught it: that cluster is itself ~a third of the dataset's dims, and both
+      tests' dataset-wide median/MAD shift toward it, capping every one of its members' own
+      outlier z at 3.6-3.8 -- just under `smoothness_dim_outlier_z`'s 4.0 (confirmed directly:
+      removing the single worst offender and recomputing still leaves the next-worst *below*
+      threshold, unlike a true minority outlier). On `package_fruit` this same contamination
+      also masked a second, smaller, real defect underneath: `torso_joint_1/2/3_rad` (the
+      same `RoboCOIN/AI2_Alphabot_2_insert_water_pipe` pattern) landed at scale-outlier z
+      near 0 instead of 4+, since the frozen left arm was pulling the dataset's median scale
+      down toward its own near-zero range (confirmed: removing it from the population first
+      correctly surfaces 2 of those 3 torso dims as outliers again). Fixed by adding
+      `checks._unused_side_dims` (`DatasetContext.build`): pairs up each "left"/"right"-named
+      action dim with its counterpart (matched by replacing "left" with "right" in the
+      feature name) and returns the whole side only when *every* matched pair agrees, both
+      in direction and by a decisive margin (`Config.unused_side_scale_ratio`, 100x) -- a
+      real bimanual task, even a lopsided one, has no reason to move one arm two orders of
+      magnitude less than the other on every joint and pose axis at once. Unlike the two
+      existing tests, this doesn't need the frozen cluster to be a small minority of *all*
+      dims, since it only compares matched pairs directly. Those dims are dropped from the
+      live `step_p99` array *and* from the population the two existing tests build their own
+      median/MAD from (a separate `scale_for_outliers` copy; `ctx.action_scale` itself stays
+      intact for every other check that uses it), so a real but smaller defect elsewhere
+      isn't masked by a whole frozen limb skewing the dataset's own median either. New
+      `tests/test_checks.py::test_smoothness_ignores_an_unused_bimanual_side` builds a
+      41-episode synthetic dataset by hand (7 normal, actively-moving "right_joint_i_rad"
+      dims plus 7 matching "left_joint_i_rad" dims frozen for the whole dataset except for
+      scattered sensor-noise blips, one more episode with a genuine jump on a driven dim)
+      and asserts the whole frozen side's `step_p99` is excluded while the driven side is
+      untouched, every blip episode stays silent, and the genuine-jump episode is still
+      flagged; fails without this change (confirmed via `git stash` on just
+      `src/demoqc/checks.py` -- the frozen side's `step_p99` comes back ~3.4-3.7, not NaN,
+      reproducing the real datasets' false positive exactly). Validated on the real datasets:
+      `demoqc score RoboCOIN/AI2_Alphabot_2_package_fruit --max-episodes 20` went from mean
+      94.5 (`smoothness` x10) to 98.2 (`smoothness` x4, down to just the residual torso_1/3
+      case below); `..._stamp_document --max-episodes 20` went from mean 95.5 (`smoothness`
+      x9) to 100.0 (0 flags). Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`,
+      `aaronsu11/so100_lego`, `shylee/so100_cube`, `jccj/so100_block_in_cup`) and every other
+      real dataset from the smoothness-fix series (`zekaiwang/trex_dataset`,
+      `RoboCOIN/AI2_Alphabot_2_insert_water_pipe` and `_insert_hose_into_hole`,
+      `lerobot/aloha_static_cups_open`/`_battery`, both Agilex Cobot Magic datasets,
+      `allenai/MolmoAct2-BimanualYAM-Dataset`, `BitRobot/HIW-500-LeRobot`,
+      `RoboCOIN/Galbot_G1_load_floor_trash_3`, `RoboCOIN/Unitree_G1edu_u3_place_bread_1`,
+      `EPITECH-LILLE/eval_training`) via `git stash` before/after for an exact apples-to-apples
+      diff: byte-identical mean scores and flag counts on every one of them, confirming this
+      is a no-op whenever a dataset has no "left"/"right"-named dim pair with a decisive,
+      consistent scale gap.
+      Follow-up: `package_fruit`'s `torso_joint_1/3_rad` dims remain a small residual (4
+      episodes still carry a `smoothness` flag) -- their scale-outlier z against the
+      corrected population is 3.4-3.7, still short of the 4.0 threshold (the other two torso
+      dims, `torso_joint_2/4_rad`, are already caught). The same shape of residual was left
+      open and later resolved for `insert_water_pipe`'s own torso/neck dims (see the
+      2026-11-17/18 entries below); worth revisiting the same way if another real dataset
+      makes the pattern clearer.
 - [x] **Fix `demoqc score` crashing on a dataset whose parquet files mix `float32` and
       `float64` for the same column across episodes.** Found incidentally while validating
       an earlier run's fix on `RoboCOIN/Agilex_Cobot_Magic_place_towel_flat`: scoring the
@@ -2280,3 +2346,10 @@ Work top-down through **Next up**. Each item should ship in one focused session
   non-requested indices on one line. Capped the printed list at 20 indices plus a
   `", ... and N more"` suffix and a total count; the export itself is unchanged, only the
   console output. See the "Next up" entry for the full root cause and validation details.
+- 2026-11-27: Fixed `check_smoothness` flagging scattered noise on a whole unused bimanual
+  side (e.g. a single-arm task on a dual-arm robot) as abrupt action jumps -- the existing
+  per-dim noise/scale-outlier exclusions break down once that side is too large a minority
+  of the dataset's dims, and on one real dataset this also masked a second, smaller,
+  genuine torso-noise defect underneath. `RoboCOIN/AI2_Alphabot_2_package_fruit` went from
+  mean 94.5 to 98.2, `_stamp_document` from 95.5 to 100.0. See the "Next up" entry for the
+  full root cause, the still-open residual, and validation details.
