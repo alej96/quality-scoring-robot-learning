@@ -82,6 +82,10 @@ class Config:
     smoothness_dim_outlier_z: float = 4.0  # exclude a dim from spike/jump detection if
     # log(step_p99) is this many robust MADs from the dataset's other action dims' own
     # median -- a joint/axis the task barely ever moves, so step_p99 reflects only noise
+    unused_side_scale_ratio: float = 100.0  # exclude a bimanual robot's whole "left"/
+    # "right" side from spike/jump detection if every one of its dims' own robust scale is
+    # at least this many times smaller than its named counterpart on the other side -- see
+    # _exclude_unused_side_dims
     smoothness_ramp_gap_frames: int = 10  # bridge a same-direction gap of up to this many
     # frames between two big-step frames on the same dim before counting runs -- frame-to-
     # frame noise mid-ramp shouldn't split one continuous motion into many "jumps"
@@ -263,8 +267,19 @@ class DatasetContext:
         # dims that almost never change (e.g. a binary gripper) have no step scale;
         # leave them out of spike detection rather than flag every toggle
         step_p99 = np.where(step_p99 > 1e-9, step_p99, np.nan)
+        # an unused side's dims are dropped from both the live step_p99 array *and* the
+        # population the next two tests build their own median/MAD from (a separate copy,
+        # scale_for_outliers -- ctx.action_scale itself must stay intact for every other
+        # check that uses it), so a real but smaller defect elsewhere isn't masked by a
+        # whole frozen limb skewing the dataset's own median -- see _unused_side_dims.
+        unused_side_dims = _unused_side_dims(ds.action_names, scale, cfg.unused_side_scale_ratio)
+        step_p99[unused_side_dims] = np.nan
+        scale_for_outliers = scale.copy()
+        scale_for_outliers[unused_side_dims] = np.nan
         step_p99 = _exclude_noise_dominated_dims(step_p99, cfg.smoothness_dim_outlier_z)
-        step_p99 = _exclude_scale_outlier_dims(step_p99, scale, cfg.smoothness_dim_outlier_z)
+        step_p99 = _exclude_scale_outlier_dims(
+            step_p99, scale_for_outliers, cfg.smoothness_dim_outlier_z
+        )
         step_p99 = _exclude_gripper_dims(step_p99, gripper_dims)
         # half-quaternion pairs (e.g. base_orient_quat_z/w) would otherwise have just been
         # excluded above as a scale/noise outlier (their raw components' own IQR-based
@@ -383,6 +398,79 @@ def _exclude_scale_outlier_dims(
     out = step_p99.copy()
     out[idx[z < -z_thresh]] = np.nan
     return out
+
+
+def _unused_side_dims(names: list[str] | None, scale: np.ndarray, min_ratio: float) -> list[int]:
+    """Return the action dim indices of a bimanual robot's "left" or "right" side when
+    that whole side is never actually commanded for the whole dataset.
+
+    Found on real Hub datasets beyond the existing validation set
+    (``RoboCOIN/AI2_Alphabot_2_package_fruit``, ``RoboCOIN/AI2_Alphabot_2_stamp_document``,
+    both single-arm tasks on a dual-arm robot): 10+ of ~30 action dims -- the *entire*
+    unused ``left_arm_joint_1..7_rad``/``left_eef_pos_x/y/z_m``/``left_eef_rot_euler_x/y/
+    z_rad`` group -- sit at a near-frozen setpoint for every episode of the whole dataset
+    (dataset-wide robust ``scale`` under 4e-5, vs. 0.02-0.3 for the matching ``right_*``
+    dim actually driving the task). This cluster, left in the dim population either of the
+    two existing per-dim exclusions (``_exclude_noise_dominated_dims``,
+    ``_exclude_scale_outlier_dims``) compares against, is itself ~a third of the dataset's
+    dims -- too large a minority for their dataset-wide median/MAD not to shift toward it,
+    which both masks the frozen left arm itself (every one of its members' own outlier z
+    caps at 3.6-3.8, just under ``smoothness_dim_outlier_z``'s 4.0) *and*, on exactly this
+    dataset, masks the real, smaller defect underneath: the genuinely torso-noise-dominated
+    ``torso_joint_1/2/3_rad`` dims (the same ``RoboCOIN/AI2_Alphabot_2_insert_water_pipe``
+    pattern the scale-outlier test was built for) land at scale outlier z~=0 instead of the
+    4+ they'd get without the frozen left arm pulling the dataset's median scale down toward
+    its own near-zero range -- confirmed directly: removing the frozen left arm from the
+    population first, then recomputing, correctly surfaces `torso_joint_1/2/3_rad` as the
+    scale outliers they are. The result before this fix: 10-14/20 episodes of each dataset
+    carried a `smoothness` "abrupt action jump" flag from scattered torso noise (confirmed
+    by inspecting the flagged dim/frame directly), on datasets whose actually-driven
+    ``right_*`` dims and other checks were clean.
+
+    Unlike those two dataset-wide-median tests, this doesn't need the frozen cluster to be
+    a small minority of *all* dims to find it in the first place: it only compares each
+    "left"/"right"-named dim directly against its own named counterpart (matched by
+    replacing "left" with "right" in the feature name, e.g. ``"left_arm_joint_3_rad"`` <->
+    ``"right_arm_joint_3_rad"``), so a whole-limb cluster is no harder to catch than a
+    single dim. A whole side is only returned when *every* matched pair agrees, both in
+    which side is the tiny one and by a decisive margin (``min_ratio``, 100x): a real
+    bimanual task, even a lopsided one, has no reason to move one arm literally two orders
+    of magnitude less than the other on *every single joint and pose axis at once* --
+    that's the signature of a control channel never being commanded at all, not real
+    asymmetric motion. Needs at least 4 matched pairs, so a dataset with only one or two
+    "left"/"right"-named dims (too little evidence either way) is left alone. A dataset
+    where both sides are genuinely driven (every dataset in the existing validation set,
+    plus every ALOHA/Agilex two-arm dataset from earlier fixes) has near-1 ratios on every
+    pair and returns nothing.
+    """
+    if not names:
+        return []
+    lower = [n.lower() if n else "" for n in names]
+    name_to_idx = {n: i for i, n in enumerate(lower) if n}
+    pairs = []
+    for i, name in enumerate(lower):
+        if "left" not in name:
+            continue
+        j = name_to_idx.get(name.replace("left", "right"))
+        if j is not None:
+            pairs.append((i, j))
+    if len(pairs) < 4:
+        return []
+    left_idx = np.array([p[0] for p in pairs])
+    right_idx = np.array([p[1] for p in pairs])
+    valid = np.isfinite(scale[left_idx]) & np.isfinite(scale[right_idx])
+    valid &= (scale[left_idx] > 0) & (scale[right_idx] > 0)
+    if valid.sum() < 4:
+        return []
+    ratio = np.log(scale[left_idx[valid]]) - np.log(scale[right_idx[valid]])
+    log_min_ratio = np.log(min_ratio)
+    if np.all(ratio < -log_min_ratio):
+        unused_side = "left"
+    elif np.all(ratio > log_min_ratio):
+        unused_side = "right"
+    else:
+        return []
+    return [i for i, name in enumerate(lower) if unused_side in name]
 
 
 _GRIPPER_NAME_KEYWORDS = ("gripper", "trigger", "squeeze", "hand_joint")

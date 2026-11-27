@@ -827,6 +827,104 @@ def test_smoothness_ignores_a_scale_outlier_dim():
     assert "smoothness" in _checks(jump_result)
 
 
+def _unused_side_dataset() -> Dataset:
+    """A synthetic bimanual dataset where the "right_*" joints are actively driven and
+    every matching "left_*" joint sits frozen (small encoder jitter only) for the whole
+    dataset -- a single-arm task on a dual-arm robot, as found on real Hub datasets
+    (RoboCOIN/AI2_Alphabot_2_package_fruit, _stamp_document). The frozen dims occasionally
+    hold a small sensor-noise blip, exactly like the already-fixed noise-dominated-dim
+    case, but here there are 7 of them (not 1), too large a minority for the dataset's own
+    median/MAD-based outlier tests to separate from the 7 genuinely driven dims. The 7
+    driven dims (not fewer) also give the scale-outlier population enough points of its
+    own, once the frozen side is removed from it, for a stable robust z-score.
+    """
+    n = 90  # 3s at FPS
+    t = np.arange(n)
+    n_clean = 40
+    rng = np.random.default_rng(0)
+    n_dims = 7
+    freqs = np.array([1.0, 1.6, 0.6, 2.2, 0.9, 1.3, 1.9])
+    amps = np.array([5.0, 5.5, 6.0, 5.2, 6.5, 5.8, 6.2])
+    phases0 = np.array([0.3, 1.1, 2.0, 2.9, 4.0, 0.7, 3.3])
+    names = [f"right_joint_{i}_rad" for i in range(n_dims)] + [
+        f"left_joint_{i}_rad" for i in range(n_dims)
+    ]
+
+    def active_dims(idx: int) -> np.ndarray:
+        return amps * np.sin(2 * np.pi * freqs[None, :] * t[:, None] / n + phases0 + 0.01 * idx)
+
+    def frozen_dims(idx: int, blip_frame: int | None = None, blip_mag: float = 0.0) -> np.ndarray:
+        d = 0.0003 * rng.normal(0, 1, (n, n_dims)) + 2.6e-5 * np.sin(
+            2 * np.pi * 0.3 * t[:, None] / n + 0.05 * idx
+        )
+        if blip_frame is not None:
+            d = d.copy()
+            d[blip_frame:, idx % n_dims] += blip_mag  # a held sensor blip on one frozen dim
+        return d
+
+    def episode(
+        idx: int,
+        frozen: np.ndarray,
+        jump_dim: int | None = None,
+        jump_frame: int | None = None,
+        jump_mag: float = 0.0,
+    ) -> Episode:
+        act = active_dims(idx)
+        if jump_dim is not None:
+            act = act.copy()
+            act[jump_frame:, jump_dim] += jump_mag
+        action = np.concatenate([act, frozen], axis=1)
+        return Episode(
+            index=idx, timestamps=t / FPS, frame_index=t, action=action, state=action.copy()
+        )
+
+    blip_episodes = range(0, n_clean, 7)
+    clean = []
+    for i in range(n_clean):
+        if i in blip_episodes:
+            frozen = frozen_dims(
+                i, blip_frame=20 + (i % 50), blip_mag=0.02 if i % 2 == 0 else -0.02
+            )
+        else:
+            frozen = frozen_dims(i)
+        clean.append(episode(i, frozen))
+
+    # a genuine, unrelated jump on one of the five driven dims
+    jump_ep = episode(n_clean, frozen_dims(n_clean + 900), jump_dim=1, jump_frame=45, jump_mag=10.0)
+
+    return Dataset(
+        root=Path("."),
+        fps=float(FPS),
+        codebase_version="v3.0",
+        robot_type=None,
+        episodes=[*clean, jump_ep],
+        action_names=names,
+    )
+
+
+def test_smoothness_ignores_an_unused_bimanual_side():
+    # Found on real Hub datasets beyond the existing validation set
+    # (RoboCOIN/AI2_Alphabot_2_package_fruit, RoboCOIN/AI2_Alphabot_2_stamp_document):
+    # both are single-arm tasks on a dual-arm robot, so the whole "left_*" group of
+    # action dims -- 10+ of ~30 dims, too large a minority for the dataset-wide
+    # median/MAD tests above to separate from the genuinely driven "right_*" dims --
+    # sits frozen for every episode, yet kept contributing scattered noise blips as
+    # `smoothness` "abrupt action jump" flags on 10-14/20 episodes of each dataset.
+    ctx = DatasetContext.build(_unused_side_dataset(), Config())
+    assert np.isnan(ctx.step_p99[7:14]).all(), ctx.step_p99  # every "left_*" dim excluded
+    assert not np.isnan(ctx.step_p99[:7]).any(), ctx.step_p99  # "right_*" dims untouched
+
+    results = {r.episode_index: r for r in evaluate(_unused_side_dataset())}
+    for i in range(40):
+        assert results[i].metrics["jumps"] == 0, (i, results[i].metrics)
+        assert results[i].metrics["spikes"] == 0, (i, results[i].metrics)
+
+    # the fix must not blind the check to a real jump on one of the driven dims
+    jump_result = results[40]
+    assert jump_result.metrics["jumps"] == 1
+    assert "smoothness" in _checks(jump_result)
+
+
 def test_smoothness_jerkier_than_peers_needs_a_material_ldlj_gap():
     # Found by running `demoqc score` against a real Hub dataset beyond the existing
     # validation set (EPITECH-LILLE/eval_training): episode 37, scored against a
