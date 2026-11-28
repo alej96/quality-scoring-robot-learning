@@ -1444,6 +1444,45 @@ Work top-down through **Next up**. Each item should ship in one focused session
       confirming this is a no-op whenever fewer than 21 episodes are dropped. Also ran
       `pytest -m network`: all network tests pass.
 
+- [x] **Fix `demoqc score`/`dedupe`/`export`/`push-report` crashing with a raw Python
+      traceback on a mistyped, private/gated, or unreachable Hub repo id.** Found while
+      hunting for real-dataset bugs beyond the existing validation set (no unchecked item
+      remained under "Next up"): running `demoqc score` against several newly-listed Hub
+      datasets (`IDEAS-Lab-Northwestern/datagen-stack-*`, `sitthaveet/duolingo_to_nest_...`,
+      `Pantheon-inc/DiverseUMI-sample100`, all gated/private with no token configured in
+      this environment) and a deliberately mistyped repo id each dumped a full multi-frame
+      `huggingface_hub`/`httpx`/`OSError` traceback to the terminal, instead of the one-line
+      `demoqc: ...` error every other load failure (a bad local path, a malformed config
+      file, a duplicate episode index) already prints. Root cause: `dataset.py`'s
+      `_download` called `huggingface_hub.snapshot_download` with no exception handling at
+      all, so `RepositoryNotFoundError`, `GatedRepoError`, `RevisionNotFoundError` and a
+      plain Hub connection failure (all `OSError` subclasses, like `requests`'s own
+      connection/timeout errors) propagated straight through `load_dataset` to
+      `cli._load`, which only ever caught `(FileNotFoundError, ValueError)` -- exactly the
+      kind of Hub-reachability failure this project's own validation workflow already
+      anticipates ("If the Hugging Face Hub isn't reachable from this environment, say so
+      ..."), just not yet handled gracefully by the tool itself for a *user* hitting it.
+      Fixed by wrapping the `snapshot_download` call in `_download` with `except OSError`
+      and re-raising as `FileNotFoundError(f"could not load {repo_id!r} from the Hugging
+      Face Hub: {exc}")`, reusing the exact exception type `cli._load` already catches and
+      prints as `demoqc: {exc}` -- no `cli.py` change needed, and every command built on
+      `load_dataset` (`score`, `dedupe`, `export`, `push-report`) gets the fix at once. New
+      `tests/test_dataset.py::test_hub_download_failure_raises_a_clean_error_not_a_raw_hub_exception`
+      and `tests/test_cli.py::test_hub_download_failure_prints_a_clean_error_not_a_traceback`
+      (both monkeypatch `huggingface_hub.snapshot_download` to raise a plain `OSError` with
+      a Hub-style message, the same pattern `test_push.py` already uses for
+      `HfApi.create_commit`) assert a clean `FileNotFoundError`/exit-2 with no `Traceback`
+      in stderr; both fail without this change (confirmed via `git stash` on just
+      `src/demoqc/dataset.py` -- the raw `OSError` propagates all the way through `main()`,
+      reproducing the real datasets' crash exactly). Validated directly against the real
+      failures: `demoqc score definitely-not-a-real-user-xyz/definitely-not-a-real-dataset-abc`
+      and `demoqc score Pantheon-inc/DiverseUMI-sample100` (gated, no token) now both print a
+      single `demoqc: could not load '...' from the Hugging Face Hub: ...` line and exit 2,
+      instead of a traceback. Re-ran the full existing validation set
+      (`lerobot/svla_so101_pickplace`, `masato-ka/so100_cutlery_handling_simple`) and
+      `pytest -m network`: byte-identical mean scores to every prior Log entry (97.1 / 92.9),
+      confirming this is a no-op on every load that actually succeeds.
+
 ## Needs the owner
 
 - Publish to PyPI (needs a PyPI account and trusted-publisher setup).
@@ -2353,3 +2392,8 @@ Work top-down through **Next up**. Each item should ship in one focused session
   genuine torso-noise defect underneath. `RoboCOIN/AI2_Alphabot_2_package_fruit` went from
   mean 94.5 to 98.2, `_stamp_document` from 95.5 to 100.0. See the "Next up" entry for the
   full root cause, the still-open residual, and validation details.
+- 2026-11-28: Fixed `demoqc score`/`dedupe`/`export`/`push-report` crashing with a raw
+  Python traceback (instead of a one-line `demoqc: ...` error) on a mistyped, private/gated,
+  or unreachable Hub repo id -- `dataset.py`'s `_download` called `snapshot_download` with
+  no exception handling at all. See the "Next up" entry for the full root cause and
+  validation details.
