@@ -441,13 +441,24 @@ def _download(
 ) -> Path:
     from huggingface_hub import snapshot_download
 
-    local = snapshot_download(
-        repo_id,
-        repo_type="dataset",
-        revision=revision,
-        allow_patterns=patterns or HUB_PATTERNS,
-        cache_dir=cache_dir,
-    )
+    try:
+        local = snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            revision=revision,
+            allow_patterns=patterns or HUB_PATTERNS,
+            cache_dir=cache_dir,
+        )
+    except OSError as exc:
+        # huggingface_hub raises a variety of HfHubHTTPError subclasses for a mistyped
+        # repo id, a private/gated repo with no token, or an unreachable Hub (all of
+        # which, like a plain requests connection error, are OSError subclasses) -- with
+        # a long, HTTP-flavored message but no demoqc context, and with nothing catching
+        # it, a user hitting any of these got a raw multi-frame Python traceback instead
+        # of the one-line "demoqc: ..." every other load error already prints.
+        raise FileNotFoundError(
+            f"could not load {repo_id!r} from the Hugging Face Hub: {exc}"
+        ) from exc
     return Path(local)
 
 

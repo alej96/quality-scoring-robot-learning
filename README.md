@@ -327,6 +327,16 @@ idle time (the start/end of almost every demo, or a very static scene) looks ide
 isn't a defect, so it's left alone rather than risk flagging ordinary, well-compressed
 footage.
 
+## A mistyped, private or unreachable Hub repo id
+
+Loading `user/dataset` from the Hub when the id is mistyped, the dataset is private/gated
+with no token configured, or the Hub itself can't be reached raises some
+`huggingface_hub`-specific HTTP error (`RepositoryNotFoundError`, `GatedRepoError`, a plain
+connection error, ...) with a long, HTTP-flavored message and no `demoqc` context.
+`demoqc score`/`dedupe`/`export`/`push-report` catch this and print a one-line
+`demoqc: could not load 'user/dataset' from the Hugging Face Hub: ...` error (exit code 2)
+instead of letting it surface as an unhandled multi-frame Python traceback.
+
 ## Development
 
 ```bash

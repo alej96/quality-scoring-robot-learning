@@ -263,3 +263,20 @@ def test_requesting_a_duplicate_episode_index_raises_a_specific_error(make_datas
 
     with pytest.raises(ValueError, match="appear more than once"):
         load_dataset(root, episodes=[1])
+
+
+def test_hub_download_failure_raises_a_clean_error_not_a_raw_hub_exception(monkeypatch):
+    """A mistyped repo id, a private/gated repo with no token, or an unreachable Hub all
+    surface from huggingface_hub as some OSError subclass (e.g. RepositoryNotFoundError,
+    GatedRepoError, or a plain connection error) with a long HTTP-flavored message and no
+    demoqc context. Before this fix, nothing caught it, so `load_dataset` (and every CLI
+    command built on it) let the raw exception propagate as an unhandled multi-frame
+    traceback instead of the one-line error every other load failure already gets."""
+
+    def fake_snapshot_download(*args, **kwargs):
+        raise OSError("401 Client Error: Repository Not Found for url: https://...")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    with pytest.raises(FileNotFoundError, match="could not load 'someone/nonexistent'"):
+        load_dataset("someone/nonexistent")
