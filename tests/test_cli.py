@@ -53,6 +53,18 @@ def test_bad_source(tmp_path, capsys):
     assert "info.json" in capsys.readouterr().err
 
 
+def test_hub_download_failure_prints_a_clean_error_not_a_traceback(monkeypatch, capsys):
+    def fake_snapshot_download(*args, **kwargs):
+        raise OSError("401 Client Error: Repository Not Found for url: https://...")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    assert main(["score", "someone/nonexistent"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("demoqc: could not load 'someone/nonexistent'")
+    assert "Traceback" not in err
+
+
 def test_score_reports_duplicates(make_dataset, tmp_path, capsys):
     specs = clean_specs()
     specs[9] = specs[2]  # byte-identical re-run
